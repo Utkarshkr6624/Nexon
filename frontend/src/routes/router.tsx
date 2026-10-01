@@ -11,6 +11,7 @@ import {
   DashboardPage,
   DeveloperPage,
   ExperimentsPage,
+  ForgotPasswordPage,
   KnowledgePage,
   LearningPage,
   LoginPage,
@@ -18,6 +19,7 @@ import {
   PlannerPage,
   ProjectsPage,
   RegisterPage,
+  ResetPasswordPage,
   SearchPage,
   SettingsPage,
   TasksPage,
@@ -61,6 +63,17 @@ export const router = createBrowserRouter([
     children: [
       { path: '/login', element: <LoginPage /> },
       { path: '/register', element: <RegisterPage /> },
+      // Password recovery lives on the anonymous branch too: there is no
+      // session to authenticate with, and a signed-in user has no reason to see
+      // either screen.
+      //
+      // `/reset-password` is reached from the emailed link, which carries the
+      // reset token as a `?token=` query parameter. The route table stays token
+      // -free on purpose — `ResetPasswordPage` reads it with `useSearchParams`
+      // and is the single place that does, so a token never reaches a loader or
+      // an error message.
+      { path: '/forgot-password', element: <ForgotPasswordPage /> },
+      { path: '/reset-password', element: <ResetPasswordPage /> },
     ],
   },
 ])

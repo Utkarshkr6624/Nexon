@@ -3,14 +3,24 @@ import { createJSONStorage, persist } from 'zustand/middleware'
 
 import { ApiError, apiClient } from '@/lib/api-client'
 import {
+  changePasswordRequest,
   fetchCurrentUser,
   loginRequest,
+  logoutAllRequest,
   logoutRequest,
   refreshRequest,
   registerRequest,
 } from '@/services/auth'
 import { toApiError } from '@/services/errors'
-import type { LoginPayload, RegisterPayload, User } from '@/types'
+import { deleteAccountRequest, updateProfileRequest } from '@/services/users'
+import type {
+  LoginPayload,
+  PasswordChangePayload,
+  ProfileUpdatePayload,
+  RegisterPayload,
+  User,
+  UserDeletionPayload,
+} from '@/types'
 
 export const AUTH_STORAGE_KEY = 'nexus.auth'
 
@@ -40,6 +50,25 @@ interface AuthState {
   login: (payload: LoginPayload) => Promise<void>
   register: (payload: RegisterPayload) => Promise<void>
   logout: () => Promise<void>
+  /**
+   * Revokes every *other* device's session and keeps this one. The local session
+   * is cleared all the same — the caller still holds this device's pair, but
+   * everything cached under the old session is dropped so the sessions panel
+   * refetches a list that is now a single row.
+   */
+  logoutAll: () => Promise<void>
+  /**
+   * The backend revokes every session but the caller's as part of this call, so
+   * the tokens already held stay valid and the user is not bounced to /login.
+   */
+  changePassword: (payload: PasswordChangePayload) => Promise<void>
+  /**
+   * Edits the caller's own profile. The response replaces `user` wholesale so
+   * the avatar, name and role chip all update from one round trip.
+   */
+  updateProfile: (payload: ProfileUpdatePayload) => Promise<void>
+  /** Destroys the account. Unlike the other actions this always ends the session. */
+  deleteAccount: (payload: UserDeletionPayload) => Promise<void>
   /**
    * Verifies a persisted session against `GET /auth/me`. Single-flight: the
    * boot effect and any later caller share one verification, so a StrictMode
@@ -244,6 +273,62 @@ export const useAuthStore = create<AuthState>()(
           }
         },
 
+        async logoutAll() {
+          set({ pending: true, error: null })
+          try {
+            await logoutAllRequest()
+          } catch (cause) {
+            // Every other device is still live; say so rather than pretending
+            // the sign-out happened.
+            set({ pending: false, error: toApiError(cause) })
+            return
+          }
+          // The caller's own tokens survive server-side, but this session's
+          // cached data is stale either way — clearSession() announces the change
+          // so the query cache is dropped and the sessions panel refetches.
+          clearSession()
+        },
+
+        async changePassword(payload) {
+          set({ pending: true, error: null })
+          try {
+            await changePasswordRequest(payload)
+          } catch (cause) {
+            set({ pending: false, error: toApiError(cause) })
+            return
+          }
+          // Not a session transition: this device's tokens stay valid, so no
+          // announcement — the cache is still good data.
+          set({ pending: false, error: null })
+        },
+
+        async updateProfile(payload) {
+          set({ pending: true, error: null })
+          try {
+            const user = await updateProfileRequest(payload)
+            // No session announcement: a profile edit is not a session
+            // transition, and dropping the cache here would throw away data the
+            // new `user` still authorises.
+            set({ user, pending: false, error: null })
+          } catch (cause) {
+            set({ pending: false, error: toApiError(cause) })
+          }
+        },
+
+        async deleteAccount(payload) {
+          set({ pending: true, error: null })
+          try {
+            await deleteAccountRequest(payload)
+          } catch (cause) {
+            set({ pending: false, error: toApiError(cause) })
+            return
+          }
+          // The account and its sessions are gone, so this operation inherently
+          // ends the session. clearSession() announces it, which is what drops
+          // the React Query cache.
+          clearSession()
+        },
+
         hydrate() {
           if (hydrateInFlight) return hydrateInFlight
           const attempt = verifyPersistedSession().finally(() => {
@@ -286,10 +371,20 @@ export function selectIsAuthenticated(state: AuthState): boolean {
   return state.status === 'authenticated' && state.accessToken !== null
 }
 
+/**
+ * The name to show for an account, best available first: the chosen display
+ * name, then the handle the account signed up with, then the local part of the
+ * email address. There is always an answer — a signed-in user must never be
+ * rendered as "undefined" — so an account that has set none of the three still
+ * gets something stable and recognisable.
+ */
 export function selectDisplayName(user: User | null): string {
   if (!user) return 'Guest'
-  const name = user.full_name?.trim()
-  return name && name.length > 0 ? name : user.email.split('@')[0] ?? user.email
+  const display = user.display_name?.trim()
+  if (display && display.length > 0) return display
+  const username = user.username?.trim()
+  if (username && username.length > 0) return username
+  return user.email.split('@')[0] || user.email
 }
 
 export function selectInitials(user: User | null): string {

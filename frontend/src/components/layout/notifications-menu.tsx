@@ -11,11 +11,13 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { cn } from '@/lib/utils'
 
 /**
- * No notification records exist yet, so the unread count is a real zero rather
- * than a sample number. The badge stays mounted so the affordance is visible.
+ * There is no notification store in Phase 2 — no backend, no persisted
+ * preferences, nothing to fake. The count below is a real zero rather than a
+ * sample number, and the panel says plainly why it is empty. A control that
+ * opened onto a fabricated feed would be worse than one that admits the feature
+ * is not built yet.
  */
 const UNREAD_COUNT = 0
 
@@ -30,29 +32,29 @@ export function NotificationsMenu() {
               variant="ghost"
               size="icon"
               className="relative text-muted-foreground"
-              aria-label={`Notifications (${UNREAD_COUNT} unread)`}
+              aria-label={UNREAD_COUNT > 0 ? `Notifications, ${UNREAD_COUNT} unread` : 'Notifications'}
             >
-              <Bell className="size-4" aria-hidden="true" />
-              <span
-                aria-hidden="true"
-                className={cn(
-                  'absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold tabular-nums',
-                  UNREAD_COUNT > 0
-                    ? 'bg-primary text-primary-foreground'
-                    : 'bg-muted text-muted-foreground',
-                )}
-              >
-                {UNREAD_COUNT}
-              </span>
+              <Bell aria-hidden="true" />
+              {/* A muted "0" chip is noise, so the marker only exists once
+                  there is genuinely something unread. */}
+              {UNREAD_COUNT > 0 && (
+                <span
+                  aria-hidden="true"
+                  className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold tabular-nums text-primary-foreground"
+                >
+                  {UNREAD_COUNT}
+                </span>
+              )}
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
         <TooltipContent side="bottom">Notifications</TooltipContent>
       </Tooltip>
+
       <DropdownMenuContent align="end" className="w-80 p-0">
-        <div className="flex items-center justify-between px-3 py-2.5">
+        <div className="flex items-center justify-between gap-2 px-3 py-2.5">
           <DropdownMenuLabel className="p-0 text-sm">Notifications</DropdownMenuLabel>
-          <span className="text-xs tabular-nums text-muted-foreground">
+          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
             {UNREAD_COUNT} unread
           </span>
         </div>
@@ -62,7 +64,7 @@ export function NotificationsMenu() {
             compact
             icon={Bell}
             title="Nothing needs you right now"
-            description="Alerts from projects, tasks and the assistant will collect here. Nothing is generated until those modules exist, so this stays empty for now."
+            description="Alerts from projects, tasks and the assistant collect here. None of those surfaces ship a feed yet, so an empty panel is the accurate state rather than a broken one."
           />
         </ScrollArea>
       </DropdownMenuContent>

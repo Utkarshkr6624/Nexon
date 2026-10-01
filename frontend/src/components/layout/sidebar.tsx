@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react'
-import type { CSSProperties } from 'react'
+import { forwardRef, useEffect, useRef } from 'react'
+import type { ComponentPropsWithoutRef, CSSProperties } from 'react'
 import { NavLink } from 'react-router-dom'
 import { ChevronsLeft, PanelLeft } from 'lucide-react'
 
@@ -31,62 +31,96 @@ function focusableWithin(root: HTMLElement): HTMLElement[] {
   )
 }
 
-interface NavItemProps {
+/*
+ * Grouping. The registry already clusters the twelve modules, so the rail adds
+ * one decision on top of it rather than inventing a second taxonomy: a group of
+ * one is a home row, not a section. The Dashboard is where the product opens, so
+ * it sits alone at the top and the remaining four groups carry headings. Four
+ * headings across eleven destinations is about as much as a rail can hold
+ * before it stops being scannable, and each one earns its place by naming a
+ * different kind of work — doing it, reasoning over it, growing at it, and
+ * extending the platform itself.
+ */
+const HOME_GROUP = NAV_GROUPS.find((group) => group.items.length === 1)
+const HEADING_GROUPS = NAV_GROUPS.filter((group) => group.items.length > 1)
+
+interface NavItemProps
+  extends Omit<ComponentPropsWithoutRef<'a'>, 'children' | 'className'> {
   item: ModuleDefinition
   collapsed: boolean
   onNavigate: () => void
 }
 
-function NavItem({ item, collapsed, onNavigate }: NavItemProps) {
+/**
+ * One destination. The row states come from `.app-nav-row`, which keys the
+ * active treatment off the `aria-current="page"` NavLink sets, so the fill, the
+ * label weight and the hover are one definition rather than three conditions
+ * kept in sync here. Only the leading indicator and the collapsed layout are
+ * component concerns.
+ *
+ * `ref` and the remaining anchor props are forwarded because the collapsed
+ * variant wraps this element in a `TooltipTrigger asChild`: Radix's Slot
+ * attaches its pointer and focus handlers to whatever it clones, and an element
+ * that swallows them leaves a tooltip that never opens.
+ */
+const NavItem = forwardRef<HTMLAnchorElement, NavItemProps>(function NavItem(
+  { item, collapsed, onNavigate, ...rest },
+  ref,
+) {
   const Icon = item.icon
 
   return (
     <NavLink
+      {...rest}
+      ref={ref}
       to={item.to}
       onClick={onNavigate}
-      title={collapsed ? item.label : undefined}
-      className={({ isActive }) =>
-        cn(
-          'group relative flex h-9 items-center gap-3 rounded-md px-3 text-sm transition-colors duration-150 ease-out',
-          'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-          isActive && 'bg-accent/70 font-medium text-accent-foreground',
-          collapsed && 'justify-center px-0',
-        )
-      }
+      className={cn('app-nav-row relative', collapsed && 'justify-center px-0')}
     >
       {({ isActive }) => (
         <>
           <span
             aria-hidden="true"
             className={cn(
-              'absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-primary transition-opacity duration-150 ease-out',
+              'absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 rounded-full bg-primary',
+              'transition-opacity duration-150 ease-out',
               isActive ? 'opacity-100' : 'opacity-0',
             )}
           />
-          <Icon
-            aria-hidden="true"
-            className={cn(
-              'size-4 shrink-0 transition-colors duration-150 ease-out',
-              isActive ? 'text-primary' : 'text-muted-foreground group-hover:text-foreground',
-            )}
-          />
+          <Icon aria-hidden="true" className={cn('size-4 shrink-0', isActive && 'text-primary')} />
           {!collapsed && <span className="truncate">{item.label}</span>}
         </>
       )}
     </NavLink>
   )
-}
+})
 
+/**
+ * Collapsed rows lose their label, so the label moves into a tooltip. Radix
+ * opens it on pointer entry *and* on keyboard focus, which is the only way a
+ * sighted keyboard user can read an icon-only rail.
+ */
 function CollapsibleNavItem({ item, collapsed, onNavigate }: NavItemProps) {
-  if (!collapsed) return <NavItem item={item} collapsed={collapsed} onNavigate={onNavigate} />
+  const row = <NavItem item={item} collapsed={collapsed} onNavigate={onNavigate} />
+  if (!collapsed) return row
 
   return (
     <Tooltip>
-      <TooltipTrigger asChild>
-        <NavItem item={item} collapsed onNavigate={onNavigate} />
-      </TooltipTrigger>
+      <TooltipTrigger asChild>{row}</TooltipTrigger>
       <TooltipContent side="right">{item.label}</TooltipContent>
     </Tooltip>
+  )
+}
+
+function NavGroupHeading({ label, collapsed }: { label: string; collapsed: boolean }) {
+  if (collapsed) {
+    return <div aria-hidden="true" className="mx-3 mb-1.5 h-px bg-sidebar-border first:hidden" />
+  }
+
+  return (
+    <h2 className="flex h-5 items-center px-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-sidebar-muted">
+      {label}
+    </h2>
   )
 }
 
@@ -142,15 +176,18 @@ export function AppSidebar({
       inert={inert}
       style={style}
       className={cn(
-        'fixed inset-y-0 left-0 z-40 flex w-[260px] flex-col border-r border-border bg-card',
+        // The rail is chrome, not content: it takes the --sidebar plane so it
+        // reads as a distinct surface from the canvas in both themes.
+        'fixed inset-y-0 left-0 z-40 flex w-[260px] flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground',
         'transition-[width,transform] duration-200 ease-out',
         'lg:w-[var(--sidebar-width)]',
         mobileOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full lg:translate-x-0',
       )}
     >
+      {/* h-14 matches the top bar, so the two rails line up on the first row. */}
       <div
         className={cn(
-          'flex h-14 shrink-0 items-center border-b border-border',
+          'flex h-14 shrink-0 items-center border-b border-sidebar-border',
           collapsed ? 'justify-center px-2' : 'justify-between px-4',
         )}
       >
@@ -159,29 +196,35 @@ export function AppSidebar({
           type="button"
           variant="ghost"
           size="icon"
-          className="hidden size-8 shrink-0 text-muted-foreground lg:inline-flex"
+          className={cn(
+            'hidden size-8 shrink-0 text-sidebar-muted lg:inline-flex',
+            'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+          )}
           onClick={onCollapseToggle}
           aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         >
-          {collapsed ? (
-            <PanelLeft aria-hidden="true" />
-          ) : (
-            <ChevronsLeft aria-hidden="true" />
-          )}
+          {collapsed ? <PanelLeft aria-hidden="true" /> : <ChevronsLeft aria-hidden="true" />}
         </Button>
       </div>
 
       <ScrollArea className="flex-1">
-        <nav className="space-y-6 px-3 py-4" aria-label="Primary">
-          {NAV_GROUPS.map((group) => (
-            <div key={group.id} className="space-y-1">
-              {collapsed ? (
-                <div aria-hidden="true" className="mx-3 mb-3 h-px bg-border" />
-              ) : (
-                <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/70">
-                  {group.label}
-                </p>
-              )}
+        <nav className="flex flex-col gap-6 px-3 py-4" aria-label="Primary">
+          {HOME_GROUP && (
+            <div className="flex flex-col gap-1">
+              {HOME_GROUP.items.map((item) => (
+                <CollapsibleNavItem
+                  key={item.to}
+                  item={item}
+                  collapsed={collapsed}
+                  onNavigate={onNavigate}
+                />
+              ))}
+            </div>
+          )}
+
+          {HEADING_GROUPS.map((group) => (
+            <div key={group.id} className="flex flex-col gap-1">
+              <NavGroupHeading label={group.label} collapsed={collapsed} />
               {group.items.map((item) => (
                 <CollapsibleNavItem
                   key={item.to}
@@ -195,15 +238,16 @@ export function AppSidebar({
         </nav>
       </ScrollArea>
 
-      <div className="shrink-0 border-t border-border p-3">
+      <div className="shrink-0 border-t border-sidebar-border p-2">
         <CollapsibleNavItem
           item={SETTINGS_MODULE}
           collapsed={collapsed}
           onNavigate={onNavigate}
         />
         {!collapsed && (
-          <p className="px-3 pt-3 text-[11px] leading-relaxed text-muted-foreground/70">
-            Phase 1 · shell and platform foundations
+          <p className="flex items-center gap-2 px-3 pt-2.5 text-[11px] text-sidebar-muted">
+            <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-primary/70" />
+            Phase 2 · shell and pages
           </p>
         )}
       </div>

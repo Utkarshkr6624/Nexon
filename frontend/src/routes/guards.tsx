@@ -9,8 +9,11 @@ import { useAuthStore } from '@/stores/auth-store'
  * Shown while a persisted session is being verified. It is deliberately
  * branded and silent — the alternative is a flash of the login screen on every
  * reload for a signed-in user.
+ *
+ * Exported so the auth route boundary can reuse it for the lazy chunks behind
+ * /login instead of keeping a near-identical private copy.
  */
-function BootScreen() {
+export function BootScreen() {
   return (
     <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-background">
       <Brand />
@@ -41,7 +44,8 @@ export interface RequireAnonymousProps {
   children: ReactNode
 }
 
-/** Keeps signed-in users out of /login and /register. */
+/** Keeps signed-in users out of the credential screens: /login, /register,
+ * /forgot-password and /reset-password. */
 export function RequireAnonymous({ children }: RequireAnonymousProps) {
   const status = useAuthStore((state) => state.status)
 
