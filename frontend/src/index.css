@@ -1,0 +1,288 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * NEXUS design tokens.
+ *
+ * Values are bare HSL channels so Tailwind can apply opacity modifiers
+ * (e.g. `bg-primary/10`). The palette is deliberately narrow: a near-neutral
+ * slate base, one restrained electric-blue accent, and muted semantic colours
+ * reserved for status. Component styling lives in Tailwind classes; this file
+ * owns the token layer and a small set of app-wide structural helpers.
+ */
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 8%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 8%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 8%;
+
+    --primary: 212 85% 50%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 5% 96%;
+    --secondary-foreground: 240 10% 10%;
+
+    --muted: 240 5% 96%;
+    --muted-foreground: 240 4% 44%;
+
+    --accent: 240 5% 94%;
+    --accent-foreground: 240 10% 10%;
+
+    --destructive: 350 80% 46%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 152 60% 32%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 32 90% 40%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 240 6% 90%;
+    --input: 240 6% 88%;
+    --ring: 212 85% 50%;
+
+    /*
+     * Navigation rail surface. The rail is chrome, not content, so it gets its
+     * own plane instead of borrowing --card: a shade cooler and a step darker
+     * than the white content canvas, so the shell stops reading flat.
+     */
+    --sidebar: 240 6% 97%;
+    --sidebar-foreground: 240 10% 12%;
+
+    /* Rail divider. A step stronger than --border, which is tuned for a hairline
+       inside a card and disappears against a tinted surface. */
+    --sidebar-border: 240 5% 88%;
+
+    /* Hovered and active navigation rows. Separate from --accent because that
+       value is chosen for a row sitting on a white card; on the tinted rail it
+       needs its own weight to stay visible without shouting. */
+    --sidebar-accent: 240 5% 92%;
+    --sidebar-accent-foreground: 240 10% 12%;
+
+    /* Group headings and inactive rail labels: legible against --sidebar, but
+       never competing with the active row. */
+    --sidebar-muted-foreground: 240 4% 45%;
+
+    /* Surface-coloured gap under a focus ring. Matches the canvas today, so
+       rendering is unchanged; a component on a non-canvas surface (a card, the
+       auth panel, a table row) can point the offset at that surface instead of
+       punching a canvas-coloured notch through it. */
+    --ring-offset: 0 0% 100%;
+
+    /* Canvas for the signed-out surfaces (sign in, register, password reset).
+       One step away from --background in both themes, so authentication reads
+       as a separate place from the signed-in app without a gradient doing it. */
+    --auth-background: 240 12% 97%;
+
+    /* Hairline grid drawn over the auth canvas. At 1px and low alpha it is
+       texture rather than content, and it sits far enough below the text to
+       leave body contrast untouched. */
+    --auth-grid: 240 8% 86%;
+
+    --chart-1: 212 85% 50%;
+    --chart-2: 160 64% 34%;
+    --chart-3: 32 90% 44%;
+    --chart-4: 350 74% 48%;
+    --chart-5: 220 13% 45%;
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 240 10% 4%;
+    --foreground: 0 0% 98%;
+
+    --card: 240 8% 6%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 240 10% 5%;
+    --popover-foreground: 0 0% 98%;
+
+    --primary: 212 90% 58%;
+    --primary-foreground: 222 47% 11%;
+
+    --secondary: 240 5% 14%;
+    --secondary-foreground: 0 0% 96%;
+
+    --muted: 240 5% 13%;
+    --muted-foreground: 240 5% 62%;
+
+    --accent: 240 6% 16%;
+    --accent-foreground: 0 0% 98%;
+
+    --destructive: 350 75% 52%;
+    --destructive-foreground: 0 0% 98%;
+
+    --success: 152 55% 45%;
+    --success-foreground: 222 47% 8%;
+
+    --warning: 38 92% 55%;
+    --warning-foreground: 222 47% 8%;
+
+    --border: 240 5% 17%;
+    --input: 240 5% 19%;
+    --ring: 212 90% 58%;
+
+    /* The dark rail is lifted off the near-black canvas rather than sunk into
+       it — a shadow on a #0a0a0a page is invisible, so the separation has to
+       come from lightness. Values are chosen per theme, not inverted. */
+    --sidebar: 240 7% 7%;
+    --sidebar-foreground: 240 5% 94%;
+
+    --sidebar-border: 240 5% 20%;
+
+    --sidebar-accent: 240 6% 15%;
+    --sidebar-accent-foreground: 240 5% 96%;
+
+    --sidebar-muted-foreground: 240 5% 60%;
+
+    --ring-offset: 240 10% 4%;
+
+    --auth-background: 240 12% 5%;
+    --auth-grid: 240 6% 16%;
+
+    --chart-1: 212 90% 58%;
+    --chart-2: 160 70% 45%;
+    --chart-3: 38 92% 55%;
+    --chart-4: 350 75% 60%;
+    --chart-5: 220 12% 62%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings:
+      'rlig' 1,
+      'calt' 1;
+  }
+
+  /* Consistent, keyboard-visible focus across native and Radix elements. The
+     offset reads from --ring-offset rather than the canvas token so a focused
+     control sitting on a raised surface keeps a matching gap. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-[hsl(var(--ring-offset))];
+  }
+
+  /*
+   * Motion is decoration here — skeletons, the sheet, the command palette, the
+   * live dot — so honouring the OS preference means collapsing durations rather
+   * than removing the properties: state changes still commit, they just arrive
+   * without the travel.
+   */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  /* Horizontal page gutter + max content width. */
+  .app-container {
+    @apply mx-auto w-full max-w-[1400px] px-4 sm:px-6 lg:px-8;
+  }
+
+  /* Scroll region for app shells; keeps the page itself from scrolling twice. */
+  .app-scroll {
+    @apply min-h-0 flex-1 overflow-y-auto overscroll-contain;
+  }
+
+  /*
+   * Form rhythm, shared by the auth, settings and security forms. Every one of
+   * them stacks the same three things in the same order — control, hint, error
+   * — and an error takes the hint's slot rather than being added after it, so
+   * the field does not jump when a validation message appears.
+   */
+  .app-form-stack {
+    @apply flex flex-col gap-5;
+  }
+
+  .app-form-field {
+    @apply flex flex-col gap-1.5;
+  }
+
+  .app-form-hint {
+    @apply text-xs leading-relaxed text-muted-foreground;
+  }
+
+  .app-form-error {
+    @apply text-xs font-medium leading-relaxed text-destructive;
+  }
+
+  /*
+   * Canvas for the signed-out surfaces. Static by construction — a wide radial
+   * tint plus a 32px hairline grid, no keyframes and no transitions — so
+   * `prefers-reduced-motion` has nothing to switch off here. The tint peaks at
+   * 7% of the accent and the grid sits at 60% of --auth-grid, both far below
+   * anything that would move body-text contrast, and the panel that holds the
+   * form is a solid surface on top of it.
+   */
+  .app-auth-backdrop {
+    @apply relative flex min-h-screen items-center justify-center overflow-hidden px-4 py-12;
+    background-color: hsl(var(--auth-background));
+    background-image:
+      radial-gradient(120% 80% at 50% 0%, hsl(var(--primary) / 0.07), transparent 60%),
+      linear-gradient(to right, hsl(var(--auth-grid) / 0.6) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--auth-grid) / 0.6) 1px, transparent 1px);
+    background-size:
+      100% 100%,
+      32px 32px,
+      32px 32px;
+    background-position:
+      center top,
+      center top,
+      center top;
+  }
+
+  /*
+   * Navigation rail surface and row states, expressed as classes rather than
+   * `bg-sidebar` utilities: mapping the --sidebar tokens onto Tailwind's colour
+   * scale is a tailwind.config.ts change, and that file is not the CSS layer's
+   * to edit. These keep the rail off --card without waiting for that mapping.
+   */
+  .app-sidebar-surface {
+    background-color: hsl(var(--sidebar));
+    color: hsl(var(--sidebar-foreground));
+    border-color: hsl(var(--sidebar-border));
+  }
+
+  .app-nav-row {
+    @apply flex h-9 items-center gap-3 rounded-md px-3 text-sm transition-colors duration-150 ease-out;
+    color: hsl(var(--sidebar-muted-foreground));
+  }
+
+  .app-nav-row:hover {
+    background-color: hsl(var(--sidebar-accent));
+    color: hsl(var(--sidebar-accent-foreground));
+  }
+
+  /* NavLink marks the current destination with aria-current="page". */
+  .app-nav-row[aria-current='page'] {
+    background-color: hsl(var(--sidebar-accent));
+    color: hsl(var(--sidebar-foreground));
+    font-weight: 500;
+  }
+}

@@ -1,0 +1,70 @@
+# =============================================================================
+# NEXUS — root Docker build context exclusions.
+# =============================================================================
+# The compose services build with the contexts ./backend and ./frontend, and
+# each of those directories has its own, stricter .dockerignore — those are the
+# files that actually apply to `docker compose build`. This root file governs
+# any build that uses the repository root as its context (a future
+# all-in-one image, or `docker build -f backend/Dockerfile .`), and acts as a
+# second line of defence so secrets and multi-gigabyte artefacts can never be
+# picked up by accident.
+# =============================================================================
+
+# --- Secrets: never bake a real .env into an image --------------------------
+.env
+.env.*
+# Last match wins, so this re-include is only effective while it stays *below*
+# the `.env.*` exclusion above. Moving it up silently excludes .env.example too.
+!.env.example
+
+# --- VCS ---------------------------------------------------------------------
+.git
+.gitignore
+.github
+
+# --- Virtual environments and installed dependencies -----------------------
+.venv
+venv
+env
+ENV
+**/.venv
+node_modules
+**/node_modules
+
+# --- Build output ------------------------------------------------------------
+**/dist
+**/build
+**/*.egg-info
+**/*.tsbuildinfo
+**/coverage
+
+# --- Python caches and artefacts ---------------------------------------------
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# --- Local runtime data ------------------------------------------------------
+# A bind-mounted PostgreSQL data directory is 1+ GB of binary; nothing that big
+# has any business in a build context.
+pgdata
+postgres-data
+**/pgdata
+**/postgres-data
+.tmpchk
+
+# --- Logs and scratch --------------------------------------------------------
+logs
+**/logs
+*.log
+
+# --- Tooling config not needed inside an image -------------------------------
+.vscode
+.idea
+**/.vscode
+**/.idea
+**/node_modules/.cache
+**/.vite
+**/.turbo
+**/.eslintcache

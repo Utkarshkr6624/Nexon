@@ -1,0 +1,160 @@
+# =============================================================================
+# NEXUS — local development stack (Compose v2 syntax: no `version:` key)
+# =============================================================================
+#   cp .env.example .env      # Compose reads .env automatically
+#   docker compose up -d --build
+#   docker compose logs -f backend
+#   docker compose down        # add -v to also drop the database volume
+#
+# `.env` reaches the stack two different ways, and the difference matters:
+#   * `${VAR:-default}` interpolates one value into this file while Compose
+#     parses it. Nothing else is read; the container sees what is written here.
+#   * `env_file: .env` (backend, frontend) hands the container the whole file,
+#     so the ~20 settings no `environment:` entry names — DEBUG, APP_NAME,
+#     OPENAPI_URL, JWT_*, DB_POOL_*, LOG_*, API_V1_PREFIX, ... — arrive as
+#     written instead of silently falling back to the pydantic defaults.
+# `environment:` outranks `env_file:`, so the overrides below still win; each
+# one is a value that has to differ inside a container (a service name, or a
+# dev-server setting the Vite proxy depends on). `.env` is therefore required
+# rather than optional, which is what `cp .env.example .env` above is for.
+#
+# Defaults on the `${VAR:-...}` interpolations exist only so `docker compose
+# config` still renders on a fresh clone.
+#
+# Published ports bind to ${BIND_HOST:-127.0.0.1}, not 0.0.0.0: the database
+# runs behind the default nexus/nexus credentials and the API signs tokens with
+# the placeholder SECRET_KEY, so neither belongs on the local network.
+#
+# `$$VAR` is a literal `$VAR` handed to the container's shell — that is how the
+# healthcheck reaches POSTGRES_USER/POSTGRES_DB from inside the container
+# instead of baking the values into the compose file.
+#
+# DOCKER WAS NOT EXECUTED while authoring this file: the project was built on a
+# machine without Docker. The YAML is parsed and structurally validated by
+# `scripts/verify_compose.py`; it has not been run by `docker compose`.
+# =============================================================================
+
+name: nexus
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — the single source of truth for all NEXUS data.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ${POSTGRES_CONTAINER_NAME:-nexus-postgres}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nexus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus}
+      POSTGRES_DB: ${POSTGRES_DB:-nexus}
+    ports:
+      # Host side is configurable so a native local server can keep 5432.
+      - "${BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - "${POSTGRES_VOLUME_NAME:-nexus_pgdata}:/var/lib/postgresql/data"
+      # Runs once, on an empty data directory. See the file for what it enables.
+      - "./docker/postgres/init:/docker-entrypoint-initdb.d:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # First boot of a fresh volume also has to run initdb + the init scripts.
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Backend — FastAPI + SQLAlchemy + Alembic.
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+    container_name: ${BACKEND_CONTAINER_NAME:-nexus-backend}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Compose interpolates `${...}` from `.env` but a container otherwise sees
+    # only what `environment:` lists — every variable missing there falls back
+    # to its pydantic default, whatever `.env` says. Passing the whole file
+    # fixes that for the settings this stack does not need to override.
+    env_file: .env
+    environment:
+      # Compose is a development stack; the value is still taken from `.env` so
+      # the production guard in config.py can be reached deliberately instead of
+      # being short-circuited by a hardcoded literal.
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      # Service name, never 127.0.0.1: inside the compose network the database
+      # is reachable as `postgres` only.
+      POSTGRES_HOST: postgres
+      # The DSN is assembled by `Settings.sqlalchemy_database_uri`, not here.
+      # Empty clears whatever `.env` carries (it points at 127.0.0.1, which
+      # cannot resolve in the container) and hands the job to config.py, which
+      # percent-encodes the user and password. Interpolating POSTGRES_PASSWORD
+      # into a URL below would corrupt any secret containing a reserved
+      # character — @ : / # ? % — and fail at startup with an opaque SQLAlchemy
+      # error rather than at the point of configuration.
+      DATABASE_URL: ""
+      SECRET_KEY: ${SECRET_KEY:-dev-insecure-change-me}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_JSON: ${LOG_JSON:-true}
+      # 0.0.0.0 so the published port reaches the server; run.py reads both.
+      NEXUS_HOST: 0.0.0.0
+      NEXUS_PORT: 8000
+      # No hot reload in the container: the app is a compiled image, so there is
+      # no host file tree to watch, and the reloader would fork a second process
+      # with its own engine and token store.
+      NEXUS_RELOAD: "false"
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:8000:8000"
+    # The image ships Alembic and the migrations but does not run them, so a
+    # fresh volume would start against an empty schema and every request would
+    # fail. Upgrade (a no-op once the schema is current) and then serve.
+    command: ["sh", "-c", "alembic upgrade head && exec python run.py"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$$NEXUS_PORT/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # First boot also pays for `alembic upgrade head` before the port opens.
+      start_period: 40s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Frontend — the Vite dev server, proxying /api to the backend service.
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ${FRONTEND_CONTAINER_NAME:-nexus-frontend}
+    depends_on:
+      backend:
+        condition: service_healthy
+    # See the backend service: without this the container would only see the
+    # handful of VITE_* values named below.
+    env_file: .env
+    environment:
+      # Relative, so the browser calls same-origin and the Vite proxy forwards
+      # to the backend container.
+      VITE_API_BASE_URL: /api/v1
+      # Reserved: declared in frontend/src/vite-env.d.ts and nothing reads them
+      # yet. Set here so the names resolve inside the container; changing them
+      # has no effect until the features land. See .env.example.
+      VITE_API_SERVER_URL: http://localhost:8000
+      VITE_APP_NAME: NEXUS
+      VITE_ENABLE_COMMAND_PALETTE: "true"
+      # Server-side proxy destination: the dev server runs *inside* this
+      # container, so `localhost:8000` would be the frontend container itself.
+      # Read by frontend/vite.config.ts; defaults to http://localhost:8000
+      # when running the frontend directly on the host.
+      VITE_DEV_PROXY_TARGET: http://backend:8000
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:5173:5173"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5173/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # `npm ci` plus Vite's first cold dependency optimisation.
+      start_period: 60s
+    restart: unless-stopped

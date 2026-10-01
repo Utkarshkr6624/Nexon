@@ -1,0 +1,38 @@
+# Dependencies are installed inside the image with `npm ci`.
+node_modules
+.pnpm-store
+.yarn
+
+# Build and test artefacts
+dist
+build
+coverage
+*.tsbuildinfo
+*.local
+
+# Vite / tool caches
+.vite
+.turbo
+.eslintcache
+
+# Environment and secrets — the image must never carry a real .env
+.env
+.env.*
+!.env.example
+
+# Source control and CI
+.git
+.gitignore
+.github
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and scratch
+logs
+*.log
+.tmpchk

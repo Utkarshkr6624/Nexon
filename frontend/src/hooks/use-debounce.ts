@@ -1,0 +1,16 @@
+import { useEffect, useState } from 'react'
+
+/**
+ * Returns `value` after it has stayed unchanged for `delay` ms.
+ * Used by the command palette filter so keystrokes do not thrash the list.
+ */
+export function useDebouncedValue<T>(value: T, delay = 200): T {
+  const [debounced, setDebounced] = useState(value)
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delay)
+    return () => window.clearTimeout(timer)
+  }, [value, delay])
+
+  return debounced
+}

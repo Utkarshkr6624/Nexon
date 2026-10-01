@@ -1,0 +1,47 @@
+# =============================================================================
+# NEXUS — shared editor and formatter settings.
+# =============================================================================
+# Every editor and formatter in the project reads this file, so an indentation
+# change is made once here rather than per tool. Ruff and Prettier/eslint
+# configs remain the authority for anything language-specific.
+# =============================================================================
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+# Frontend sources follow the Vite/TypeScript default, which is what
+# eslint.config.js and the Tailwind config assume.
+[*.{js,jsx,ts,tsx,mjs,cjs}]
+indent_size = 2
+max_line_length = 100
+
+[*.{json,jsonc,yml,yaml}]
+indent_size = 2
+
+[*.{css,scss,less,html}]
+indent_size = 2
+
+[*.{md,markdown}]
+# Two trailing spaces are a hard line break in Markdown.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
+
+[*.{sh,bash}]
+indent_size = 2
+
+[*.sql]
+indent_size = 2

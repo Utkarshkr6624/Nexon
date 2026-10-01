@@ -1,0 +1,59 @@
+[project]
+name = "nexus-backend"
+version = "0.1.0"
+description = "NEXUS — Personal Intelligence & Decision Platform backend"
+requires-python = ">=3.13"
+# Runtime dependencies are pinned in requirements.txt, which is what the
+# Docker build installs. They are not duplicated here.
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["."]
+extend-exclude = ["migrations", ".venv"]  # Alembic boilerplate, not ours to lint
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "A",    # builtin shadowing
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RUF",  # ruff-specific
+    "ASYNC",
+    "S",    # bandit
+    "D",    # pydocstyle
+]
+ignore = [
+    "D203",  # conflicts with D211
+    "D213",  # conflicts with D212
+    "B008",  # FastAPI's Depends() in defaults is the documented idiom
+    "E501",  # line length is handled by the formatter
+    # D1xx enforce the *presence* of docstrings. This codebase documents at
+    # module and public-function level; demanding a docstring on every dunder,
+    # __init__ or pydantic validator produces noise, not information. D2xx/D4xx
+    # (docstring *quality*) stay enabled.
+    "D105",
+    "D107",
+    "S105",  # settings defaults legitimately look like hardcoded secrets
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "D103", "D100", "D104"]
+# Settings validators are self-describing by name and short enough that a
+# docstring would only restate the code.
+"app/core/config.py" = ["D102"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+docstring-code-format = false

@@ -1,0 +1,49 @@
+# NEXUS backend — dependencies (CPython 3.13)
+#
+# Fully pinned: reproducible builds, and a known-good set on Python 3.13.
+#
+#   pip install -r requirements.txt
+#
+# The file is split into two sections. The Dockerfile extracts the runtime
+# section only (everything above the DEV marker), so development tooling is
+# never baked into the runtime image.
+#
+# Deliberately absent: structlog — the stdlib logging module plus the JSON
+# formatter in app/core/logging.py covers Phase 1 without a new dependency —
+# and passlib, which is unmaintained and breaks against bcrypt >= 4.1.
+
+# --- Web framework ----------------------------------------------------------
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32   # form parsing for OAuth2 password flow
+
+# --- Data validation / settings --------------------------------------------
+pydantic==2.13.5
+pydantic-settings==2.15.0
+annotated-types==0.8.0     # transitive; pinned explicitly for reproducibility
+
+# --- Persistence -----------------------------------------------------------
+sqlalchemy[asyncio]==2.1.1
+alembic==1.20.0
+psycopg[binary]==3.3.6
+
+# --- Security --------------------------------------------------------------
+# PyJWT rather than python-jose: actively maintained, no long-dead crypto deps.
+pyjwt==2.15.1
+# bcrypt used directly. Do NOT reintroduce passlib: unmaintained, and its
+# bcrypt backend errors out on bcrypt >= 4.1.
+bcrypt==5.0.0
+
+# ============================ DEV MARKER ====================================
+# Everything below this line is development-only tooling. The runtime Docker
+# image stops at this marker.
+# ----------------------------------------------------------------------------
+
+# --- Testing ---------------------------------------------------------------
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1            # ASGI transport for TestClient / AsyncClient
+anyio==4.15.1
+
+# --- Linting ---------------------------------------------------------------
+ruff==0.16.9

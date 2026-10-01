@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" id="theme-color" content="#09090b" />
+    <meta name="description" content="NEXUS — your personal intelligence and decision platform." />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>NEXUS</title>
+
+    <!--
+      Critical styles applied before first paint. The font stack mirrors
+      `theme.fontFamily.sans` in tailwind.config.ts.
+    -->
+    <style>
+      html {
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+          sans-serif;
+      }
+    </style>
+
+    <!--
+      No-flash theme bootstrap: runs before the bundle so the persisted theme is
+      on <html> at first paint. Default is dark when nothing is stored. It also
+      owns <meta name="theme-color"> for the whole session, so the browser chrome
+      follows the same signal the app toggles.
+    -->
+    <script>
+      ;(function () {
+        var theme = 'dark'
+        try {
+          var stored = window.localStorage.getItem('nexus-theme')
+          if (stored === 'light' || stored === 'dark') {
+            theme = stored
+          }
+        } catch (error) {
+          /* Private mode or storage disabled: keep the dark default. */
+        }
+        var root = document.documentElement
+        root.classList.toggle('dark', theme === 'dark')
+        root.style.colorScheme = theme
+        root.dataset.theme = theme
+
+        // The app's theme provider only toggles the `.dark` class, so that class
+        // is the one signal to watch for the effective theme.
+        var CHROME_COLOR = { light: '#ffffff', dark: '#09090b' }
+        function paintChromeColor() {
+          var meta = document.getElementById('theme-color')
+          if (meta) {
+            meta.setAttribute('content', CHROME_COLOR[root.classList.contains('dark') ? 'dark' : 'light'])
+          }
+        }
+        paintChromeColor()
+        if (window.MutationObserver) {
+          new MutationObserver(paintChromeColor).observe(root, {
+            attributes: true,
+            attributeFilter: ['class'],
+          })
+        }
+      })()
+    </script>
+  </head>
+  <body class="min-h-screen bg-background text-foreground antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
