@@ -17,14 +17,20 @@ Three things happen here that the application does not do for itself:
   session so API tests never touch the development database, and every managed
   table is truncated before each test — repository methods commit, so that
   truncation is the only thing standing between two tests.
+* **Exclusivity.** Truncation is only safe while one session has the database.
+  A session takes a PostgreSQL advisory lock named after the test database and
+  holds it until it finishes, so a second session against the same database is
+  told so and stops instead of manufacturing phantom failures in the first one.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import sys
+import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -228,13 +234,245 @@ def _assert_separate_test_database(test_uri: str, app_uri: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Exclusive use of the test database
+# ---------------------------------------------------------------------------
+
+#: Mixed into every advisory-lock key. Two processes that disagreed on this
+#: string would take different locks for the same database and the guard below
+#: would quietly protect nothing, so it is part of the contract rather than a
+#: value to tune.
+_LOCK_NAMESPACE = "nexus-backend-pytest-session"
+
+#: How long a second session keeps re-trying before it gives up. Long enough
+#: that a session which is already finishing gives its lock back first, short
+#: enough that a genuine conflict reads as a conflict instead of as a hang.
+_LOCK_RETRY_ATTEMPTS = 20
+_LOCK_RETRY_INTERVAL_SECONDS = 0.25
+
+#: Ceiling on the probe's own connection attempt. Without it a run against a
+#: host that silently drops packets spends minutes in the connect before the
+#: session-start probe gives up and hands the problem to ``test_database_url``,
+#: which turns "no database here" from an error into a stall.
+_LOCK_CONNECT_TIMEOUT_SECONDS = 5
+
+#: The locks this session holds, by database name. Keyed rather than a single
+#: slot so the probe at session start and the fixture that enforces the guard
+#: can both ask without the second call blocking on the first one's lock.
+_SESSION_LOCKS: dict[str, _SessionDatabaseLock] = {}
+
+
+class SessionLockError(RuntimeError):
+    """Another pytest session already holds the test database.
+
+    Named without the ``Test`` prefix deliberately: pytest collects classes that
+    start with one out of test modules, and importing this into a test would
+    turn it into a zero-test class that pytest warns about.
+    """
+
+
+class _SessionDatabaseLock:
+    """One held advisory lock, and the connection that is holding it."""
+
+    def __init__(self, database: str, connection: psycopg.Connection) -> None:
+        self.database = database
+        self._connection = connection
+
+    def release(self) -> None:
+        """Give the lock back and close the connection that holds it.
+
+        The unlock is explicit rather than left to the close so the ordering is
+        visible: the lock is released while this process is still healthy,
+        rather than whenever the socket happens to be reaped.
+        """
+        with contextlib.suppress(psycopg.Error):
+            self._connection.execute(
+                "SELECT pg_advisory_unlock(%s::int, %s::int)",
+                _database_lock_key(self.database),
+            )
+        self._connection.close()
+
+
+def _async_url(sync_uri: str) -> str:
+    """Put SQLAlchemy's driver suffix back, which :func:`_sync_url` strips."""
+    return sync_uri.replace("postgresql://", "postgresql+psycopg://", 1)
+
+
+def _database_lock_key(database: str) -> tuple[int, int]:
+    """The two-``int4`` advisory-lock key that names ``database``.
+
+    PostgreSQL advisory locks are cluster-wide: the lock table is shared by
+    every database on the server, so a key derived from a constant alone would
+    have session A on ``nexus_test`` excluding session B on some unrelated
+    database. Folding the database name into the key is what makes the exclusion
+    per-database, which is the granularity the suite actually wants.
+    """
+    digest = hashlib.blake2b(f"{_LOCK_NAMESPACE}:{database}".encode(), digest_size=8).digest()
+    return (
+        int.from_bytes(digest[:4], "big", signed=True),
+        int.from_bytes(digest[4:], "big", signed=True),
+    )
+
+
+def _suggest_alternative_database(database: str) -> str:
+    """A neighbouring name to offer when the database in use is already taken."""
+    if database.endswith("_test"):
+        return f"{database}_2"
+    return f"{database}_test"
+
+
+def _lock_holder_pid(connection: psycopg.Connection, database: str) -> int | None:
+    """The backend PID holding ``database``'s lock, or ``None`` if nobody is.
+
+    Best effort only. The PID is what lets the operator tell one stuck session
+    from another, but a session that releases between the failed try and this
+    query is a session that has just gone away, not an error worth raising.
+    """
+    first, second = _database_lock_key(database)
+    row = connection.execute(
+        "SELECT pid FROM pg_locks"
+        " WHERE locktype = 'advisory' AND classid = %s AND objid = %s AND granted",
+        (first, second),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def _lock_conflict_message(test_uri: str, database: str, holder_pid: int | None) -> str:
+    """The operator-facing explanation, including the exact command to run."""
+    alternative = _async_url(_url_for_database(test_uri, _suggest_alternative_database(database)))
+    holder = f" (backend PID {holder_pid})" if holder_pid is not None else ""
+    return (
+        f'Another pytest session already holds the test database "{database}"{holder}.\n'
+        "\n"
+        "The suite truncates every managed table before each test, so two sessions\n"
+        "on one database destroy each other's rows. Everything that follows reads\n"
+        'like a defect in the product — "username already taken", foreign key\n'
+        'violations, deadlocks, "could not refresh instance" — and none of it is.\n'
+        "\n"
+        "Wait for the other session to finish, or give this one its own database:\n"
+        "\n"
+        f"    TEST_DATABASE_URL={alternative}\n"
+    )
+
+
+def _take_session_lock(
+    test_uri: str, *, attempts: int = _LOCK_RETRY_ATTEMPTS
+) -> _SessionDatabaseLock:
+    """Take the advisory lock naming the database ``test_uri`` points at.
+
+    ``pg_try_advisory_lock`` rather than ``pg_advisory_lock``, because a plain
+    blocking lock would park the second session for as long as the first one ran
+    — indistinguishable, from the outside, from a hung test run. The caller
+    polls a bounded number of times and reports the conflict itself, so what
+    reaches the operator is a sentence about test databases rather than a query
+    timeout or a driver traceback.
+
+    The lock is taken from the maintenance database rather than from the target
+    for two reasons: advisory locks are cluster-wide, so the key and not the
+    connection's database is what scopes the exclusion; and a first run has to
+    be able to claim the lock before the test database exists, which is exactly
+    when it is most worth holding.
+    """
+    database = _database_name(test_uri)
+    connection = psycopg.connect(
+        _url_for_database(test_uri, "postgres"),
+        autocommit=True,
+        connect_timeout=_LOCK_CONNECT_TIMEOUT_SECONDS,
+        # Named so that a holder reported by PID can be told apart from any other
+        # connection to the server in ``pg_stat_activity``, which is where the
+        # next person looks when the message names a PID.
+        application_name="nexus-pytest-session-lock",
+    )
+    first, second = _database_lock_key(database)
+    try:
+        for attempt in range(attempts):
+            acquired = connection.execute(
+                "SELECT pg_try_advisory_lock(%s::int, %s::int)", (first, second)
+            ).fetchone()[0]
+            if acquired:
+                return _SessionDatabaseLock(database, connection)
+            if attempt + 1 < attempts:
+                time.sleep(_LOCK_RETRY_INTERVAL_SECONDS)
+        raise SessionLockError(
+            _lock_conflict_message(test_uri, database, _lock_holder_pid(connection, database))
+        )
+    except BaseException:
+        # Closing is the release: if the lock was taken and something failed
+        # afterwards, the session-scope lock would otherwise outlive the attempt
+        # and block every later run until this process died.
+        connection.close()
+        raise
+
+
+def _acquire_session_lock(test_uri: str) -> _SessionDatabaseLock:
+    """Hold the test database for this session, or end the session.
+
+    Idempotent per database, which is what lets both callers use it: the probe
+    in :func:`pytest_sessionstart` and the ``test_database_url`` fixture that
+    enforces the guard before anything truncates.
+    """
+    database = _database_name(test_uri)
+    held = _SESSION_LOCKS.get(database)
+    if held is not None:
+        return held
+    try:
+        lock = _take_session_lock(test_uri)
+    except SessionLockError as conflict:
+        pytest.exit(str(conflict), returncode=1)
+    _SESSION_LOCKS[database] = lock
+    return lock
+
+
+def _release_session_locks() -> None:
+    while _SESSION_LOCKS:
+        _, lock = _SESSION_LOCKS.popitem()
+        lock.release()
+
+
+def _test_database_uri() -> str:
+    """The database this session would test against, read from the environment."""
+    get_settings.cache_clear()
+    return get_settings().test_sqlalchemy_database_uri
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Claim the test database before any test in this session can truncate it.
+
+    Best effort in one narrow sense: a PostgreSQL this session will never use
+    is not an error. ``tests/test_risk_scoring.py`` is required to run with the
+    database stopped, and that has to keep working. An unreachable server is
+    therefore passed over here and surfaces later from ``test_database_url``,
+    where the guard is not optional and where the connection failure is
+    reported as itself.
+
+    What the probe buys is position. The second session learns about the
+    conflict in its first few seconds rather than part-way through a run that has
+    already spent minutes manufacturing errors indistinguishable from defects.
+    """
+    with contextlib.suppress(psycopg.OperationalError):
+        _acquire_session_lock(_test_database_uri())
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: object) -> None:
+    """Hand the lock back so the next session can start without waiting.
+
+    PostgreSQL drops the lock when the connection closes either way, so this is
+    about ordering rather than about recovering from a crash: the lock is
+    released while this process is still in a known state.
+    """
+    _release_session_locks()
+
+
 @pytest.fixture(scope="session")
 def test_database_url() -> str:
-    """Create ``nexus_test`` if needed and migrate it to ``head``."""
+    """Claim the database exclusively, create it if needed, migrate it to ``head``."""
     get_settings.cache_clear()
     settings = get_settings()
     uri = settings.test_sqlalchemy_database_uri
     _assert_separate_test_database(uri, settings.sqlalchemy_database_uri)
+    # Before the migration, not after it: two sessions racing to bring the same
+    # schema up is the same collision one schema version further along.
+    _acquire_session_lock(uri)
     _ensure_database_exists(uri)
     with _preserved_logging():
         command.upgrade(_alembic_config(uri), "head")

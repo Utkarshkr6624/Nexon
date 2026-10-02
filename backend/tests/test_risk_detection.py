@@ -90,7 +90,7 @@ from app.models.enums import (
     RiskType,
     TaskStatus,
 )
-from app.models.planner import AvailabilityRule
+from app.models.planner import AvailabilityRule, WorkSession
 from app.models.risk import Recommendation, Risk, RiskEvaluation
 from app.models.task import Task
 from app.repositories.activity import ActivityRepository
@@ -724,7 +724,7 @@ async def test_a_busy_quiet_account_is_measured_and_stores_nothing(
 async def test_a_brand_new_account_is_told_it_has_not_enough_data(
     db_session: AsyncSession,
 ) -> None:
-    """An empty account produces no rows and every reason, not a fabricated zero.
+    """An empty account produces no rows, no events and every reason.
 
     The sentence is asserted in full rather than by substring because the whole
     point is that each detector says *its own* reason: "no availability is
@@ -732,10 +732,23 @@ async def test_a_brand_new_account_is_told_it_has_not_enough_data(
     with different remediations, and a summary that collapsed them into one
     generic sentence would have thrown away the only actionable part.
 
-    ``evaluated`` is true even here, and that is not a contradiction: the
-    scheduling detector always has an answer (four counts over an empty plan),
-    so the pass *ran*. What it has is an answer of zero, which is why the zeros
-    sentence appears alongside the unavailable ones.
+    ``evaluated`` is **false** here, and this assertion was ``True`` before the
+    scheduling detector learned to decline. The old expectation was wrong rather
+    than merely out of date, and the reason is worth recording: the flag means
+    "at least one detector could judge something", and on an account with no
+    projects, no tasks, no sessions and no availability rules, not one could.
+    The flag stayed true only because the scheduling detector was fed four zero
+    counts and had nowhere to notice that there was no plan behind them. So the
+    pass reported that it had evaluated this account and had measured nothing
+    at all — a confident "you are fine" from an engine whose entire design
+    argument is that it would rather decline, and ``evaluated: false`` — the
+    answer the contracts describe and the Risk Center needs to tell "nothing to
+    report yet" from "nothing wrong" — was unreachable through the API.
+
+    The two halves are asserted together because they are one claim: the account
+    produces nothing **and** says why. A pass that wrote a row here would be
+    fabricating one, and a pass that wrote nothing silently would have left an
+    empty Risk Center indistinguishable from a clean one.
     """
     seed = await _seed(db_session)
     today = await _db_today(db_session)
@@ -743,6 +756,60 @@ async def test_a_brand_new_account_is_told_it_has_not_enough_data(
     summary = await _service(db_session).evaluate(owner=seed.owner, today=today, window_days=WINDOW)
 
     assert await _risks(db_session, seed.owner.id) == []
+    assert _risk_event_types(await _events(db_session, seed.owner.id)) == []
+    assert await _recommendations(db_session, seed.owner.id) == []
+    assert summary.risks_found == 0
+    assert summary.risks_created == 0
+    assert summary.risks_updated == 0
+    assert summary.risks_resolved == 0
+    assert summary.recommendations_created == 0
+    assert summary.evaluated is False
+    assert summary.reason_if_not_evaluated == (
+        "Workload: No availability is configured, so there is no capacity to compare "
+        "scheduled work against.; "
+        "Estimation: Not enough historical data to estimate your typical task duration.; "
+        "Consistency: There is no earlier period with recorded activity to compare against.; "
+        "Scheduling: No work sessions are recorded in this window, so there is no schedule "
+        "to inspect.; "
+        "Deadline: Not assessed: no open task carries both a due date inside this window "
+        "and an estimate.; "
+        "Task: Not assessed: no open task is recorded as blocked or has 3 or more reschedules "
+        "in its history."
+    )
+    history = await _evaluations(db_session, seed.owner.id)
+    assert len(history) == 1
+    assert history[0]["risks_found"] == 0
+
+
+async def test_one_scheduled_session_is_enough_for_the_pass_to_have_judged_something(
+    db_session: AsyncSession,
+) -> None:
+    """The other side of the boundary: a plan of one is still a plan.
+
+    The cold-start test above asserts that an account with nothing at all
+    answers ``evaluated: false``, and the obvious way to over-correct is to make
+    the scheduling detector decline whenever it measured zero — which would turn
+    every clean week into "not enough data" and quietly invert the flag into
+    "no risk was found". This is the test that pins the boundary where it
+    belongs: **one** session with no conflicts in it is a measurement of a real
+    schedule, so the detector measures, scores zero, stores nothing, and the flag
+    is true.
+
+    Everything else about the account is deliberately left empty — no project, no
+    task, no availability — so the scheduling detector is the *only* detector
+    that can judge, and ``evaluated: true`` here rests on one answer rather than
+    on a crowd. The reason sentence is asserted in full because its shape is the
+    contract a client renders: the three unavailable detectors first, then the
+    two that had no rows to look at, then the single zero.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    await seed.work_session(day=today, minutes=60, start_hour=9)
+
+    summary = await _service(db_session).evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+
+    assert await _risks(db_session, seed.owner.id) == []
+    assert _risk_event_types(await _events(db_session, seed.owner.id)) == []
     assert summary.risks_found == 0
     assert summary.evaluated is True
     assert summary.reason_if_not_evaluated == (
@@ -756,9 +823,47 @@ async def test_a_brand_new_account_is_told_it_has_not_enough_data(
         "in its history.; "
         "Scheduling: measured no risk in this window."
     )
-    history = await _evaluations(db_session, seed.owner.id)
-    assert len(history) == 1
-    assert history[0]["risks_found"] == 0
+
+
+async def test_cancelled_sessions_are_not_a_plan_to_inspect(db_session: AsyncSession) -> None:
+    """Rows the detector walks past are not rows it judged.
+
+    A cancelled session was booked and then withdrawn, so it is not part of the
+    plan — which is why :func:`~app.services.risk.detection._booked_minutes_by_task`
+    already excludes it from a task's booked time. Counting it here would make
+    ``sessions_considered`` disagree with the counts beside it: an account whose
+    only session was cancelled would report a plan of one and a clean week,
+    which is the same fabricated zero the cold-start case exists to prevent.
+
+    The stored row is counted first, so the test cannot pass vacuously — if the
+    fixture's session were not actually in the table, "no sessions to inspect"
+    would be true for the wrong reason.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    await seed.work_session(day=today, minutes=60, start_hour=9, status="cancelled")
+    stored = await db_session.scalar(
+        select(func.count()).select_from(WorkSession).where(WorkSession.owner_id == seed.owner.id)
+    )
+    assert stored == 1
+
+    summary = await _service(db_session).evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+
+    assert await _risks(db_session, seed.owner.id) == []
+    assert _risk_event_types(await _events(db_session, seed.owner.id)) == []
+    assert summary.evaluated is False
+    assert summary.reason_if_not_evaluated == (
+        "Workload: No availability is configured, so there is no capacity to compare "
+        "scheduled work against.; "
+        "Estimation: Not enough historical data to estimate your typical task duration.; "
+        "Consistency: There is no earlier period with recorded activity to compare against.; "
+        "Scheduling: No work sessions are recorded in this window, so there is no schedule "
+        "to inspect.; "
+        "Deadline: Not assessed: no open task carries both a due date inside this window "
+        "and an estimate.; "
+        "Task: Not assessed: no open task is recorded as blocked or has 3 or more reschedules "
+        "in its history."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -58,7 +58,10 @@ through a ``CASE`` rank built from :class:`~app.models.enums.RiskSeverity`
 itself, so the ordering cannot drift from the vocabulary if the words are ever
 re-spelled. The cost is that the list ordering can no longer be served straight
 off ``ix_risks_owner_status_severity``; that is accepted, because the alternative
-is a list that ranks the user's problems wrongly.
+is a list that ranks the user's problems wrongly. The index keeps its value for a
+different job: ``severity`` is its *third* column, so the Risk Center's band
+filter is an equality probe on ``(user_id, status, severity)`` rather than a scan
+— which is why adding a server-side severity filter needed no migration.
 
 **Counts are one grouped query, seeded, and carry no derived total.**
 :meth:`RiskRepository.count_by_severity` returns every severity key with a zero
@@ -316,6 +319,52 @@ def _to_orm_attributes(values: Mapping[str, Any]) -> dict[str, Any]:
     return {_ORM_ATTRIBUTE_OVERRIDES.get(key, key): value for key, value in values.items()}
 
 
+def _risk_filters(
+    owner_id: uuid.UUID,
+    *,
+    statuses: Sequence[str] | None,
+    risk_types: Sequence[str] | None,
+    severities: Sequence[str] | None,
+) -> list[Any]:
+    """Build the one ``WHERE`` clause the risk list, its count and its tally share.
+
+    Three statements answer three questions about the same question — "which rows
+    do these filters match" — and a filter written out three times is three
+    chances for the header to disagree with the rows under it. Building it once
+    is what makes ``by_severity`` a description of the filtered set rather than a
+    near neighbour of it, and it is why this takes all three filter kinds as
+    required keywords: a caller cannot add a filter to one statement and forget
+    the others.
+
+    Each is a sequence rather than a single value because that is what the
+    filters really are — "one of these statuses" is the live set, and a caller
+    that wants one word passes one word. An empty or absent sequence means *no
+    restriction on this column*, which is the same convention as the SQL: the
+    predicate is simply not added.
+
+    Args:
+        owner_id: Whose risks, always asserted rather than filtered afterwards.
+        statuses: Restrict to these :class:`~app.models.enums.RiskStatus` values.
+        risk_types: Restrict to these :class:`~app.models.enums.RiskType` values.
+        severities: Restrict to these
+            :class:`~app.models.enums.RiskSeverity` values.
+
+    Returns:
+        The predicates, owner first. ``ix_risks_owner_status_severity`` is keyed
+        on ``(user_id, status, severity)``, so a query carrying both a status and
+        a band is an equality probe on three indexed columns and needs no new
+        index to stay cheap.
+    """
+    filters: list[Any] = [Risk.user_id == owner_id]
+    if statuses:
+        filters.append(Risk.status.in_(list(statuses)))
+    if risk_types:
+        filters.append(Risk.risk_type.in_(list(risk_types)))
+    if severities:
+        filters.append(Risk.severity.in_(list(severities)))
+    return filters
+
+
 class RiskRepository:
     """Risk, recommendation, and evaluation persistence for one session.
 
@@ -338,6 +387,7 @@ class RiskRepository:
         *,
         statuses: Sequence[str] | None = None,
         risk_types: Sequence[str] | None = None,
+        severities: Sequence[str] | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[Risk], int]:
@@ -360,17 +410,23 @@ class RiskRepository:
                 the live set explicitly.
             risk_types: Restrict to these :class:`~app.models.enums.RiskType`
                 values. Same convention as ``statuses``.
+            severities: Restrict to these
+                :class:`~app.models.enums.RiskSeverity` values. This is the band
+                filter the Risk Center's tiles drive, and it is answered here
+                rather than in the client so a band count can reach beyond the
+                current page. It costs nothing to serve: ``severity`` is the third
+                column of ``ix_risks_owner_status_severity``, so a caller holding
+                both a status and a band is probing all three indexed columns for
+                equality.
             limit: Page size.
             offset: Rows to skip.
 
         Returns:
             The page of rows and the total number of rows the filters match.
         """
-        filters: list[Any] = [Risk.user_id == owner_id]
-        if statuses:
-            filters.append(Risk.status.in_(list(statuses)))
-        if risk_types:
-            filters.append(Risk.risk_type.in_(list(risk_types)))
+        filters = _risk_filters(
+            owner_id, statuses=statuses, risk_types=risk_types, severities=severities
+        )
 
         statement = (
             select(Risk, func.count().over().label("total"))
@@ -864,7 +920,12 @@ class RiskRepository:
         return list(result.scalars().all())
 
     async def count_by_severity(
-        self, owner_id: uuid.UUID, *, statuses: Sequence[str] | None = None
+        self,
+        owner_id: uuid.UUID,
+        *,
+        statuses: Sequence[str] | None = None,
+        risk_types: Sequence[str] | None = None,
+        severities: Sequence[str] | None = None,
     ) -> dict[str, int]:
         """``{severity: count}`` for the Risk Center header, in one grouped query.
 
@@ -879,10 +940,20 @@ class RiskRepository:
         status tally. The response schema carries ``total`` beside
         ``by_severity``, so a total inside the tally would be a second number
         that a client could sum alongside the first.
+
+        The three filters are the ones :meth:`list_risks` takes, built by the same
+        :func:`_risk_filters`, and they are all honoured here. A tally that
+        described a *different* set from the rows on screen would be worse than
+        no tally: the header would say there are four critical findings while the
+        filtered list showed none, and nothing on the page would let a reader tell
+        which of the two numbers to believe. Passing ``severities`` collapses the
+        tally to one populated band, which is the honest answer to "what is behind
+        this band" — and it is the answer the Risk Center tiles need in order to
+        count a band across every page rather than the one it happens to hold.
         """
-        filters: list[Any] = [Risk.user_id == owner_id]
-        if statuses:
-            filters.append(Risk.status.in_(list(statuses)))
+        filters = _risk_filters(
+            owner_id, statuses=statuses, risk_types=risk_types, severities=severities
+        )
         result = await self.session.execute(
             select(Risk.severity, func.count()).where(*filters).group_by(Risk.severity)
         )

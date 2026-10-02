@@ -134,15 +134,13 @@ RISK_NOT_FOUND_MESSAGE = "That risk does not exist."
 #: The same for recommendations — on the read route.
 RECOMMENDATION_NOT_FOUND_MESSAGE = "That recommendation does not exist."
 
-#: ...and on the four transitions, which is a *different* string for the same
-#: condition. ``app/api/v1/recommendations.py`` defines
-#: ``_RECOMMENDATION_NOT_FOUND`` for its own ``GET``, but the transitions delegate
-#: to :class:`RecommendationService`, which raises its own
-#: ``_RECOMMENDATION_NOT_FOUND`` ("Recommendation not found."). Neither leaks an
-#: existence oracle — both are identical for a foreign id and a never-issued one,
-#: which is what is asserted — but the router's docstring claims one message for
-#: both surfaces, so this is reported as a defect rather than as intended.
-RECOMMENDATION_TRANSITION_NOT_FOUND_MESSAGE = "Recommendation not found."
+#: ...and on the four transitions, which used to be a *different* string for the
+#: same condition: the router defined one for its own ``GET`` while the
+#: transitions delegated to :class:`RecommendationService`, which raised its own.
+#: Neither leaked an existence oracle, but the same condition answering in two
+#: sentences on two routes of one resource is a contract a client cannot hold
+#: onto, and the router's docstring claimed otherwise. They are now one constant.
+RECOMMENDATION_TRANSITION_NOT_FOUND_MESSAGE = RECOMMENDATION_NOT_FOUND_MESSAGE
 
 #: A role the permission map has never heard of, used for the 403 case. An
 #: ordinary account holds ``analytics.read``, so refusing a request has to be a
@@ -619,13 +617,12 @@ async def test_a_page_size_outside_the_documented_bounds_is_422(
 
 
 async def test_the_risk_list_filters_by_status_and_by_type(client, db_session, account):
-    """Each filter narrows the rows, and the tally follows the status filter only.
+    """Each filter narrows the rows, and the tally narrows with them.
 
-    ``by_severity`` deliberately counts the **status** filter and not the type
-    filter: the grouped count takes statuses, so a page narrowed to one risk type
-    draws a header describing the whole status set. Asserting the mismatch is
-    what stops a future "fix" from quietly changing which number the header is
-    describing.
+    ``by_severity`` counts the **same set the items come from**, which is what
+    makes ``sum(by_severity.values()) == total`` true rather than incidental.
+    Asserting the type filter reaches the tally is what stops a future change
+    from quietly describing the whole account over the top of a filtered page.
     """
     seed, headers = account
     owner = seed.owner
@@ -654,9 +651,10 @@ async def test_the_risk_list_filters_by_status_and_by_type(client, db_session, a
         str(project_acknowledged.id),
     ]
     assert body["total"] == 2
-    # The type filter does not reach the tally: the header still describes every
-    # risk the caller has in these statuses.
-    assert body["by_severity"] == {"critical": 1, "high": 1, "medium": 1, "low": 0}
+    # The type filter reaches the tally too, so the header describes the two rows
+    # on screen and not the deadline risk the caller filtered away.
+    assert body["by_severity"] == {"critical": 0, "high": 1, "medium": 1, "low": 0}
+    assert sum(body["by_severity"].values()) == body["total"]
 
     by_status = await client.get(
         "/api/v1/risks", params={"status": "acknowledged"}, headers=headers
@@ -677,8 +675,185 @@ async def test_the_risk_list_filters_by_status_and_by_type(client, db_session, a
     assert deadline.id not in {item["id"] for item in both.json()["items"]}
 
 
+async def test_the_risk_list_filters_by_severity_band(client, db_session, account):
+    """One band, counted across every page rather than across the rows in hand.
+
+    The band is the tile filter, so it is the one whose client-side version was
+    visibly wrong: narrowing a page in the browser could only ever find the rows
+    that page already carried. Answering it here is what lets ``total`` and the
+    pager mean something while a band is in force.
+    """
+    seed, headers = account
+    owner = seed.owner
+    rows = await _seed_ordering(db_session, owner)
+
+    response = await client.get("/api/v1/risks", params={"severity": "high"}, headers=headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Both `high` rows, and only them, still in the repository's ordering.
+    assert [item["id"] for item in body["items"]] == [
+        str(rows["high-new"].id),
+        str(rows["high-old"].id),
+    ]
+    assert body["total"] == 2
+    # The tally describes the filtered set, so the three bands the caller did not
+    # ask for read zero rather than repeating numbers the list is not showing.
+    assert body["by_severity"] == {"critical": 0, "high": 2, "medium": 0, "low": 0}
+
+
+async def test_a_band_filter_pages_without_losing_a_row(client, db_session, account):
+    """Two rows in a band, taken one at a time.
+
+    This is the case the client-side band could not express at all: the pager was
+    withdrawn while a band was active, because the narrowed page had no total to
+    divide by. ``total`` here is the band's, so the second row is reachable.
+    """
+    seed, headers = account
+    owner = seed.owner
+    rows = await _seed_ordering(db_session, owner)
+
+    first = await client.get(
+        "/api/v1/risks", params={"severity": "high", "limit": 1, "offset": 0}, headers=headers
+    )
+    second = await client.get(
+        "/api/v1/risks", params={"severity": "high", "limit": 1, "offset": 1}, headers=headers
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert [item["id"] for item in first.json()["items"]] == [str(rows["high-new"].id)]
+    assert [item["id"] for item in second.json()["items"]] == [str(rows["high-old"].id)]
+    # A short page is not a filtered one: both pages say the band holds two.
+    for page in (first, second):
+        assert page.json()["total"] == 2
+        assert page.json()["by_severity"] == {"critical": 0, "high": 2, "medium": 0, "low": 0}
+
+
+async def test_the_band_filter_narrows_with_status_and_type_together(client, db_session, account):
+    """Three filters are an intersection, on the items and on the tally alike.
+
+    The rows are seeded so that each filter alone would still leave more than
+    one: dropping ``status`` widens the answer, which is what distinguishes an
+    intersection from three filters where only the last one is doing the work.
+    """
+    seed, headers = account
+    owner = seed.owner
+    deadline = await _risk(
+        db_session, owner, risk_type=RiskType.DEADLINE.value, severity="critical", score=91
+    )
+    project_active = await _risk(
+        db_session,
+        owner,
+        risk_type=RiskType.PROJECT.value,
+        severity="high",
+        score=60,
+        detected_at=_recent(1),
+    )
+    project_acknowledged = await _risk(
+        db_session,
+        owner,
+        risk_type=RiskType.PROJECT.value,
+        severity="high",
+        score=58,
+        status=RiskStatus.ACKNOWLEDGED.value,
+        detected_at=_recent(2),
+    )
+    workload = await _risk(
+        db_session,
+        owner,
+        risk_type=RiskType.WORKLOAD.value,
+        severity="high",
+        score=52,
+        detected_at=_recent(3),
+    )
+
+    narrowed = await client.get(
+        "/api/v1/risks",
+        params={"severity": "high", "status": "active", "risk_type": "project"},
+        headers=headers,
+    )
+    assert narrowed.status_code == 200, narrowed.text
+    body = narrowed.json()
+    assert [item["id"] for item in body["items"]] == [str(project_active.id)]
+    assert body["total"] == 1
+    assert body["by_severity"] == {"critical": 0, "high": 1, "medium": 0, "low": 0}
+
+    # Dropping one filter widens it by exactly the rows that filter was holding.
+    band_only = await client.get("/api/v1/risks", params={"severity": "high"}, headers=headers)
+    assert band_only.status_code == 200, band_only.text
+    assert [item["id"] for item in band_only.json()["items"]] == [
+        str(project_active.id),
+        str(project_acknowledged.id),
+        str(workload.id),
+    ]
+    assert band_only.json()["total"] == 3
+    assert str(deadline.id) not in {item["id"] for item in band_only.json()["items"]}
+
+
+async def test_the_band_tally_and_the_total_describe_the_same_rows(client, db_session, account):
+    """``sum(by_severity.values()) == total``, whatever band is in force.
+
+    The two are produced by different statements — a window count for the rows
+    and a grouped count for the tally — and a client is entitled to add one up
+    and check it against the other. The assertion is made over every band rather
+    than one because the interesting failure is a filter that reaches the grouped
+    count and not the rows, which shows up as a mismatch rather than as a 422.
+
+    The empty intersection is included because it is the one case the repository
+    answers with a different statement: a window count only exists on a returned
+    row, so a filter matching nothing falls back to a separate ``COUNT``. A band
+    filter that narrowed the rows but not that fallback would report a total of
+    zero for a band the tally says holds rows.
+    """
+    seed, headers = account
+    owner = seed.owner
+    await _seed_ordering(db_session, owner)
+
+    requests = [{"severity": band} for band in ("critical", "high", "medium", "low")]
+    requests.append({"severity": "critical", "status": "dismissed"})
+
+    for params in requests:
+        response = await client.get("/api/v1/risks", params=params, headers=headers)
+
+        assert response.status_code == 200, (params, response.text)
+        body = response.json()
+        assert sum(body["by_severity"].values()) == body["total"], params
+        assert set(body["by_severity"]) == {"critical", "high", "medium", "low"}, params
+        if body["total"] == 0:
+            assert body["items"] == [], params
+            assert body["by_severity"] == ZERO_BANDS, params
+        else:
+            assert {item["severity"] for item in body["items"]} == {params["severity"]}, params
+            assert body["by_severity"][params["severity"]] == body["total"], params
+
+
+async def test_omitting_the_band_filter_describes_the_whole_set(client, db_session, account):
+    """No ``severity`` parameter is no filter at all.
+
+    The band parameter is optional rather than defaulting to a first band,
+    because a default would silently hide every other band from a caller who
+    never asked to be shown one.
+    """
+    seed, headers = account
+    owner = seed.owner
+    rows = await _seed_ordering(db_session, owner)
+
+    response = await client.get("/api/v1/risks", headers=headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == [
+        str(rows[label].id) for label in ORDERING_EXPECTED
+    ]
+    assert body["total"] == len(ORDERING_FIXTURE)
+    assert body["by_severity"] == {"critical": 2, "high": 2, "medium": 1, "low": 1}
+
+
 @pytest.mark.parametrize(
-    "params", [{"status": "nonsense"}, {"risk_type": "budget"}], ids=["status", "risk_type"]
+    "params",
+    [{"status": "nonsense"}, {"risk_type": "budget"}, {"severity": "catastrophic"}],
+    ids=["status", "risk_type", "severity"],
 )
 async def test_an_unknown_filter_value_is_422_not_a_silently_empty_list(
     params, client, db_session, account
@@ -835,18 +1010,16 @@ async def test_a_terminal_risk_is_409_on_every_further_transition(
     current status — a deliberate asymmetry against the recommendation router,
     which does name it, and the difference is worth seeing stated here.
 
-    The one case this asserts is *not* a 409 is the repeat of the status the row
-    already holds, and it is worth being explicit about why. The repository's
-    transition table deliberately lets a terminal row transition to itself
-    (``_RISK_TRANSITIONS`` maps ``dismissed -> {dismissed}``) because the
-    detection sweep must be able to re-resolve a row another run already closed
-    without raising. The router reads the row and hands the request to the same
-    statement, so it cannot tell a repeat click from that sweep, and
-    ``POST /risks/{id}/dismiss`` on an already-dismissed risk answers 200 with
-    the row unchanged. That contradicts this router's own error contract —
-    ``app/api/v1/risks.py`` promises "409 for one already resolved or dismissed"
-    on all three transitions — and is reported as a defect rather than asserted
-    as intended. The fix belongs in the router, which already holds the row.
+    A repeat of the status the row *already holds* is a 409 too, and that is
+    worth being explicit about because the repository deliberately permits it.
+    ``_RISK_TRANSITIONS`` maps ``dismissed -> {dismissed}`` because the detection
+    sweep must be able to re-resolve a row another run already closed without
+    raising. That is right for the sweep and wrong for this endpoint: a user who
+    clicks "dismiss" on a risk they already dismissed should be told it is
+    closed, not handed a cheerful 200 and a second dismissal event. The two
+    callers genuinely want different answers, so the distinction is made in the
+    router — which already holds the row — rather than by loosening the
+    repository's table.
     """
     seed, headers = account
     owner = seed.owner
@@ -864,8 +1037,6 @@ async def test_a_terminal_risk_is_409_on_every_further_transition(
             resolved_at=_recent(0),
         ),
     ]
-    same_status = {RiskStatus.DISMISSED.value: "dismiss", RiskStatus.RESOLVED.value: "resolve"}
-
     for row in rows:
         for action, _expected, _event in RISK_TRANSITIONS:
             response = await _request(
@@ -875,12 +1046,10 @@ async def test_a_terminal_risk_is_409_on_every_further_transition(
                 headers=headers,
                 risk_id=row.id,
             )
-            if same_status[row.status] == action:
-                # See the docstring: idempotent today, 409 by the router's own
-                # documented contract.
-                assert response.status_code == 200, response.text
-                assert response.json()["status"] == row.status
-                continue
+            # Every combination is a 409, including the repeat of the status the
+            # row already holds. See the docstring: the repository permits that
+            # move for the detection sweep, and the router refuses it for a
+            # user, because the two callers want different answers.
             error = assert_error_envelope(response, status_code=409, code="conflict")
             assert "not in a state this action can apply to" in error["message"]
 
@@ -931,17 +1100,15 @@ async def test_each_recommendation_transition_writes_its_own_status_and_event(
     own event, because the status column says what a suggestion is now and the
     feed says when and in what order it got there.
 
-    ``from_status`` is asserted as the *target*, which is not what
-    :meth:`RecommendationService._respond` documents it to be. The service reads
-    the row first precisely so the event can say "accepted from viewed" rather
-    than "accepted without being read", but the read and the write share one
-    session, and ``transition_recommendation`` executes its ``UPDATE ...
-    RETURNING`` with ``populate_existing=True`` (``app/repositories/risk.py``
-    documents that flag for a good reason), which overwrites the attribute on the
-    instance the earlier read loaded. ``before.status`` is therefore the status
-    the write just set, and the training signal the method exists to preserve
-    is lost. Reported as a defect; the assertion below pins what the service
-    does today so the change is visible when it is fixed.
+    ``from_status`` is the status the row held *before* this call — which is the
+    whole point of the field. "accepted from viewed" and "accepted without being
+    read" are different rows in a future training set, and a ``from_status``
+    that always equalled the target could not tell them apart. Capturing it
+    takes reading it before the write: ``get_recommendation`` and
+    ``transition_recommendation`` share one session, and the latter's ``UPDATE
+    ... RETURNING`` runs with ``populate_existing=True``, so an attribute read
+    after the transition returns the status the write just set. Asserted as
+    ``new`` here because every case in this table starts from ``new``.
     """
     seed, headers = account
     owner = seed.owner
@@ -966,7 +1133,7 @@ async def test_each_recommendation_transition_writes_its_own_status_and_event(
     assert len(recorded) == 1, event
     assert recorded[0].metadata_["recommendation_id"] == str(suggestion.id)
     assert recorded[0].metadata_["status"] == expected
-    assert recorded[0].metadata_["from_status"] == expected
+    assert recorded[0].metadata_["from_status"] == "new"
 
 
 async def test_an_answered_recommendation_is_409_naming_the_status_it_is_in(
@@ -1027,11 +1194,12 @@ async def test_an_evaluation_runs_detection_and_reports_exact_counts(client, db_
 
     Everything else is *not* written, and the summary says why: no declared
     availability leaves the workload detector nothing to compare against, fewer
-    than three completed pairs leaves the estimation detector no history, and an
+    than three completed pairs leaves the estimation detector no history, an
     earlier window with no activity in it leaves the consistency detector no
-    baseline. The scheduling detector ran and measured zero, which is a
-    measurement rather than an absence — the distinction the module exists to
-    preserve.
+    baseline, and no work sessions at all leaves the scheduling detector no plan
+    to inspect. That last one is a genuine absence rather than a measured zero —
+    the fixture books no work — and it is why the pass is still ``evaluated``
+    only because the deadline detector had something to judge.
     """
     seed, headers = account
     await _overdue_task(seed)
@@ -1053,7 +1221,11 @@ async def test_an_evaluation_runs_detection_and_reports_exact_counts(client, db_
     assert reason.startswith("Workload: No availability is configured")
     assert "Estimation: Not enough historical data" in reason
     assert "Consistency: " in reason
-    assert reason.endswith("Scheduling: measured no risk in this window.")
+    assert "Scheduling: No work sessions are recorded in this window" in reason
+    assert reason.endswith(
+        "Task: Not assessed: no open task is recorded as blocked or has 3 or more "
+        "reschedules in its history."
+    )
 
     # The two rows the summary describes are the two the Risk Center now holds.
     listed = await client.get("/api/v1/risks", headers=headers)
@@ -1481,13 +1653,16 @@ async def test_a_fresh_account_can_evaluate_and_is_told_why_it_found_nothing(
     user in their first fortnight and a user with nothing wrong, and only the
     first can be told from the second if the reasons are on the response.
 
-    ``evaluated`` is true even here, and that is worth stating rather than
-    papering over: the flag means "at least one detector could judge something",
-    and the scheduling detector always can — it weighs four counts, all of which
-    are zero on an empty account. So the ``evaluated: false`` branch the
-    contracts describe is not reachable through the API while any detector is
-    unconditionally available. Reported as an observation; the reasons are what
-    a client has to render either way.
+    ``evaluated`` is **false**, and this is the assertion that proves the flag
+    is reachable. It used to be ``True`` here, and the test documented why as an
+    accepted limitation: the scheduling detector always could judge, because its
+    inputs are four counts and all four are zero on an empty account. That left
+    the API permanently answering "I evaluated this account and there is nothing
+    to report" for a user who has recorded nothing at all — the exact confusion
+    the flag exists to prevent, and the reason ``evaluated: false`` had no path
+    through the surface. The scheduling detector now declines when the plan it
+    read holds no sessions, so every detector declines here and the answer is
+    the honest one.
     """
     _seed, headers = account
 
@@ -1495,7 +1670,7 @@ async def test_a_fresh_account_can_evaluate_and_is_told_why_it_found_nothing(
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["evaluated"] is True
+    assert body["evaluated"] is False
     assert body["risks_found"] == 0
     assert body["risks_created"] == 0
     assert body["risks_updated"] == 0
@@ -1505,3 +1680,4 @@ async def test_a_fresh_account_can_evaluate_and_is_told_why_it_found_nothing(
     assert body["by_type"] == {}
     reason = body["reason_if_not_evaluated"]
     assert "Deadline: Not assessed: no open task carries both a due date" in reason
+    assert "Scheduling: No work sessions are recorded in this window" in reason

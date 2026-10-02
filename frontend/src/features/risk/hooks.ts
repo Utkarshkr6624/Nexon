@@ -12,15 +12,15 @@
  * suggestions" and "refresh the findings" the same operation, and the
  * recommendation list does not live inside the risk list.
  *
- * **The severity band is a client-side filter, and that is a property of the
- * API rather than a shortcut here.** `GET /risks` accepts `status` and
- * `risk_type`; it has no severity parameter, so `useRisks` narrows the returned
- * page itself. The band still belongs in the key — two different bands are two
- * different views and must not share a cache entry — and it is a *part* of the
- * key that the query function strips before the request, so no unknown query
- * parameter is ever put on the wire. The consequence is stated rather than
- * hidden: with a band active, `items` and `total` describe the band and the
- * server's `by_severity` and `summary` still describe the whole requested set.
+ * **The severity band is a server-side filter.** It was a client-side one until
+ * `GET /risks` grew a `severity` parameter, which moved the narrowing into a
+ * single indexed query and — the reason it mattered — made `total` and
+ * `by_severity` describe the filtered set rather than one page of it. That was
+ * the whole limitation of the earlier design: a band filter narrowed a page the
+ * server had already cut, so it could not count past the page and the pager had
+ * to be withdrawn. Both problems are gone; the pager now works under a band.
+ * The band is still part of the query key, because two bands are two views and
+ * must not share a cache entry.
  *
  * **Transitions write the row they changed straight into the cache before
  * invalidating.** The lifecycle routes answer with the updated resource, so the
@@ -99,8 +99,7 @@ type Enabled = { enabled?: boolean }
  * wire type and the view type cannot be confused for one another.
  */
 export interface RiskQuery extends RiskListParams {
-  /** Client-side band filter. See the module docstring for what it does to
-   *  `total`, `by_severity` and `summary`. */
+  /** Server-side band filter; sent as `?severity=`. */
   severity?: RiskSeverity
 }
 
@@ -146,29 +145,23 @@ export const riskKeys = {
     ['risk', 'evaluation', params.limit ?? null] as const,
 }
 
-/** The request parameters, with the client-only band removed. */
+/**
+ * The request parameters.
+ *
+ * The band goes on the wire. `GET /risks` grew a `severity` parameter during
+ * Phase 7, so the narrowing the UI used to do in JavaScript now happens in one
+ * indexed query: the band counts as a third equality column on
+ * `ix_risks_owner_status_severity`, and `by_severity` and `total` describe the
+ * filtered set rather than one page of it.
+ */
 function wireParams(params: RiskQuery): RiskListParams {
   return {
     ...(params.status ? { status: params.status } : {}),
     ...(params.risk_type ? { risk_type: params.risk_type } : {}),
+    ...(params.severity ? { severity: params.severity } : {}),
     ...(params.limit !== undefined ? { limit: params.limit } : {}),
     ...(params.offset !== undefined ? { offset: params.offset } : {}),
   }
-}
-
-/**
- * Narrows a page to one band.
- *
- * `by_severity` and `summary` are left exactly as the server sent them: they
- * are the server's account of the whole requested set, which is what the header
- * tiles render, and rewriting them here would produce two different truths for
- * the same number. `total` is the exception — it drives "showing N of M", and a
- * stale `M` there is a plainly wrong sentence rather than a different framing.
- */
-function applyBand(page: RiskListRead, severity: RiskSeverity | undefined): RiskListRead {
-  if (!severity) return page
-  const items = page.items.filter((item) => item.severity === severity)
-  return { ...page, items, total: items.length }
 }
 
 /* ----------------------------------------------------------------- queries */
@@ -191,7 +184,6 @@ export function useRisks(
     queryFn: ({ signal }) => fetchRisks(wireParams(params), signal),
     enabled: options.enabled,
     placeholderData: (previous) => previous,
-    select: (page) => applyBand(page, params.severity),
   })
 }
 

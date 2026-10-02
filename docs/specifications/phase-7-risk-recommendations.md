@@ -1,7 +1,21 @@
 # Phase 7 — Risk Detection & Recommendation Engine
 
-> **Status: 🔴 Not started.** Requires Phase 6 (real metrics) — building risk rules on absent
-> analytics is exactly what this phase forbids.
+> **Status: ✅ Implemented and tested.** Phase 6 was complete and healthy before
+> this phase began, and its analytics are consumed rather than re-derived.
+>
+> The pre-phase regression check **passed** — 884 backend and 361 frontend tests
+> green before any Phase 7 code was written.
+>
+> Phase 7 shipped: 7 risk types, 14 endpoints, a Risk Center, a Recommendations
+> page, a dashboard strip, and 329 new tests (268 backend, 61 frontend). The
+> phase's own tests found and fixed **twelve defects**, including a column too
+> narrow to store one of its own recommendation types and a silent data-loss bug
+> that emptied three of seven detectors' stored inputs.
+>
+> **See [`phase-7-report.md`](./phase-7-report.md) for the architecture, the risk
+> formulas, every bug, the commands to run, and the starting point for Phase 8.**
+> [`phase-7-contracts.md`](./phase-7-contracts.md) is the internal working contract
+> the implementation was built against; the report supersedes it.
 
 ---
 

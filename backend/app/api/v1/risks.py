@@ -68,6 +68,11 @@ Pagination
 than a silent truncation** — ``?limit=500`` is a 422, because a caller that
 asked for 500 and received 100 cannot tell a truncated page from a page that was
 always 100 rows long. See ``docs/api-conventions.md`` §Pagination.
+
+Every filter here narrows ``total``, so a caller narrows and then still pages.
+That is the whole argument for the severity filter being answered here rather
+than in the browser: a client-side band filter can only see the rows it already
+holds, so it can neither count a band nor offer a pager for one.
 """
 
 from __future__ import annotations
@@ -90,7 +95,7 @@ from app.api.deps import (
 from app.core.deps import require_permission
 from app.core.exceptions import ConflictError, NotFoundError
 from app.core.permissions import Permission
-from app.models.enums import ActivityEvent, RiskStatus, RiskType
+from app.models.enums import ActivityEvent, RiskSeverity, RiskStatus, RiskType
 from app.models.risk import LIVE_RISK_STATUSES, Recommendation, Risk
 from app.models.user import User
 from app.repositories.risk import RiskRepository
@@ -312,6 +317,7 @@ async def list_risks(
     offset: Annotated[int, Query(ge=0)] = 0,
     risk_status: Annotated[RiskStatus | None, Query(alias="status")] = None,
     risk_type: Annotated[RiskType | None, Query()] = None,
+    severity: Annotated[RiskSeverity | None, Query()] = None,
 ) -> RiskListRead:
     """One page of risks, ordered by severity then by how recently each was seen.
 
@@ -321,17 +327,21 @@ async def list_risks(
     the enum. A client that sorted the page itself would have to reimplement that
     and would eventually get it wrong.
 
-    ``status`` and ``risk_type`` are single-valued and are checked against the
-    enums by FastAPI, so ``?status=nonsense`` is a 422 rather than a filter that
-    quietly matches nothing.
+    ``status``, ``risk_type`` and ``severity`` are single-valued and are checked
+    against the enums by FastAPI, so ``?status=nonsense`` is a 422 rather than a
+    filter that quietly matches nothing. The band filter is the server's for a
+    reason a client cannot fix: narrowing a page in the browser can only count
+    the rows that page happened to carry, so the tiles would understate a band
+    that continued onto page two and the pager would have to be withdrawn for
+    want of a total. Here the same word narrows ``items``, ``total`` and the
+    tally together, and paging keeps working.
 
-    ``by_severity`` counts **the status filter, not the type filter**, and the
-    difference is worth stating because the response carries both: the grouped
-    count takes statuses only, so a page narrowed to one risk type draws a header
-    describing the whole status set. ``items`` and ``total`` follow both filters.
-    Making the tally type-aware is one optional parameter on
-    ``count_by_severity``; until it exists the header is deliberately not
-    silently wrong about the numbers it does cover.
+    ``by_severity`` counts **the same set the items come from** — all three
+    filters, applied by the repository's one filter builder, so the header tiles
+    and the rows underneath them cannot describe different questions. That makes
+    ``sum(by_severity.values()) == total`` an invariant a client may rely on, and
+    it is why the band filter leaves the other three bands at zero rather than
+    reporting what they would have said.
 
     **The suggestions are joined, so a card shows its actions.** A risk with none
     carries an empty list, which the Risk Center renders as "No suggested action
@@ -340,10 +350,18 @@ async def list_risks(
     """
     statuses = [risk_status.value] if risk_status is not None else None
     types = [risk_type.value] if risk_type is not None else None
+    bands = [severity.value] if severity is not None else None
     rows, total = await risks.list_risks(
-        current_user.id, statuses=statuses, risk_types=types, limit=limit, offset=offset
+        current_user.id,
+        statuses=statuses,
+        risk_types=types,
+        severities=bands,
+        limit=limit,
+        offset=offset,
     )
-    by_severity = await risks.count_by_severity(current_user.id, statuses=statuses)
+    by_severity = await risks.count_by_severity(
+        current_user.id, statuses=statuses, risk_types=types, severities=bands
+    )
     suggestions = await _recommendations_by_risk(session, current_user.id, [row.id for row in rows])
     return RiskListRead(
         items=[_risk_read(row, suggestions.get(row.id, [])) for row in rows],

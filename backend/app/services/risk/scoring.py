@@ -942,6 +942,7 @@ def scheduling_risk(
     outside_availability_sessions: int = 0,
     sessions_after_deadline: int = 0,
     longest_consecutive_run: int = 0,
+    sessions_considered: int | None = None,
     window_label: str = "",
 ) -> RiskResult:
     """Does the plan itself contain problems, independent of any single task.
@@ -969,18 +970,61 @@ def scheduling_risk(
     unambiguous — one of them cannot happen as planned, and that is arithmetic
     rather than interpretation.
 
+    **On a plan with nothing in it, declining rather than measuring zero.** This
+    detector used to be unconditionally available, on the argument that every
+    input is a count and a count of zero is a measurement. That argument does not
+    survive the case where *all four* counts are zero because there was nothing
+    to count. An account with no scheduled sessions has no plan, and "no
+    scheduling conflicts detected" is a claim about a plan that does not exist —
+    which is the "confident 0 that reads as *you are fine*" failure this module
+    is built to avoid, and the reason a pass over an empty account used to answer
+    ``evaluated: true`` while having measured nothing whatsoever.
+
+    The narrowing is deliberate in two directions. Declining requires the caller
+    to report **zero** sessions in the plan it walked: one session and no
+    conflict is a measurement of a real schedule, and stays one. And the test is
+    on the sessions, not on the four counts, because the four counts are this
+    function's own *output* — gating availability on the output would let a
+    detector silence itself by miscounting.
+
+    Args:
+        overlapping_sessions: Sessions that start before the furthest end already
+            seen, so one of them cannot happen as planned.
+        outside_availability_sessions: Sessions starting when declared
+            availability is off. Zero when no availability is declared, which is
+            a limitation of the *signal* rather than of the plan: the other three
+            are still measured, so the detector stays available.
+        sessions_after_deadline: Sessions starting after their own task is due.
+        longest_consecutive_run: The longest run of back-to-back sessions with no
+            gap between them.
+        sessions_considered: How many sessions the plan being inspected consists
+            of. Zero means there is no plan to inspect and the detector declines.
+            ``None`` — the default — means the caller has not established it
+            either way, and the four counts are taken at face value; that is the
+            right default for a pure function, and the detection service, which
+            knows how many rows it read, passes the real number.
+        window_label: Human description of the window, echoed into metadata.
+
     Returns:
-        A scored result. Always available: every input is a count, so a zero
-        score means "none of these were found", which is a measurement.
+        A scored result, or an unavailable one when the caller reports that the
+        plan contains no sessions to inspect.
     """
     meta: dict[str, Any] = {
         "overlapping_sessions": overlapping_sessions,
         "outside_availability_sessions": outside_availability_sessions,
         "sessions_after_deadline": sessions_after_deadline,
         "longest_consecutive_run": longest_consecutive_run,
+        "sessions_considered": sessions_considered,
     }
     if window_label:
         meta["window_label"] = window_label
+
+    if sessions_considered == 0:
+        return _unavailable(
+            RiskType.SCHEDULING,
+            "No work sessions are recorded in this window, so there is no schedule to inspect.",
+            metadata=meta,
+        )
 
     signals: dict[str, float] = {}
     evidence: list[RiskEvidence] = []

@@ -184,7 +184,31 @@ interface Backend {
  */
 function installBackend(overrides: Backend = {}): Call[] {
   const summary = overrides.summary ?? (() => json(SUMMARY))
-  const list = overrides.list ?? (() => json(RISK_LIST))
+  // The default list honours `severity` the way the server does. It has to:
+  // the band is a server-side filter now, so a stub that ignored it would hand
+  // the page rows for every band and the test would be asserting that the page
+  // filters in JavaScript — which is exactly what it no longer does.
+  const list =
+    overrides.list ??
+    ((url: string) => {
+      const severity = new URL(url, 'http://test').searchParams.get('severity')
+      if (!severity) return json(RISK_LIST)
+      const items = RISK_LIST.items.filter((item) => item.severity === severity)
+      const bySeverity: Record<string, number> = {
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+      }
+      for (const item of items) bySeverity[item.severity] = (bySeverity[item.severity] ?? 0) + 1
+      return json({
+        ...RISK_LIST,
+        items,
+        total: items.length,
+        by_severity: bySeverity,
+        summary: RISK_LIST.summary,
+      })
+    })
   const acknowledge =
     overrides.acknowledge ?? ((url) => json(transitioned(rowFor(url), 'acknowledged')))
   const dismiss = overrides.dismiss ?? ((url) => json(transitioned(rowFor(url), 'dismissed')))
@@ -309,7 +333,7 @@ describe('risk center page', () => {
     expect(screen.getAllByRole('heading', { name: 'Why' })).toHaveLength(4)
   })
 
-  it('narrows the list to the band in the URL without putting the band on the wire', async () => {
+  it('narrows the list to the band in the URL and sends it to the server', async () => {
     const calls = installBackend()
     renderRiskCenter('/risks?severity=critical')
 
@@ -323,15 +347,16 @@ describe('risk center page', () => {
     expect(screen.getByRole('link', { name: /High/ })).not.toHaveAttribute('aria-current')
     expect(screen.getByLabelText('Severity band')).toHaveValue('critical')
 
-    // The band is a client-side narrowing of the returned page, because
-    // `GET /risks` accepts `status` and `risk_type` only. It must therefore
-    // never appear as an unknown query parameter on the request.
+    // The band goes on the wire. It used to be narrowed in the browser over one
+    // server page, which is why `total` could not count past that page and the
+    // pager had to be withdrawn under a band; `GET /risks` now takes `severity`,
+    // so the narrowing is one indexed query and both problems are gone.
     expect(listCalls(calls)).toHaveLength(1)
-    expect(listCalls(calls)[0]?.url).not.toContain('severity=')
+    expect(listCalls(calls)[0]?.url).toContain('severity=critical')
     expect(listCalls(calls)[0]?.url).toContain('status=active')
 
-    // And the page says what the narrowing costs, rather than hiding it.
-    expect(screen.getByText(/The API filters by status and type only/)).toBeInTheDocument()
+    // And the page no longer carries the notice explaining what narrowing cost.
+    expect(screen.queryByText(/The API filters by status and type only/)).not.toBeInTheDocument()
   })
 
   it('acknowledges, dismisses and resolves through the three transition endpoints', async () => {

@@ -166,6 +166,10 @@ export type EvidenceStrength = (typeof EVIDENCE_STRENGTHS)[number]
 export interface RiskListParams extends PaginationParams {
   status?: RiskStatus
   risk_type?: RiskType
+  /** Narrow to one band. Served from the third column of
+   *  `ix_risks_owner_status_severity`, and `by_severity`/`total` describe the
+   *  filtered set rather than one page of it. */
+  severity?: RiskSeverity
 }
 
 /** Query parameters for `GET /recommendations`. Same single-valued rule. */

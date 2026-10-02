@@ -80,14 +80,27 @@ example had no path to the screen. They now share one identity — a risk of typ
 ``task`` pointing at the task row — which is also what lets the two rules agree
 with the detector about what "repeatedly rescheduled" means.
 
-One gap, resolved in this module's favour
------------------------------------------
+One gap, and how the summary carries the answer
+-----------------------------------------------
 ``risk_evaluations`` has no column for "detectors that declined to judge", and the
 ``EvaluationRead`` wire shape has no list for them either. The run summary
 therefore carries those reasons — and the reasons for the detectors that measured
 zero — in ``reason_if_not_evaluated``. ``evaluated`` is true when at least one
 detector could judge something, which is the question that field's name implies
 and the question an empty Risk Center needs answered.
+
+For that flag to be worth anything, *every* detector has to be able to decline.
+Six of the seven always could; the scheduling detector could not, because its
+four inputs are counts and a count of zero reads as a measurement. That reading
+is right when the plan is real and wrong when there is no plan at all — an
+account with no scheduled sessions has nothing the four counts could have found,
+and reporting "no conflicts detected" is the confident zero this module refuses
+to store anywhere else. So the count of sessions the detector actually walked is
+now one of its inputs, and an empty plan makes it decline like the rest. That
+makes ``evaluated: false`` reachable, which is the only way the distinction the
+Risk Center needs — "no significant risk detected yet" against "not enough data
+to assess this yet" — can be drawn at all: both present as an empty list, and
+only one of them is an answer the engine stands behind.
 
 Language
 --------
@@ -929,6 +942,15 @@ class RiskDetectionService:
         The scoring module documents why, and it is worth repeating where the
         number is assembled: a system that infers fatigue from a calendar is
         making a claim it has no data for, and the brief rules that out.
+
+        ``sessions_considered`` is the one input this detector supplies and the
+        scoring function could not have derived. Everything else is a count the
+        scoring module computed from the same rows; whether there *were* rows is
+        a fact only this layer holds, and it is what separates "the plan has no
+        conflicts" from "there is no plan". Without it the detector was
+        unconditionally available on four zeroes, which made the run summary's
+        ``evaluated`` flag permanently true and let a pass over an empty account
+        claim to have measured something.
         """
         signals = _scheduling_signals(
             session_rows=context.session_rows,
@@ -941,6 +963,7 @@ class RiskDetectionService:
                 outside_availability_sessions=signals["outside_availability_sessions"],
                 sessions_after_deadline=signals["sessions_after_deadline"],
                 longest_consecutive_run=signals["longest_consecutive_run"],
+                sessions_considered=signals["sessions_considered"],
                 window_label=context.window_label,
             ),
             entity_type=ENTITY_ACCOUNT,
@@ -1338,6 +1361,9 @@ def _scheduling_signals(
 ) -> dict[str, int]:
     """The four counts :func:`~app.services.risk.scoring.scheduling_risk` weighs.
 
+    The fifth entry, ``sessions_considered``, is how many sessions those four
+    counts were taken over.
+
     Computed in one pass over the already-fetched session rows rather than in
     four queries, because a plan's faults are not independent: two overlapping
     sessions are usually also two sessions outside availability, and asking the
@@ -1347,6 +1373,12 @@ def _scheduling_signals(
     which is the number of sessions in conflict. A session clashing with two
     others counts once: the fault is the clash, and counting it twice would
     inflate a two-session mistake into a four-session one.
+
+    ``sessions_considered`` is the size of ``ordered`` rather than the size of
+    ``session_rows``, and that distinction is the whole reason the count is
+    reported: a session with no start time is not a booking, and a cancelled one
+    is not part of the plan any more, so neither belongs in the number the
+    scoring function decides whether there *is* a plan.
     """
     windows: dict[int, list[tuple[time, time]]] = {}
     for weekday, window_start, window_end in availability:
@@ -1397,6 +1429,7 @@ def _scheduling_signals(
         "outside_availability_sessions": outside,
         "sessions_after_deadline": after_deadline,
         "longest_consecutive_run": longest_run,
+        "sessions_considered": len(ordered),
     }
 
 

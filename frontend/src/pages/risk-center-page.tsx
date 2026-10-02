@@ -47,11 +47,11 @@ import type {
  * **Every filter is in the URL, including the severity band.** `?severity=`,
  * `?status=`, `?risk_type=` and `?page=` make the view shareable and survive a
  * reload, and they make the back button walk out of a filter rather than out of
- * the page. The band is not a server filter — `GET /risks` accepts `status` and
- * `risk_type` only — so `useRisks` narrows the returned page itself. The
- * consequence is stated on screen rather than hidden: with a band active the
- * pager is withdrawn, because paging a client-side filter over one server page
- * would silently show fewer rows than the band actually holds.
+ * the page. The band used to be narrowed in the browser, which meant the pager
+ * had to be withdrawn under it: paging a client-side filter over one server page
+ * would show fewer rows than the band actually holds. `GET /risks` now takes
+ * `severity`, so the narrowing happens in one indexed query and the pager works
+ * under every filter.
  *
  * **The status filter defaults to `active`, and that is a visible choice rather
  * than a hidden one.** The select reads "Active" on arrival and the tiles above
@@ -243,9 +243,8 @@ export default function RiskCenterPage() {
     [fetched, overrides],
   )
 
-  // `total` follows the server filters. With a band active `useRisks` has
-  // already narrowed it to the band inside the current page, which is why the
-  // pager is withdrawn rather than driven from this number.
+  // `total` is the server's count for the *filtered* set, band included, so the
+  // pager is driven from it under every filter rather than withdrawn.
   const total = list.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const bandFiltered = severity !== undefined
@@ -457,12 +456,6 @@ export default function RiskCenterPage() {
               {list.data?.summary && (
                 <p className="mt-3 text-xs text-muted-foreground">{list.data.summary}</p>
               )}
-              {bandFiltered && (
-                <p className="mt-3 text-xs text-muted-foreground">
-                  The API filters by status and type only, so a band narrows the page currently
-                  loaded rather than the whole history. Clear the band to page through every risk.
-                </p>
-              )}
             </div>
 
             {/* A refetch under a changed filter keeps the previous page on screen
@@ -503,10 +496,9 @@ export default function RiskCenterPage() {
                 ))}
               </div>
 
-              {/* Withdrawn under a band filter on purpose: `total` there counts
-                  the matches inside one page, so a pager built from it would
-                  promise rows that were never fetched. */}
-              {!bandFiltered && total > PAGE_SIZE && (
+              {/* `total` is the server's count for the filtered set, band
+                  included, so this is correct under every combination. */}
+              {total > PAGE_SIZE && (
                 <nav className="flex items-center justify-between gap-3" aria-label="Risk pages">
                   <p className="text-xs text-muted-foreground">
                     Page {page} of {totalPages} · {total} matching risk
