@@ -10,6 +10,13 @@ caller computed and passed in, so a caller with a skewed clock cannot make an
 expired session look live. Second, a session row is mutated in place and never
 replaced: rotation rewrites ``token_hash`` rather than inserting a new row, which
 is what keeps "sign out everywhere" a single UPDATE.
+
+The consequence of the second idea is that a rotation has to be *guarded*, and
+it is guarded in SQL rather than in the caller: a row that holds exactly one
+current token is also a row two concurrent requests can both believe they are
+holding, so the expectation is part of the ``WHERE`` clause
+(:meth:`SessionRepository.rotate_token_if_current`) instead of a SELECT that
+precedes the write.
 """
 
 from __future__ import annotations
@@ -72,26 +79,37 @@ class SessionRepository:
         )
         return result.scalar_one_or_none()
 
-    async def get_by_token_hash(self, token_hash: str) -> Session | None:
-        """Return the session whose current token digest matches, or ``None``.
-
-        A rotated-away token no longer matches anything, which is what makes
-        replay detectable at this layer rather than by consulting a history.
-        """
-        result = await self.session.execute(select(Session).where(Session.token_hash == token_hash))
-        return result.scalar_one_or_none()
-
     async def list_for_user(
-        self, user_id: uuid.UUID, *, include_revoked: bool = False
+        self, user_id: uuid.UUID, *, include_inactive: bool = False
     ) -> list[Session]:
         """List a user's sessions, newest first.
 
-        Expired rows are kept in the listing: the sessions screen shows when a
-        device signed out, and that is only readable from the row itself.
+        **What this returns is live sessions only** — ``revoked_at IS NULL AND
+        expires_at > now()``, decided by the database. An expired row is not a
+        device that is signed in, and the sessions screen has no field that can
+        tell the two apart, so returning one would show the user a laptop they
+        signed out of months ago as a live session. The row itself is still kept
+        for audit purposes; it just is not part of what "your sessions" means.
+
+        ``include_inactive`` exists for the callers that want the history rather
+        than the live set, and is off by default. It is not a second product
+        decision: exposing rows the UI cannot classify is a change that belongs
+        to whoever adds an ``expired`` marker to the response schema.
+
+        Args:
+            user_id: Whose sessions to list. The scope is always one account.
+            include_inactive: Return revoked and expired rows too, instead of
+                only the live ones.
+
+        Returns:
+            The matching rows, newest first.
         """
         stmt = select(Session).where(Session.user_id == user_id)
-        if not include_revoked:
-            stmt = stmt.where(Session.revoked_at.is_(None))
+        if not include_inactive:
+            stmt = stmt.where(
+                Session.revoked_at.is_(None),
+                Session.expires_at > func.now(),
+            )
         result = await self.session.execute(stmt.order_by(Session.created_at.desc()))
         return list(result.scalars().all())
 
@@ -101,6 +119,13 @@ class SessionRepository:
         Oldest-first is the whole point of this method: the service enforces
         ``max_active_sessions`` by walking this list and evicting from the front,
         so the order has to be the eviction order rather than a display order.
+
+        ``id`` breaks ties because ``created_at`` is a one-second
+        ``server_default``. Without it, two sign-ins in the same second can come
+        back in either order, and "evicting the oldest" would quietly mean
+        "evicting whichever of the two the planner happened to return first" —
+        which, on a replay attack, is the difference between the attacker's row
+        and the owner's being the one that survives.
         """
         result = await self.session.execute(
             select(Session)
@@ -109,7 +134,7 @@ class SessionRepository:
                 Session.revoked_at.is_(None),
                 Session.expires_at > func.now(),
             )
-            .order_by(Session.created_at.asc())
+            .order_by(Session.created_at.asc(), Session.id.asc())
         )
         return list(result.scalars().all())
 
@@ -141,10 +166,18 @@ class SessionRepository:
     async def rotate_token(
         self, db_session: Session, *, token_hash: str, expires_at: datetime
     ) -> Session:
-        """Swap in a freshly minted token digest and its new expiry.
+        """Write a freshly minted token digest and its expiry, unconditionally.
 
         The row keeps its identity across rotation, so the ``sid`` claim of the
         refresh token that produced this call still points at this same device.
+
+        This is a first-write, not a rotation: it is how :meth:`SessionRepository.create`'s
+        placeholder digest is replaced with the real one during sign-in, by the
+        process that inserted the row microseconds earlier and is therefore the
+        only writer. It carries no "is the caller's token still current?" check,
+        so it must never be reached by a request that is *spending* a presented
+        token — that path is :meth:`rotate_token_if_current`, where an unguarded
+        write is a replay waiting to happen.
         """
         db_session.token_hash = token_hash
         db_session.expires_at = expires_at
@@ -152,6 +185,66 @@ class SessionRepository:
         await self.session.commit()
         await self.session.refresh(db_session)
         return db_session
+
+    async def rotate_token_if_current(
+        self,
+        db_session: Session,
+        *,
+        current_token_hash: str,
+        token_hash: str,
+        expires_at: datetime,
+    ) -> bool:
+        """Swap the digest in, but only while the row still holds the one presented.
+
+        The comparison lives in the ``WHERE`` clause rather than in a preceding
+        read, and that placement is the whole point. A read followed by an
+        unconditional write is check-then-act: under ``READ COMMITTED`` the
+        second client's SELECT still sees the *old* digest, because the first
+        client's UPDATE is uncommitted and therefore invisible to it, so both
+        pass the check and both write. The last writer wins and both freshly
+        minted pairs stay live — one refresh token, two usable sessions. Folding
+        the expectation into the UPDATE predicate makes the loser's statement
+        match zero rows, which is a conflict the database itself detects, with no
+        lock ordering to reason about and nothing for a caller to forget.
+
+        ``revoked_at IS NULL AND expires_at > now()`` rides along for the same
+        reason: "current" and "live" are decided together, so a session that was
+        revoked or that expired in the last few milliseconds cannot be rotated
+        by a check that read it a moment earlier. The instant is the database's
+        clock, per this module's rule.
+
+        Args:
+            db_session: The row being rotated. Only its ``id`` is trusted; every
+                other condition is re-evaluated by the database.
+            current_token_hash: The digest the caller presented, i.e. the one
+                whose currency earned this rotation.
+            token_hash: The digest to install.
+            expires_at: The new expiry, already clamped by the caller.
+
+        Returns:
+            ``True`` if the row was rotated. ``False`` if it no longer holds
+            ``current_token_hash``, or is no longer live — a replayed token, a
+            concurrent rotation, or a revocation that landed first. The
+            distinction is deliberately not available to the caller.
+        """
+        stmt = (
+            update(Session)
+            .where(
+                Session.id == db_session.id,
+                Session.token_hash == current_token_hash,
+                Session.revoked_at.is_(None),
+                Session.expires_at > func.now(),
+            )
+            .values(token_hash=token_hash, expires_at=expires_at)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        if not result.rowcount:
+            return False
+        # The instance still holds the values the UPDATE replaced.
+        await self.session.refresh(db_session)
+        return True
 
     async def revoke(self, db_session: Session, *, revoked_at: datetime) -> Session:
         """Mark the session revoked, leaving an earlier revocation untouched.

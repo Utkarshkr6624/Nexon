@@ -12,6 +12,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.session import Session
+
 __all__ = ["SessionListRead", "SessionRead"]
 
 
@@ -43,6 +45,36 @@ class SessionRead(BaseModel):
         default=False,
         description="True for the session the request was made with.",
     )
+
+    @classmethod
+    def for_request(cls, row: Session, *, current_session_id: UUID | None) -> SessionRead:
+        """Build one row's wire model, marking it when the caller is signed in on it.
+
+        **``is_current`` is a property of the request, not of the row.** The same
+        row is current in one caller's response and merely historical in
+        another's, so persisting the flag would mean a column that is only ever
+        true relative to somebody and has to be rewritten per reader. It is
+        derived here instead, from the id of the session the request was made
+        with, which the caller already holds — so marking costs no query the
+        listing did not already make.
+
+        Args:
+            row: The persisted session. Read through ``from_attributes``, so the
+                column list is not restated here and cannot drift.
+            current_session_id: The id from the presented token's ``sid`` claim,
+                or ``None`` for a token that carried none. ``None`` marks nothing,
+                which is the honest answer for a caller we cannot locate.
+
+        Returns:
+            The row as :class:`SessionRead`, with ``is_current`` resolved.
+        """
+        # ``model_validate`` reads the row; ``model_copy`` is the v2 API that
+        # overlays a computed value on an already-validated model. There is no
+        # ``update`` argument to ``model_validate`` — passing one is a TypeError
+        # the first time this endpoint is called.
+        return cls.model_validate(row).model_copy(
+            update={"is_current": row.id == current_session_id}
+        )
 
 
 class SessionListRead(BaseModel):

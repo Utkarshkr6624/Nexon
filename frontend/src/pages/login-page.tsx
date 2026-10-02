@@ -149,15 +149,19 @@ export default function LoginPage() {
       <Card>
         {/* No `CardHeader` — `AuthShell` already owns the page masthead — so the
             content keeps the card's own side padding instead of `pt-0`. */}
-        <CardContent className="pt-6">
+        <CardContent className="pt-5">
           {/*
             `noValidate` because the validation below is the one that runs:
             `type="email"` would otherwise block submission with a native
             bubble before `onSubmit` ever fires, and the inline messages the
             form actually renders would never appear. The type stays for the
             mobile keyboard and for the semantics it carries.
+
+            `gap-4` over the shared `gap-5`: the signed-out form is the one that
+            has to fit a laptop screen whole, and this screen has nothing below
+            it but a footer.
           */}
-          <form onSubmit={onSubmit} noValidate className="app-form-stack">
+          <form onSubmit={onSubmit} noValidate className="app-form-stack gap-4">
             {showBanner && error && <ErrorState error={error} compact title={bannerTitle} />}
 
             <div className="app-form-field">

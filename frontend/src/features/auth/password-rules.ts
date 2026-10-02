@@ -11,6 +11,12 @@
  * The ids and labels are the shared vocabulary with the backend's
  * `PASSWORD_RULES` and `password_rule_status`; changing one side without the
  * other silently desynchronises the two checklists.
+ *
+ * `hint` is the only text the checklist puts on screen, so it has to state the
+ * requirement rather than name the rule: "At least 8 characters" tells someone
+ * what to type, "Minimum length" makes them work out the rest. The four
+ * character-class rules carry worked examples for the same reason — a person
+ * guessing whether a space counts should not have to.
  */
 
 /** One requirement in the policy, in the shape the form renders. */
@@ -18,7 +24,11 @@ export interface PasswordRule {
   /** Stable id, identical to the backend's rule id. Do not reword. */
   id: string
   label: string
-  /** The concrete requirement, so the UI never says "the configured minimum". */
+  /**
+   * The concrete requirement as the user reads it. `label` names the rule —
+   * that is what the backend puts in its rejection message — while this says
+   * what to do, and it is the string the live checklist renders.
+   */
   hint?: string
   test: (value: string) => boolean
 }
@@ -59,25 +69,28 @@ export const PASSWORD_RULES: readonly PasswordRule[] = [
   {
     id: 'uppercase',
     label: 'Uppercase letter',
-    hint: 'At least one uppercase letter',
+    hint: 'An uppercase letter (e.g. A, Z)',
     test: (value) => HAS_UPPERCASE.test(value),
   },
   {
     id: 'lowercase',
     label: 'Lowercase letter',
-    hint: 'At least one lowercase letter',
+    hint: 'A lowercase letter (e.g. a, z)',
     test: (value) => HAS_LOWERCASE.test(value),
   },
   {
     id: 'digit',
     label: 'Digit',
-    hint: 'At least one digit',
+    hint: 'A number (e.g. 0, 9)',
     test: (value) => HAS_DIGIT.test(value),
   },
   {
     id: 'special',
     label: 'Special character',
-    hint: 'At least one character that is not a letter or a digit',
+    // A space satisfies this one, so the row admits it rather than letting the
+    // user rule it out. The examples are the familiar ones, not the only ones
+    // the backend accepts.
+    hint: 'A symbol or space (e.g. ! @ #)',
     test: (value) => HAS_SPECIAL.test(value),
   },
 ]
@@ -86,6 +99,8 @@ export const PASSWORD_RULES: readonly PasswordRule[] = [
 export interface RuleResult {
   id: string
   label: string
+  /** The requirement text, carried through so no caller has to re-derive it. */
+  hint: string
   satisfied: boolean
 }
 
@@ -94,6 +109,7 @@ export function evaluatePasswordRules(value: string): RuleResult[] {
   return PASSWORD_RULES.map((rule) => ({
     id: rule.id,
     label: rule.label,
+    hint: rule.hint ?? rule.label,
     satisfied: rule.test(value),
   }))
 }

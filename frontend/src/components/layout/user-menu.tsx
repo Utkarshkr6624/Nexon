@@ -15,13 +15,15 @@ import { selectDisplayName, selectInitials, useAuthStore } from '@/stores/auth-s
 import { toast } from '@/stores/toast-store'
 
 /**
- * Profile, Settings and Security all resolve here: `/settings` is the only
- * account route today and it is a single scrolling page, so there is no tab to
- * deep-link into. The three items stay separate because they are three
- * intentions; they land on the same page because it is the one place those
- * intentions are served.
+ * Each item targets the settings section that actually serves it. The section
+ * lives in `?tab=`, so these are real destinations rather than three labels
+ * for the same scroll position — and each one is shareable and back-navigable.
  */
-const ACCOUNT_ROUTE = '/settings'
+const ACCOUNT_ROUTES = {
+  profile: '/settings?tab=profile',
+  preferences: '/settings?tab=preferences',
+  security: '/settings?tab=security',
+} as const
 
 /** Chevron marking an item that navigates, so the destination is never a guess. */
 function NavigateHint() {
@@ -80,17 +82,17 @@ export function UserMenu() {
 
         <DropdownMenuSeparator />
 
-        <DropdownMenuItem onSelect={() => navigate(ACCOUNT_ROUTE)}>
+        <DropdownMenuItem onSelect={() => navigate(ACCOUNT_ROUTES.profile)}>
           <User aria-hidden="true" />
           Profile
           <NavigateHint />
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => navigate(ACCOUNT_ROUTE)}>
+        <DropdownMenuItem onSelect={() => navigate(ACCOUNT_ROUTES.preferences)}>
           <Settings aria-hidden="true" />
           Settings
           <NavigateHint />
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => navigate(ACCOUNT_ROUTE)}>
+        <DropdownMenuItem onSelect={() => navigate(ACCOUNT_ROUTES.security)}>
           <ShieldCheck aria-hidden="true" />
           Security
           <NavigateHint />

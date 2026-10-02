@@ -114,15 +114,6 @@ export function AppShell({ children }: AppShellProps) {
         onNavigate={closeMobile}
       />
 
-      {sheetOpen && (
-        <button
-          type="button"
-          aria-label="Close navigation"
-          onClick={closeMobile}
-          className="fixed inset-0 z-30 animate-in fade-in-0 bg-foreground/20 backdrop-blur-[1px] duration-150 ease-out lg:hidden"
-        />
-      )}
-
       {/* While the sheet covers the page, the page itself is inert: the sheet
           holds focus, so the content behind it should not be reachable at all. */}
       <div

@@ -18,6 +18,9 @@ from app.core.security import (
     create_refresh_token,
     decode_token,
     hash_password,
+    hash_token,
+    new_session_id,
+    token_fingerprint_matches,
     verify_password,
 )
 from app.models.user import User
@@ -74,6 +77,105 @@ def test_verifying_against_a_corrupt_hash_returns_false_instead_of_raising():
 def test_hashing_an_empty_password_is_rejected():
     with pytest.raises(ValueError, match="must not be empty"):
         hash_password("")
+
+
+# -- Token digests -----------------------------------------------------------
+
+
+def test_hash_token_is_a_64_character_hex_sha256():
+    """The digest is exactly as wide as the column.
+
+    ``sessions.token_hash`` and ``password_reset_tokens.token_hash`` declare
+    ``CHAR(64)``, so a different length would not fit the column.
+    """
+    digest = hash_token("a.b.c")
+
+    assert len(digest) == 64
+    assert digest == digest.lower()
+    assert int(digest, 16) >= 0  # pure hex
+    assert digest.isalnum()
+
+
+def test_hash_token_is_deterministic():
+    """Lookup is by digest, so the same token must always hash to the same value."""
+    assert hash_token("a.b.c") == hash_token("a.b.c")
+
+
+def test_hash_token_is_not_the_token_and_cannot_be_reversed():
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZGQifQ.signature"
+
+    digest = hash_token(token)
+
+    assert digest != token
+    assert token not in digest
+    # SHA-256, not bcrypt: the input is 256 bits of randomness, so there is no
+    # dictionary to slow an attacker down and a work factor would only add
+    # latency to every request that reads a session row.
+    assert not digest.startswith(("$2a$", "$2b$", "$2y$"))
+    assert hash_token("a.b.c") != hash_token("a.b.d")
+
+
+def test_hash_token_handles_an_empty_token():
+    """Hashing must not raise on input it could be handed from a header."""
+    assert len(hash_token("")) == 64
+
+
+def test_token_fingerprint_matches_accepts_the_matching_pair():
+    token = "a.b.c"
+
+    assert token_fingerprint_matches(token, hash_token(token)) is True
+
+
+def test_token_fingerprint_matches_rejects_a_mismatch():
+    stored = hash_token("the-real-token")
+
+    assert token_fingerprint_matches("a-different-token", stored) is False
+    assert token_fingerprint_matches("the-real-token", hash_token("other")) is False
+
+
+@pytest.mark.parametrize(
+    ("token", "stored"),
+    [
+        ("", hash_token("a.b.c")),
+        ("a.b.c", ""),
+        ("", ""),
+        ("a.b.c", "not-a-digest"),
+        ("a.b.c", None),
+        (None, hash_token("a.b.c")),
+        ("a.b.c", hash_token("a.b.c").upper()),
+    ],
+)
+def test_token_fingerprint_matches_denys_bad_input_instead_of_raising(token, stored):
+    """Never raises.
+
+    A corrupt or empty stored value has to deny the request, not turn it into a
+    500: the whole point of the comparison is to be the last thing standing
+    between a bad token and a session.
+    """
+    assert token_fingerprint_matches(token, stored) is False
+
+
+# -- Session ids -------------------------------------------------------------
+
+
+def test_new_session_id_is_a_parseable_uuid4():
+    parsed = uuid.UUID(new_session_id())
+
+    assert parsed.version == 4
+
+
+def test_new_session_id_is_returned_as_a_string():
+    """It travels in a JWT claim, where everything is a string."""
+    raw = new_session_id()
+
+    assert isinstance(raw, str)
+    assert str(uuid.UUID(raw)) == raw
+
+
+def test_two_session_ids_differ():
+    ids = {new_session_id() for _ in range(100)}
+
+    assert len(ids) == 100
 
 
 # -- Tokens ------------------------------------------------------------------

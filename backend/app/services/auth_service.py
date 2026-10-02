@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import secrets
 import uuid
 from collections.abc import Mapping
@@ -52,6 +53,8 @@ from app.services.audit_service import AuditService
 from app.services.session_service import SessionService
 
 __all__ = ["AuthService", "RevocationStore", "get_revocation_store"]
+
+logger = logging.getLogger("app.services.auth_service")
 
 #: Generic message for every failed credential check, so that probing cannot
 #: distinguish "unknown email" from "wrong password".
@@ -338,19 +341,39 @@ class AuthService:
         return self.issue_token_pair(user)
 
     async def revoke(self, token: str) -> None:
-        """Blacklist a token and end the session behind it.
+        """Blacklist a token and end the session behind it. Never raises.
 
         Unparseable or already expired tokens are ignored: logout answers 204
         whatever the caller presents, because a client that cannot log out is a
         client that stays signed in.
+
+        The same rule covers the rest of the method, not just the decode. A
+        signature that verifies but carries no ``jti`` has no id to blacklist,
+        and a session row that cannot be written is a database problem rather
+        than something the client could do anything about; either one escaping
+        would turn logout into a 401 and leave the caller signed in — the
+        opposite of what they asked for. Failures are logged at WARNING instead,
+        so the condition is still visible to an operator without reaching the
+        caller as an error.
         """
         try:
             token_data = decode_token(token, settings=self.settings)
         except UnauthorizedError:
             return
-        await self._revoke(token_data)
-        if self.sessions is not None:
-            await self.sessions.revoke_by_token(token)
+        try:
+            await self._revoke(token_data)
+            if self.sessions is not None:
+                await self.sessions.revoke_by_token(token)
+        except Exception:
+            logger.warning("logout_revocation_failed", exc_info=True)
+            return
+        # A logout is one of the few events an operator actually looks for, so
+        # it is recorded even though the token itself is deliberately not: the
+        # subject is enough to say "this account ended this session here". It
+        # sits outside the guard above because the attempt happened whether or
+        # not the write behind it succeeded, and that pairing — an audit row and
+        # a WARNING — is what makes a failed sign-out diagnosable.
+        await self._audit(AuditEvent.USER_LOGOUT, user_id=_subject_or_none(token_data))
 
     async def logout_all(
         self, *, user_id: uuid.UUID, keep_session_id: uuid.UUID | None = None
@@ -510,9 +533,10 @@ class AuthService:
             ip_address: Recorded on the audit row.
 
         Raises:
-            UnauthorizedError: If the token is unknown, spent, expired, or was
-                not a reset token at all. All four answer identically, so a spent
-                link cannot be distinguished from a guessed one.
+            UnauthorizedError: If the token is unknown, spent, expired, was not
+                a reset token at all, or lost the race to a concurrent
+                redemption of the same link. All five answer identically, so a
+                spent link cannot be distinguished from a guessed one.
         """
         now = datetime.now(UTC)
         token_data = decode_token(token, settings=self.settings)
@@ -527,7 +551,15 @@ class AuthService:
         user = await self.repository.get_by_id(row.user_id)
         if user is None or not user.is_active:
             raise UnauthorizedError(_INVALID_RESET)
-        await self._resets.mark_used(row, used_at=now)
+        # The token is claimed before anything is hashed or written, not after.
+        # Loading the row and then acting on it leaves two concurrent
+        # redemptions of a stolen link both ready to overwrite the password the
+        # legitimate owner just set; the conditional write in ``spend`` lets
+        # exactly one of them through and hands the other this same message.
+        # Spending first also fails the safe way: if the password write that
+        # follows fails, the link is dead rather than still redeemable.
+        if not await self._resets.spend(row.id, used_at=now):
+            raise UnauthorizedError(_INVALID_RESET)
         await self.repository.update_fields(
             user,
             hashed_password=hash_password(new_password),
@@ -619,6 +651,19 @@ def _conflict_message(exc: IntegrityError, email_message: str, username_message:
     if "username" in name:
         return username_message
     return email_message
+
+
+def _subject_or_none(token_data: TokenData) -> uuid.UUID | None:
+    """Return the token's subject as a UUID, or ``None`` when it is not one.
+
+    Only called after a signature has been verified, but a malformed ``sub``
+    must never turn a logout into a 500 — audit is best-effort by design and a
+    row that cannot name its user is still worth writing without one.
+    """
+    try:
+        return uuid.UUID(token_data.subject)
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 _revocation_store: RevocationStore | None = None

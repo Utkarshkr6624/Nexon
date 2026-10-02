@@ -1,7 +1,15 @@
 """Pydantic request/response models for the HTTP API."""
 
+from app.schemas.activity import ActivityEventRead, ActivityFeed
 from app.schemas.common import Message, Page, PageMeta
 from app.schemas.health import DatabaseHealth, HealthResponse
+from app.schemas.project import (
+    ProjectCreate,
+    ProjectRead,
+    ProjectStats,
+    ProjectSummary,
+    ProjectUpdate,
+)
 from app.schemas.security import (
     PASSWORD_RULES,
     PasswordChange,
@@ -12,6 +20,16 @@ from app.schemas.security import (
     password_rule_status,
 )
 from app.schemas.session import SessionListRead, SessionRead
+from app.schemas.tag import TagAssignment, TagCreate, TagRead
+from app.schemas.task import (
+    TaskCreate,
+    TaskPriorityChange,
+    TaskRead,
+    TaskStats,
+    TaskStatusChange,
+    TaskSummary,
+    TaskUpdate,
+)
 from app.schemas.user import (
     MAX_PASSWORD_LENGTH,
     MAX_USERNAME_LENGTH,
@@ -34,6 +52,8 @@ __all__ = [
     "MAX_USERNAME_LENGTH",
     "PASSWORD_RULES",
     "USERNAME_PATTERN",
+    "ActivityEventRead",
+    "ActivityFeed",
     "DatabaseHealth",
     "EmailAddress",
     "HealthResponse",
@@ -46,8 +66,23 @@ __all__ = [
     "PasswordResetRequest",
     "PasswordResetRequested",
     "PasswordRule",
+    "ProjectCreate",
+    "ProjectRead",
+    "ProjectStats",
+    "ProjectSummary",
+    "ProjectUpdate",
     "SessionListRead",
     "SessionRead",
+    "TagAssignment",
+    "TagCreate",
+    "TagRead",
+    "TaskCreate",
+    "TaskPriorityChange",
+    "TaskRead",
+    "TaskStats",
+    "TaskStatusChange",
+    "TaskSummary",
+    "TaskUpdate",
     "TokenPair",
     "TokenRefresh",
     "UserCreate",

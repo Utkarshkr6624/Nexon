@@ -153,7 +153,8 @@ async def sessions(
     ``sid`` is read from the access token rather than from the database, so the
     "current" marker is a property of this request and not something that has to
     be stored or kept up to date. Turning that into the per-row ``is_current``
-    flag is presentation, which is why it happens here and not in the service.
+    flag is presentation, which is why it happens here — on the way out through
+    :meth:`SessionRead.for_request` — and not in the service.
 
     Errors: 401 for a missing, invalid or revoked token.
     """
@@ -161,10 +162,7 @@ async def sessions(
         user_id=current_user.id, current_session_id=session_id
     )
     return SessionListRead(
-        sessions=[
-            SessionRead.model_validate(row, update={"is_current": row.id == current_id})
-            for row in rows
-        ],
+        sessions=[SessionRead.for_request(row, current_session_id=current_id) for row in rows],
         current_id=current_id,
     )
 
@@ -179,6 +177,7 @@ async def revoke_session(
     session_id: UUID,
     current_user: AuthenticatedUser,
     session_service: SessionServiceDep,
+    client: ClientContext,
 ) -> Response:
     """Revoke one of the caller's own sessions.
 
@@ -190,7 +189,13 @@ async def revoke_session(
 
     Errors: 404 when the caller does not own a session with this id.
     """
-    await session_service.revoke(session_id=session_id, user_id=current_user.id)
+    ip, agent = client
+    await session_service.revoke(
+        session_id=session_id,
+        user_id=current_user.id,
+        ip_address=ip,
+        user_agent=agent,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

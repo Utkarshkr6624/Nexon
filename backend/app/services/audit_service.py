@@ -126,6 +126,13 @@ class AuditService:
     The one thing a caller must not do is retry. A write that failed partway
     through is not safe to assume did not happen, and re-recording a security
     event is how a trail stops being evidence.
+
+    **Swallowing the exception is not by itself enough.** The repository shares
+    the request-scoped session, so a failed commit would otherwise leave the
+    session mid-transaction and turn the *caller's* next statement into a
+    ``PendingRollbackError`` — one broken audit row cancelling the business
+    operation it was only meant to describe. The handler therefore restores the
+    session before returning; see :meth:`_restore_session`.
     """
 
     def __init__(self, repository: AuditRepository) -> None:
@@ -177,4 +184,41 @@ class AuditService:
                 exc_info=True,
                 extra={"event_type": str(event), "user_id": str(user_id) if user_id else None},
             )
+            await self._restore_session()
             return None
+
+    async def _restore_session(self) -> None:
+        """Return the shared session to a usable state after a failed audit write.
+
+        Called only from :meth:`record`'s handler, and it is what makes the
+        "never denies service" promise in this class's docstring true rather than
+        merely intended. ``AuditRepository`` shares the *request-scoped*
+        ``AsyncSession`` with every other repository in the request, and it
+        commits. When that commit fails, SQLAlchemy leaves the session inside a
+        transaction it has already rolled back, and every subsequent operation
+        on it raises ``PendingRollbackError`` before it reaches the database.
+        Swallowing the failure without undoing it does not just lose the audit
+        row: it converts one broken write into a 500 for whatever the caller did
+        next. Concretely, ``UserService.delete_account`` writes its
+        ``ACCOUNT_DELETED`` row *before* deleting the account, so a failed audit
+        write used to make the very next statement fail and the account survive
+        the deletion it had already been told was done.
+
+        **Discarding the transaction loses nothing, because every repository
+        method in this codebase commits before it returns.** There is no
+        half-finished unit of business work sitting uncommitted for a rollback
+        to undo; the audit row was the only thing in flight, and it is the one
+        thing that has just failed. The rollback also expunges the uncommitted
+        row from the session, so the failed event cannot surface later as a
+        surprise write on somebody else's commit — which is the same thing the
+        no-retry rule above is protecting, arrived at from the other direction.
+
+        Best-effort, and quiet about its own failure: if the rollback also
+        raises there is nothing left to salvage, and the original exception has
+        already been logged. This must never turn a swallowed audit failure into
+        a raised one.
+        """
+        try:
+            await self.repository.session.rollback()
+        except Exception:
+            logger.warning("audit_session_rollback_failed", exc_info=True)

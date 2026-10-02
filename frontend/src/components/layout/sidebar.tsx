@@ -75,6 +75,10 @@ const NavItem = forwardRef<HTMLAnchorElement, NavItemProps>(function NavItem(
       ref={ref}
       to={item.to}
       onClick={onNavigate}
+      // The collapsed rail hides the label, which would leave an icon-only link
+      // with no accessible name. The name is stated explicitly so it survives
+      // both layouts and matches the visible text in the expanded one.
+      aria-label={item.label}
       className={cn('app-nav-row relative', collapsed && 'justify-center px-0')}
     >
       {({ isActive }) => (
@@ -181,7 +185,12 @@ export function AppSidebar({
         'fixed inset-y-0 left-0 z-40 flex w-[260px] flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground',
         'transition-[width,transform] duration-200 ease-out',
         'lg:w-[var(--sidebar-width)]',
-        mobileOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full lg:translate-x-0',
+        // No translate class while the sheet is open, and that is load-bearing:
+        // the backdrop below is `position: fixed`, and a transformed ancestor
+        // becomes its containing block, which would size the backdrop to the
+        // rail instead of the screen. `transform: none` still transitions from
+        // `-translate-x-full`, so the slide-in is unaffected.
+        mobileOpen ? 'shadow-2xl' : '-translate-x-full lg:translate-x-0',
       )}
     >
       {/* h-14 matches the top bar, so the two rails line up on the first row. */}
@@ -247,10 +256,34 @@ export function AppSidebar({
         {!collapsed && (
           <p className="flex items-center gap-2 px-3 pt-2.5 text-[11px] text-sidebar-muted">
             <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-primary/70" />
-            Phase 2 · shell and pages
+            Phase 2 · shell and accounts
           </p>
         )}
       </div>
+
+      {/*
+       * The dismiss control lives inside the rail, not beside it. It is a
+       * button and therefore the last tabbable in the root, so the trap's cycle
+       * ends on it: Tab reaches "Close navigation" and Shift+Tab reaches it
+       * from the first destination. As a sibling it was unreachable — the trap
+       * wrapped from the last destination straight back to the first, leaving
+       * Escape as the only keyboard way out and nothing on screen to say so
+       * (WCAG 2.1.1).
+       *
+       * It is inset by the rail's own width (`left-[260px]`, matching the
+       * `w-[260px]` above, which is what applies below `lg`) so it paints over
+       * the page only, exactly as it did when it was a sibling. Dismissing the
+       * sheet is the same action as navigating away from it, so both call
+       * `onNavigate`.
+       */}
+      {mobileOpen && (
+        <button
+          type="button"
+          aria-label="Close navigation"
+          onClick={onNavigate}
+          className="fixed inset-y-0 left-[260px] right-0 z-30 animate-in fade-in-0 bg-foreground/20 backdrop-blur-[1px] duration-150 ease-out lg:hidden"
+        />
+      )}
     </div>
   )
 }

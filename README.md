@@ -6,35 +6,52 @@ own machine and is never deployed to a cloud. No paid APIs, no paid services.
 
 ---
 
-## Status: Phase 1 (technical foundation) is complete
+## Status: Phase 2 (identity, sessions and security) is complete
 
-Phase 1 delivers the *foundation only*. What exists today:
+Phase 1 built the technical foundation. Phase 2 turns authentication into a real account
+system: persistent device sessions, a password policy, password recovery, role-based
+permissions, an audit trail, and a five-tab settings surface. What exists today:
 
 | Area | State |
 | --- | --- |
 | Repository layout, tooling, lint/format rules | Done |
 | FastAPI backend skeleton, `/api/v1` routing, layered architecture | Done |
 | JWT auth (register / login / refresh / logout / me) with `users` table | Done |
-| Alembic migration pipeline | Done |
+| Persistent device sessions — one row per browser, revocable individually or in bulk | Done |
+| Password policy, password change, and password reset (no mail service required) | Done |
+| Role-based permissions (`user` / `admin`) with a fail-closed `require_permission()` | Done |
+| Security audit trail (`audit_logs`, 12 event types, best-effort writes) | Done |
+| Alembic migration pipeline | Done — two revisions, `0001` and `0002_phase2_identity_sessions` |
 | PostgreSQL 16 via Docker Compose, three-service stack | Declared and statically validated; never executed by `docker compose` |
 | React + TypeScript frontend: router, app shell, design system, theming | Done |
+| Frontend design-system primitives, several hand-rolled (see below) | Done |
 | Structured logging, `X-Request-ID` correlation, shared error envelope | Done |
 | Health/readiness endpoints, Swagger/ReDoc | Done |
-| Automated tests | Passing — 145 backend + 30 frontend; 43 backend `integration` tests need PostgreSQL and have not been run |
+| Automated tests | Passing — 366 backend + 134 frontend; **133 backend `integration` tests need PostgreSQL and have not been run** |
 
-The 145 backend figure is `pytest -m "not integration"` from `backend/`; the other 43 tests
-are marked `integration` and need a live PostgreSQL. `frontend/` runs 30 tests across 10
-files with `npm test`. Neither a database nor Docker was available on the machine this
-document was written on, so nothing that needs either was executed.
+The 366 backend figure is `pytest -m "not integration"` from `backend/` (499 collected);
+the other 133 tests are marked `integration` and need a live PostgreSQL. `frontend/` runs
+134 tests across 22 files with `npm test`. Neither a database nor Docker was available on
+the machine this document was written on, so nothing that needs either was executed — and
+in particular **the integration suite has never passed here, because it has never run.**
 
 **What does not exist yet.** Projects, Tasks, Planner, Knowledge, Search, Analytics,
 Developer, Learning, Career, AI Assistant and Experiments are *designed placeholder pages
 only*. They render a real module description, the planned capabilities and the phase in
 which they ship — but they store nothing, compute nothing, and read no data. Every metric
-tile on those pages renders an em dash on purpose; no sample data is fabricated. Outside the
-placeholder set, the live pages are Login and Register (real calls to the auth endpoints),
-Dashboard (service health polled from the API) and Settings (theme preference and the
-signed-in session).
+tile on those pages renders an em dash on purpose; no sample data is fabricated. There is
+no module API at all: every endpoint the backend serves belongs to auth, users or health.
+
+The live pages are Login, Register, Forgot password, Reset password (all real calls to the
+auth endpoints), Dashboard (service health polled from the API) and Settings (profile,
+password, active sessions with per-device revoke and "sign out everywhere", theme, and a
+password-protected account deletion).
+
+Two things exist to prove something works rather than to be useful. `POST /api/v1/users/`
+is the administrative account listing: it exists so the role → permission wiring has a route
+whose refusal is observable end to end, and it is not a product feature. The audit-log
+retention setting states a policy that **no job enforces** — nothing is currently pruning
+`audit_logs`.
 
 Do not build on this README as if the product modules were functional. See
 [Roadmap](#roadmap).
@@ -95,7 +112,7 @@ Nexo/
 ├── backend/
 │   ├── run.py              entrypoint — selects the psycopg-compatible event loop
 │   ├── alembic.ini         no credentials; the URL comes from settings
-│   ├── migrations/         Alembic env + versions (0001_initial_create_users)
+│   ├── migrations/         Alembic env + versions (0001, 0002_phase2_identity_sessions)
 │   ├── requirements.txt    runtime deps above the DEV MARKER, dev deps below
 │   ├── pyproject.toml      ruff configuration
 │   ├── pytest.ini          testpaths, asyncio mode, `integration` marker
@@ -106,20 +123,21 @@ Nexo/
 │       ├── api/
 │       │   ├── router.py              mounts /api/v1
 │       │   ├── deps.py                HTTP-layer wiring: session → repo → service
-│       │   └── v1/{router,health,auth}.py
+│       │   └── v1/{router,health,auth,users}.py
 │       ├── core/
 │       │   ├── config.py              typed settings (pydantic-settings)
 │       │   ├── exceptions.py         domain errors + shared error envelope
 │       │   ├── event_loop.py         SelectorEventLoop on Windows for psycopg
 │       │   ├── logging.py            JSON/console logging, redaction, request_id
 │       │   ├── middleware.py          X-Request-ID, timing, access log
-│       │   ├── security.py            bcrypt + JWT issue/verify
+│       │   ├── permissions.py         Permission enum, ROLE_PERMISSIONS, gate factory
+│       │   ├── security.py            bcrypt + JWT issue/verify, token digests
 │       │   └── deps.py                canonical auth dependencies
 │       ├── db/{base,session}.py       Base + mixins, async engine and session
-│       ├── models/user.py            SQLAlchemy ORM model
-│       ├── repositories/user.py      SQL only
-│       ├── schemas/{common,health,user}.py   Pydantic request/response models
-│       └── services/{auth_service,user_service}.py   business rules
+│       ├── models/                   user, session, password_reset, audit
+│       ├── repositories/             user, session, password_reset, audit
+│       ├── schemas/                  common, health, user, session, security
+│       └── services/                 auth, session, user, audit
 └── frontend/
     ├── vite.config.ts      dev proxy (:8000), code splitting, Vitest config
     ├── tailwind.config.ts  token → utility mapping
@@ -130,17 +148,17 @@ Nexo/
         ├── main.tsx        React root
         ├── app/            providers, query client, theme provider, auth bootstrap
         ├── routes/         router, layouts, guards, lazy route table
-        ├── pages/          one file per route (many are placeholders)
-        ├── features/       domain logic: health, modules catalog, command palette
+        ├── pages/          one file per route (most modules are placeholders)
+        ├── features/       domain logic: auth, health, modules, settings, palette
         ├── components/
-        │   ├── ui/         design-system primitives (shadcn-style)
+        │   ├── ui/         design-system primitives (shadcn-style; some hand-rolled)
         │   ├── layout/     app shell, sidebar, top bar, menus, palette
         │   ├── feedback/   loading / empty / error states, page header
         │   └── brand/      logo
         ├── hooks/          use-command-palette, use-debounce, use-media-query
         ├── lib/            api-client.ts, utils.ts (cn)
-        ├── services/       auth.ts, health.ts, errors.ts — one function per endpoint
-        ├── stores/         Zustand auth and theme stores
+        ├── services/       auth.ts, sessions.ts, users.ts, health.ts, errors.ts
+        ├── stores/         Zustand auth, theme and toast stores
         ├── types/          wire types mirroring the backend schemas
         └── index.css       design tokens (HSL channels) + structural helpers
 ```
@@ -158,25 +176,27 @@ Nexo/
 | Driver | psycopg 3.3 | binary wheel; requires a SelectorEventLoop on Windows |
 | Migrations | Alembic 1.20 | async engine, URL injected from settings |
 | Validation / config | Pydantic 2.13 + pydantic-settings | one typed `Settings` object |
-| Auth | PyJWT 2.15 + bcrypt 5.0 | HS256, access + refresh, in-process denylist |
+| Auth | PyJWT 2.15 + bcrypt 5.0 | HS256, access + refresh, in-process access-token denylist plus database-backed device sessions |
 | Database | PostgreSQL 16 (`postgres:16-alpine`) | `pg_trgm`, `unaccent` enabled on first init |
 | Lint / format (backend) | ruff 0.16 | `check` + `format --check`, line length 100 |
-| Tests (backend) | pytest 9.1 + pytest-asyncio + httpx | 145 tests without a database; 43 more are marked `integration` and need PostgreSQL |
+| Tests (backend) | pytest 9.1 + pytest-asyncio + httpx | 366 tests without a database; 133 more are marked `integration` and need PostgreSQL |
 | Framework (frontend) | React 19 | function components, StrictMode |
 | Language (frontend) | TypeScript 5.7 | `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax` |
 | Build / dev server | Vite 7 | dev proxy, manual chunks, Vitest config |
 | Routing | react-router-dom 7 | `createBrowserRouter` |
 | Server state | TanStack Query 5 | retries, caching, polling |
-| Client state | Zustand 5 | auth session, theme, command palette |
-| Styling | Tailwind CSS 3.4 + shadcn/ui conventions | Radix primitives, `cva` variants, lucide icons |
+| Client state | Zustand 5 | auth session, theme, command palette, toasts |
+| Styling | Tailwind CSS 3.4 + shadcn/ui conventions | `cva` variants, lucide icons, and a small number of hand-rolled primitives where no Radix package is installed |
 | Charts | recharts 2.15 | reserved for the Analytics module |
-| Tests (frontend) | Vitest 3.2 + React Testing Library | 30 tests in 10 files |
+| Tests (frontend) | Vitest 3.2 + React Testing Library | 134 tests in 22 files |
 
 Production bundle is code-split per route and by vendor group. Current build, uncompressed
-`frontend/dist/assets/` sizes: entry chunk `index` 84,474 B, largest vendor chunk `react`
-222,295 B, then `radix` 113,444 B, `router` 91,288 B and `data` 35,764 B. The largest real
-page chunk is `dashboard-page` at 11,903 B; the ten stub module pages are ~0.36 kB each and
-`search-page` — which renders a disabled input pointing at Phase 4 — is 1,239 B.
+`frontend/dist/assets/` sizes: entry chunk `index` 91,633 B, largest vendor chunk `react`
+222,295 B, then `radix` 113,444 B, `router` 92,153 B and `data` 37,974 B. The largest real
+page chunk is now `settings-page` at 39,952 B — it grew sharply in Phase 2, from 4.8 kB to
+carry five panels, the session list and the password dialogs — followed by
+`dashboard-page` at 11,760 B. The ten stub module pages are ~0.40 kB each and
+`search-page`, which renders a disabled input pointing at Phase 4, is 1,269 B.
 
 ---
 
@@ -245,7 +265,7 @@ docker compose down -v       # also drops nexus_pgdata
 | Mechanism | Where | Effect |
 | --- | --- | --- |
 | `${VAR:-default}` | throughout the file | Interpolated while Compose parses the YAML. The container sees the value written here and nothing else. |
-| `env_file: .env` | `backend`, `frontend` | The whole file is handed to the container, so the ~20 settings no `environment:` entry names — `DEBUG`, `APP_NAME`, `OPENAPI_URL`, `JWT_*`, `DB_POOL_*`, `DB_PROBE_TIMEOUT_SECONDS`, `LOG_*`, `API_V1_PREFIX` — arrive as written. |
+| `env_file: .env` | `backend`, `frontend` | The whole file is handed to the container, so the ~25 settings no `environment:` entry names — `DEBUG`, `APP_NAME`, `OPENAPI_URL`, `JWT_*`, `PASSWORD_*`, `SESSION_ABSOLUTE_LIFETIME_DAYS`, `MAX_ACTIVE_SESSIONS`, `AUDIT_LOG_RETENTION_DAYS`, `DB_POOL_*`, `DB_PROBE_TIMEOUT_SECONDS`, `LOG_*`, `API_V1_PREFIX` — arrive as written. |
 
 `environment:` outranks `env_file:`, so the explicit overrides still win. Only a handful of
 values are literals, and each one is deliberate: the container-side port numbers, the
@@ -332,6 +352,7 @@ directory. Every variable is case-insensitive.
 | --- | --- |
 | Application | `ENVIRONMENT`, `DEBUG`, `APP_NAME`, `APP_VERSION`, `APP_DESCRIPTION` (shown in the OpenAPI schema and the docs UI), `OPENAPI_URL`, `DOCS_URL`, `REDOC_URL`, `API_V1_PREFIX` (the prefix every versioned route is mounted under; change it and `VITE_API_BASE_URL` has to change with it) |
 | Security | `SECRET_KEY`, `JWT_ALGORITHM`, `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS` |
+| Accounts, sessions and audit (Phase 2) | `PASSWORD_MIN_LENGTH` (default 8, plus uppercase/lowercase/digit/special), `PASSWORD_RESET_EXPIRE_MINUTES` (30), `SESSION_ABSOLUTE_LIFETIME_DAYS` (30), `MAX_ACTIVE_SESSIONS` (20), `AUDIT_LOG_RETENTION_DAYS` (400 — **declared, not enforced**; no pruning job exists) |
 | Backend server (read by `backend/run.py`) | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_RELOAD` |
 | CORS | `CORS_ORIGINS` (comma-separated, no trailing slashes) |
 | Database | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_HOST`, `POSTGRES_PORT`, `DATABASE_URL`, `TEST_DATABASE_URL`, `DB_ECHO`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE`, `DB_PROBE_TIMEOUT_SECONDS` |
@@ -410,7 +431,7 @@ scripts and npm scripts. `make` with no argument lists them.
 | `make db-wait` | `scripts/wait_for_db.py --timeout $(TIMEOUT)` — block until PostgreSQL accepts connections. `make db-wait TIMEOUT=120` to wait longer. |
 | `make test-db` | `scripts/create_test_database.py` — create the `nexus_test` database. Never drops anything by default; pass `TEST_DB_FLAGS=--drop` to rebuild it, which is destructive. |
 | `make test` | `test-backend` then `test-frontend` |
-| `make test-backend` | `pytest` in `backend/` (the 43 `integration` tests included — they need PostgreSQL) |
+| `make test-backend` | `pytest` in `backend/` (the 133 `integration` tests included — they need PostgreSQL) |
 | `make test-frontend` | `npm run test` in `frontend/` |
 | `make lint` | ruff check, ruff format --check, eslint, tsc -b |
 | `make backend` | `scripts/dev.sh backend` |
@@ -438,8 +459,8 @@ Backend — run from `backend/`:
 
 ```bash
 python run.py                                   # dev server, honours NEXUS_HOST/PORT/RELOAD
-python -m pytest                                # 188 tests: 145 plus 43 integration (need PostgreSQL)
-python -m pytest -m "not integration"           # 145 tests, no database needed
+python -m pytest                                # 499 collected: 366 plus 133 integration (need PostgreSQL)
+python -m pytest -m "not integration"           # 366 tests, no database needed
 python -m ruff check .
 python -m ruff format --check .
 python -m alembic upgrade head                  # apply migrations
@@ -458,7 +479,7 @@ Frontend — run from `frontend/`:
 npm run dev            # Vite dev server on :5173
 npm run build          # tsc -b && vite build
 npm run preview        # serve dist/ on :4173
-npm test               # vitest run (30 tests in 10 files)
+npm test               # vitest run (134 tests in 22 files)
 npm run test:watch     # vitest
 npm run test:coverage  # vitest run --coverage
 npm run lint           # eslint .
@@ -499,21 +520,31 @@ bash scripts/dev.sh [both|backend|frontend]
 | Liveness (no database) | http://localhost:8000/health |
 | Detailed health | http://localhost:8000/api/v1/health |
 
-Current endpoints:
+Current endpoints — **17 operations across 16 paths**:
 
 | Method | Path | Auth | Success |
 | --- | --- | --- | --- |
 | `GET` | `/` | no | 200, service metadata and endpoint links |
 | `GET` | `/health` | no | 200 `{"status":"ok"}` — never touches the database |
 | `GET` | `/api/v1/health` | no | 200, app/version/environment/database status + latency/uptime/timestamp |
-| `POST` | `/api/v1/auth/register` | no | 201, `UserRead` |
-| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` |
-| `POST` | `/api/v1/auth/refresh` | no | 200, `TokenPair` (the presented refresh token is retired) |
+| `POST` | `/api/v1/auth/register` | no | 201, `UserRead` — 409 if the email **or** the username is taken |
+| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` — opens a device session |
+| `POST` | `/api/v1/auth/refresh` | no | 200, `TokenPair` — single-use rotation on the same session row |
 | `POST` | `/api/v1/auth/logout` | optional | 204 no content |
+| `POST` | `/api/v1/auth/logout-all` | bearer | 204 — revokes every **other** session, keeps the caller's |
 | `GET` | `/api/v1/auth/me` | bearer | 200, `UserRead` |
+| `GET` | `/api/v1/auth/sessions` | bearer | 200, `SessionListRead` — the caller's live devices |
+| `DELETE` | `/api/v1/auth/sessions/{session_id}` | bearer | 204 — 404 if the caller does not own that session |
+| `PATCH` | `/api/v1/auth/password` | bearer | 204 — ends every session except the caller's |
+| `POST` | `/api/v1/auth/password/forgot` | no | 202 — identical body for a known and an unknown address |
+| `POST` | `/api/v1/auth/password/reset` | no | 204 — ends **every** session, including the caller's |
+| `PATCH` | `/api/v1/users/me` | bearer + `users.write` | 200, `UserRead` |
+| `DELETE` | `/api/v1/users/me` | bearer | 204 — requires the account password and `confirm: true` |
+| `GET` | `/api/v1/users/` | bearer + admin | 200, `UserRead[]` — a permission-system fixture, not a feature |
 
-The full contract — error codes, request ids, pagination, and the rules every future
-endpoint must follow — is in [`docs/api-conventions.md`](docs/api-conventions.md).
+The full contract — error codes, request ids, pagination, the 404-not-403 rule on session
+revocation, and the rules every future endpoint must follow — is in
+[`docs/api-conventions.md`](docs/api-conventions.md).
 
 ---
 
@@ -635,13 +666,15 @@ the first real run as untested and go straight to `docker compose logs -f`.
 
 ## Roadmap
 
-Phase numbers are the ones recorded in `frontend/src/features/modules/catalog.ts`.
+Phase numbers in the module column are the ones recorded in
+`frontend/src/features/modules/catalog.ts`.
 
 | Phase | Module | Adds |
 | --- | --- | --- |
 | 1 | Foundation (done) | Repo, stack, auth, migrations, design system, health, docs, tests |
 | 1 | Dashboard, Settings (live) | Service health card, theme and session preferences |
-| 2 | Projects, Tasks | The execution layer: outcomes, projects, tasks, triage views |
+| 2 | Identity and security (done) | Persistent device sessions, password policy / change / reset, role-based permissions, security audit trail, five-tab settings |
+| 2 | Projects, Tasks (next) | The execution layer: outcomes, projects, tasks, triage views |
 | 3 | Planner | Weekly capacity, time blocks, focus log |
 | 4 | Knowledge, Search | Linked notes, retrieval index, unified search |
 | 5 | Analytics | Traceable metrics derived from real records |
@@ -651,11 +684,19 @@ Phase numbers are the ones recorded in `frontend/src/features/modules/catalog.ts
 | 9 | AI Assistant | Grounded local-LLM answers via Ollama, proposed actions |
 | 10 | Experiments | Hypothesis, bounded scope, keep-or-kill verdict |
 
+Phase 2 was *infrastructure*, not product surface: it made the accounts behind the shell
+real and added no module. Projects and Tasks are still placeholder pages. Note also that
+the module phases above are the ones recorded in
+`frontend/src/features/modules/catalog.ts` and describe when each **module** ships — they
+are not the same axis as the platform work recorded in the
+[Status](#status-phase-2-identity-sessions-and-security-is-complete) table, which is why
+both carry a "Phase 2".
+
 Behind those modules sit infrastructure seams that are described in the extension-roadmap
-section of [`docs/architecture.md`](docs/architecture.md): Redis (replacing the
-in-process token revocation store), background workers, an ML training pipeline, a local
-model registry, Ollama-backed local LLM features, and git repository analysis. None of
-them exists in Phase 1.
+section of [`docs/architecture.md`](docs/architecture.md): Redis (replacing the in-process
+access-token revocation store), an audit-log pruning job (the retention setting exists; the
+job does not), background workers, an ML training pipeline, a local model registry,
+Ollama-backed local LLM features, and git repository analysis. None of them exists yet.
 
 ---
 
@@ -663,6 +704,6 @@ them exists in Phase 1.
 
 | Document | Contents |
 | --- | --- |
-| [`docs/architecture.md`](docs/architecture.md) | Layering, request lifecycle, auth design, configuration, logging, database strategy, extension roadmap, decisions and rationale |
-| [`docs/development.md`](docs/development.md) | Clean-machine setup, the daily loop, migrations, adding an endpoint, page or test, testing conventions, design-system and code conventions, the pre-pull-request checklist, and the verified baseline (including what was *not* run) |
-| [`docs/api-conventions.md`](docs/api-conventions.md) | Base URL and versioning, health endpoints, authentication, the error envelope and its full code table, request-id correlation, pagination, the checklist every endpoint must satisfy |
+| [`docs/architecture.md`](docs/architecture.md) | Layering, request lifecycle, auth and session design, RBAC, the audit trail, password policy and reset, configuration, logging, database strategy, extension roadmap, decisions and rationale |
+| [`docs/development.md`](docs/development.md) | Clean-machine setup, the daily loop, migrations, adding a repository, service, permission-guarded endpoint, audit event, page, settings panel or design-system primitive, testing conventions, code conventions, the pre-pull-request checklist, and the verified baseline (including what was *not* run) |
+| [`docs/api-conventions.md`](docs/api-conventions.md) | Base URL and versioning, health endpoints, the full endpoint catalogue, authentication (tokens, sessions, the password policy, permissions, password reset), the error envelope and its full code table, request-id correlation, pagination, the checklist every endpoint must satisfy |

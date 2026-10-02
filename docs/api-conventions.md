@@ -4,9 +4,9 @@ The contract every NEXUS endpoint follows, and the rules a new endpoint must obe
 `README.md` covers how to *start* the stack; this document covers what the API
 looks like once it is running.
 
-**Status.** Phase 1 (technical foundation). Eight paths exist, described in
-[Endpoint catalogue](#endpoint-catalogue). Everything about the modules
-(Projects, Planner, Knowledge, Search, Analytics, …) is a frontend placeholder —
+**Status.** Phase 2 (identity, sessions and security). **16 paths and 17 operations**
+exist, described in [Endpoint catalogue](#endpoint-catalogue). Everything about the modules
+(Projects, Planner, Knowledge, Search, Analytics, …) is still a frontend placeholder —
 there is no module API yet, and the conventions below are the shape it will take.
 
 ---
@@ -21,15 +21,15 @@ there is no module API yet, and the conventions below are the shape it will take
 - [Error codes](#error-codes)
 - [Validation errors](#validation-errors)
 - [Request correlation (`X-Request-ID`)](#request-correlation-x-request-id)
-- [Authentication](#authentication)
+- [Authentication](#authentication) | Tokens, sessions, the password policy, permissions, password reset |
 - [CORS and response headers](#cors-and-response-headers)
 - [Pagination](#pagination)
 - [Health semantics](#health-semantics)
-- [The client contract](#the-client-contract)
-- [Checklist for a new endpoint](#checklist-for-a-new-endpoint)
+- [The client contract](#the-client-contract) | `ApiClient`, the services layer, the wire types, the codes only the client manufactures |
+- [Checklist for a new endpoint](#checklist-for-a-new-endpoint) | The rules a new route must satisfy |
 - [Worked example — the shape a future endpoint takes](#worked-example--the-shape-a-future-endpoint-takes)
 - [Testing an endpoint](#testing-an-endpoint)
-- [Known gaps](#known-gaps)
+- [Known gaps](#known-gaps) | Deliberate omissions as of Phase 2 |
 
 ---
 
@@ -82,27 +82,95 @@ README's troubleshooting section.
 
 Everything the API serves today. Nothing else responds.
 
+### Unauthenticated
+
 | Method | Path | Auth | Success | Notes |
 | --- | --- | --- | --- | --- |
 | `GET` | `/` | no | 200 | Service metadata and an endpoint index (`service`, `version`, `environment`, `status`, `api_version`, `api_prefix`, `links`) |
 | `GET` | `/health` | no | 200 `{"status":"ok"}` | Liveness. Never touches the database |
 | `GET` | `/api/v1/health` | no | 200, `status: "healthy"\|"degraded"` | Metadata plus a timed `SELECT 1` probe |
-| `POST` | `/api/v1/auth/register` | no | 201, `UserRead` | 409 `conflict` if the email is taken |
-| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` | 401 `unauthorized` for any credential failure |
-| `POST` | `/api/v1/auth/refresh` | no | 200, `TokenPair` | Single-use rotation: the presented token is revoked |
+| `POST` | `/api/v1/auth/register` | no | 201, `UserRead` | 409 `conflict` if the email **or** the username is taken |
+| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` | 401 `unauthorized` for any credential failure. Opens a device session and returns its `session_id` |
+| `POST` | `/api/v1/auth/refresh` | no | 200, `TokenPair` | Single-use rotation **on the same session row** — the device stays the same device |
+| `POST` | `/api/v1/auth/password/forgot` | no | 202, `PasswordResetRequested` | The body is identical for a known and an unknown address. There is no 404 |
+| `POST` | `/api/v1/auth/password/reset` | no | 204, empty body | 401 for a token that is unknown, spent, expired or not a reset token — all four answer identically. Ends **every** session |
 | `POST` | `/api/v1/auth/logout` | optional | 204, empty body | Revokes each token it is given. **Send the refresh token in the body** — the bearer header alone leaves it valid. See [Authentication](#authentication) |
-| `GET` | `/api/v1/auth/me` | bearer | 200, `UserRead` | 401 `unauthorized` for missing/invalid/expired/revoked tokens |
 
-Declared schema facts, taken from the generated OpenAPI document:
+### Bearer-authenticated
+
+| Method | Path | Auth | Success | Notes |
+| --- | --- | --- | --- | --- |
+| `GET` | `/api/v1/auth/me` | bearer | 200, `UserRead` | 401 `unauthorized` for missing/invalid/expired/revoked tokens |
+| `POST` | `/api/v1/auth/logout-all` | bearer | 204, empty body | Revokes every session **except** the one identified by the caller's own `sid` claim |
+| `GET` | `/api/v1/auth/sessions` | bearer | 200, `SessionListRead` | The caller's live devices, newest first, each flagged `is_current` |
+| `DELETE` | `/api/v1/auth/sessions/{session_id}` | bearer | 204, empty body | **404, never 403**, for a session the caller does not own. See [Ownership answers 404](#ownership-answers-404-not-403) |
+| `PATCH` | `/api/v1/auth/password` | bearer | 204, empty body | 401 if `current_password` is wrong, 409 if `new_password` matches the current one. Ends every session except the caller's |
+| `PATCH` | `/api/v1/users/me` | bearer + `users.write` | 200, `UserRead` | 409 when the requested username is taken. `email` and `password` are **not** editable here |
+| `DELETE` | `/api/v1/users/me` | bearer | 204, empty body | Requires `{"password": "…", "confirm": true}`; 401 if the password does not verify. 422 if `confirm` is not `true` |
+| `GET` | `/api/v1/users/` | bearer + `users.read` + admin role | 200, `UserRead[]` | **A permission-system fixture, not a product feature.** 403 for any caller whose role does not satisfy both gates |
+
+### Ownership answers 404, not 403
+
+`DELETE /api/v1/auth/sessions/{session_id}` scopes its lookup to the caller's own user id
+(`SessionRepository.get_by_id_for_user`) and answers **404** when the id belongs to someone
+else.
+
+A 403 would be the wrong answer on this route and not for tidiness reasons: it would confirm
+that the id exists, turning the endpoint into a probe for which session ids are real. A 404
+is exactly what an id that never existed also returns, so the two cases are
+indistinguishable from outside. The same reasoning applies to every future endpoint that
+acts on a row the caller might not own — **404, not 403** — while a 403 stays correct for a
+*capability* the caller simply does not have (see [Authentication](#authentication)).
+
+Note the distinction the two cases make: `403` is for a capability the role map does not
+grant (`GET /api/v1/users/`), and `404` is for a resource that is not the caller's to reach.
+
+### The `User` shape
+
+`UserRead` is the only user representation that leaves the process, and Phase 2 changed it:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Application-side UUIDv4 |
+| `email` | string | Normalised to lower case before storage and comparison; unique |
+| `username` | string | New in Phase 2. 3–32 characters, must start with a letter or a digit, then letters/digits/`_`/`-`. Unique, and **case-preserving** — trimmed but never folded, so the handle you sign in with is the handle you were shown |
+| `display_name` | string \| null | Renamed from `full_name` in Phase 2. `full_name` no longer exists on the wire |
+| `avatar_url` | string \| null | Optional. Must be an absolute `http`/`https` URL — anything else, `javascript:` above all, is a 422 |
+| `role` | string | `"user"` or `"admin"`. Supersedes `is_superuser` |
+| `permissions` | string[] | New in Phase 2. **Derived from `role` at serialisation time, never stored.** Sorted, so two responses diff cleanly. An unrecognised role yields `[]` |
+| `is_active` | bool | An inactive account is rejected at authentication with 401 |
+| `is_verified` | bool | Reserved. Phase 2 does not verify delivery, so nothing ever sets it |
+| `created_at`, `updated_at` | datetime | |
+| `last_login_at` | datetime \| null | Stamped on a successful login |
+
+**`full_name` and `is_superuser` are gone from `UserRead`.** `full_name` was renamed;
+`is_superuser` was superseded by `role`, and publishing both would invite a client to branch
+on the one that is no longer consulted. The `is_superuser` *column* still exists on
+`users` and is still honoured by the superuser dependency alongside `role`, so a Phase 1
+administrator is not silently un-promoted; it is simply not something a client should read.
+
+Branch on `permissions`, not on `role`. The list is the answer to "may I open this screen?",
+and re-implementing the role → permission map in the client is exactly the drift the field
+exists to prevent.
+
+`hashed_password` is absent, as before, and no response body echoes a submitted password.
+
+### Declared schema facts
+
+Taken from the generated OpenAPI document:
 
 - The security scheme is `HTTPBearer` (`type: http`, `scheme: bearer`,
-  description "JWT access token"), so Swagger UI offers an **Authorize** button.
-  Only `GET /auth/me` and `POST /auth/logout` carry
-  `security: [{"HTTPBearer": []}]`; logout's parameter is optional.
+  description "JWT access token"), so Swagger UI offers an **Authorize** button. Every
+  route except `/`, `/health`, `/api/v1/health`, `register`, `login`, `refresh`,
+  `password/forgot` and `password/reset` carries `security: [{"HTTPBearer": []}]`;
+  `logout`'s parameter is optional.
 - **Error responses are not declared in the OpenAPI schema.** An operation lists
   only its 2xx (plus 422 where Pydantic validation applies). A 401/404/409 raised
   at runtime is documented here and in the Swagger description banner, not in the
   per-operation `responses`. See [Known gaps](#known-gaps).
+- `POST /api/v1/users/` declares `security` for both the bearer scheme and the
+  `require_permission` dependency, but the permission itself is not expressible in
+  OpenAPI — a consumer reading the schema sees a bearer requirement, not a role one.
 
 ---
 
@@ -119,10 +187,19 @@ Declared schema facts, taken from the generated OpenAPI document:
   normalised value.
 - **Constraints are declared in the schema, not the service.** `email` is capped
   at 320 characters and matched against a deliberate shape regex (not RFC 5322 —
-  `EmailStr` would need a dependency the backend does not ship); `full_name` at
-  255; a new password at 8–128. bcrypt only ever hashes the first 72 bytes of
-  input, so `security._bcrypt_bytes` truncates before hashing; be aware of that
-  ceiling when choosing a maximum password length.
+  `EmailStr` would need a dependency the backend does not ship); `username` at
+  3–32 with a leading-alphanumeric pattern; `display_name` at 255; `avatar_url`
+  at 2048 and restricted to absolute `http`/`https`. A new password is capped at
+  128 and must satisfy the policy in [Authentication](#authentication) — a 422,
+  not a 403. bcrypt only ever hashes the first 72 bytes of input, so
+  `security._bcrypt_bytes` truncates before hashing; be aware of that ceiling
+  when choosing a maximum password length.
+- **The password policy is enforced by one validator on the type, not per field.**
+  `Password` in `app/schemas/user.py` carries an `AfterValidator`, so
+  registration, password change and password reset cannot drift apart. The rule
+  ids (`min_length`, `uppercase`, `lowercase`, `digit`, `special`) and their order
+  are a shared vocabulary that `password_rule_status()` returns for the client's
+  live checklist.
 - **Secrets are write-only.** `hashed_password` is absent from every model that
   can leave the process, and no response body may echo the submitted password
   (`backend/tests/test_auth.py` asserts this).
@@ -254,12 +331,37 @@ rest resolve through `_status_code_to_code`:
 | `validation_error` | 422 | `RequestValidationError` handler; the `ValidationError` domain class | Body/query failed schema validation |
 | `not_found` | 404 | `NotFoundError`, and any unmatched path | Unknown route, or a resource id that does not exist |
 | `unauthorized` | 401 | `UnauthorizedError` | Missing, malformed, expired, wrong-type or revoked token; wrong credentials; inactive account |
-| `forbidden` | 403 | `ForbiddenError` | Authenticated but not permitted (superuser check) |
+| `forbidden` | 403 | `ForbiddenError` | Authenticated but not permitted: the caller's role does not grant the required `Permission`, or it is not the administrator role |
 | `conflict` | 409 | `ConflictError` | Uniqueness violation, or a collision with current state |
 | `bad_request` | 400 | Fallback for any unmapped 4xx; reserved as a domain code | Malformed request that is not schema-invalid |
 | `method_not_allowed` | 405 | `StarletteHTTPException` | Wrong verb on a known path |
 | `rate_limited` | 429 | Reserved — no rate limiting is implemented | — |
 | `internal_error` | 500 | `NexusError` default, `StarletteHTTPException` 5xx, the catch-all handler | Unexpected failure; the client is told nothing |
+
+The code table is unchanged by Phase 2 — a new feature never needed a new code. What
+changed is **which situations produce the existing ones**, and one of them is a rule worth
+stating on its own:
+
+- **A resource the caller does not own is `not_found` (404), never `forbidden` (403).**
+  `DELETE /auth/sessions/{session_id}` answers 404 when the id belongs to another account,
+  because a 403 would confirm that the id exists and turn the route into a probe for real
+  session ids. 403 is reserved for a *capability* the role map does not grant. A new
+  endpoint that acts on a caller-scoped row must follow the same rule; see
+  [Ownership answers 404](#ownership-answers-404-not-403).
+
+New 4xx situations introduced in Phase 2, all reusing the existing codes:
+
+| Situation | Code | Status | Raised by |
+| --- | --- | --- | --- |
+| Username already registered, or `PATCH /users/me` picks a taken one | `conflict` | 409 | `AuthService.register`, `UserService.update` |
+| Password fails the policy (on register, change or reset) | `validation_error` | 422 | the `AfterValidator` on `Password` — a schema failure, not an authorisation one |
+| `new_password` equal to `current_password` on change | `conflict` | 409 | `AuthService.change_password` |
+| `confirm` absent or false on `DELETE /users/me` | `validation_error` | 422 | the `confirm` field validator on `UserDeletion` |
+| `avatar_url` that is not an absolute `http`/`https` URL | `validation_error` | 422 | the `avatar_url` before-validator on `UserUpdate` |
+| Reset token unknown, spent, expired or wrong-type | `unauthorized` | 401 | `AuthService.complete_password_reset` — one message for all four, deliberately |
+| Session that is not the caller's, or does not exist | `not_found` | 404 | `SessionService.revoke` |
+| Role does not grant the route's permission | `forbidden` | 403 | `require_permission()` |
+| Wrong `current_password`, or a wrong password on account deletion | `unauthorized` | 401 | `AuthService.change_password`, `UserService.delete_account` |
 
 The two rules that are easy to get backwards:
 
@@ -402,7 +504,8 @@ Bearer JWT, HS256, signed with `SECRET_KEY`. Issued by
 | `type` | `access` or `refresh` — the claim that stops a refresh token being replayed as a bearer credential |
 | `iat` / `nbf` | Issued-at / not-before, UTC |
 | `exp` | Expiry, UTC |
-| `jti` | Token id; the key the revocation denylist is built on |
+| `jti` | Token id; the key the access-token revocation denylist is built on |
+| `sid` | The device session this token belongs to, UUID string. **New in Phase 2.** Required on a refresh token; `None` on an access token minted outside the session flow |
 
 `exp`, `sub` and `type` are required on decode. A token missing any of them is
 rejected, not tolerated. `sub`/`type`/`exp` are owned by the security module and
@@ -412,62 +515,48 @@ cannot be overridden by caller-supplied claims.
 | --- | --- | --- |
 | Access | 60 minutes | `ACCESS_TOKEN_EXPIRE_MINUTES` |
 | Refresh | 7 days | `REFRESH_TOKEN_EXPIRE_DAYS` |
+| Session row | 30 days, absolute | `SESSION_ABSOLUTE_LIFETIME_DAYS` |
+| Reset token | 30 minutes | `PASSWORD_RESET_EXPIRE_MINUTES` |
 
 The `TokenPair` body is `{access_token, refresh_token, token_type: "bearer",
-expires_in}` where `expires_in` is the access lifetime **in seconds**. The refresh
-lifetime is not in the body; derive the refresh deadline from `REFRESH_TOKEN_EXPIRE_DAYS`.
+expires_in, session_id}` where `expires_in` is the access lifetime **in seconds**.
+The refresh lifetime is not in the body; derive the refresh deadline from
+`REFRESH_TOKEN_EXPIRE_DAYS`. `session_id` is the device the pair belongs to —
+new in Phase 2, and nullable only so a token minted outside the session flow
+still validates. Every real issuance path sets it.
 
 ### Flow rules
 
-- **Login** returns a pair for an active account. Any credential failure returns
-  the identical message — "Incorrect email or password." — so probing cannot
-  distinguish an unknown address from a wrong password.
-- **Refresh is single-use.** The presented token's `jti` is denylisted before the
-  new pair is issued, so a replay fails with 401 `unauthorized`.
+- **Login** returns a pair for an active account and creates the device session
+  before the pair is returned. Any credential failure returns the identical
+  message — "Incorrect email or password." — and takes comparable time, so probing
+  cannot distinguish an unknown address from a wrong password.
+- **Refresh is single-use.** The row's `token_hash` is replaced with the new
+  token's digest before the new pair is issued, so a replay finds a digest that no
+  longer matches and fails with 401 `unauthorized`.
 - **Type confusion is an error.** An access token presented to `/auth/refresh`
   (or a refresh token to `/auth/me`) is 401 `unauthorized` with a message naming
   the required type.
+- **A refresh token without a `sid` claim is rejected.** A token minted before
+  sessions existed cannot be revoked individually or attributed to a device, and
+  accepting one would leave exactly the gap sessions were introduced to close.
 - **Logout revokes what it is given — so a client must send the refresh token.**
   `POST /auth/logout` takes two independent, both-optional inputs: a
   `TokenRefresh` body (`{"refresh_token": "…"}`) and an optional
-  `Authorization: Bearer …` header. Each token it receives has its `jti`
-  denylisted; anything it does not receive stays valid. A bearer header alone
-  revokes **only the access token** — the refresh token survives until it expires
-  in seven days, and a client holding it can mint a new pair. **A client that
-  wants logout to end the session must send `{"refresh_token": "…"}` in the
-  body**, alongside the header if it also wants the access token revoked.
+  `Authorization: Bearer …` header. Anything it does not receive stays valid.
   Sending neither is legal and revokes nothing.
 - The response is 204 with an empty body whenever the request itself is
-  well-formed. A token *string* that is unparseable or already expired is
-  ignored, not reported — `AuthService.revoke` swallows the `UnauthorizedError`
-  from decoding, so logout never fails the caller. A malformed *body* is still
-  schema-validated like any other, and is a 422.
-- **After logout the access token is still cryptographically valid**, but
-  `GET /auth/me` rejects it with 401 because the dependency resolves identity
-  through `AuthenticatedUser` (`app/api/deps.py`), which checks the denylist. A
-  new endpoint opts into that same check by depending on `AuthenticatedUser`
-  rather than `CurrentUser`.
+  well-formed. A token *string* that is unparseable, already expired or already
+  revoked is ignored, not reported — the service swallows every failure, so logout
+  never fails the caller. A malformed *body* is still schema-validated like any
+  other, and is a 422.
+- **Changing a password keeps the caller signed in.** `PATCH /auth/password`
+  exempts the session named by the caller's own `sid` and ends every other one. A
+  password change is only half a control unless the sessions signed in with the old
+  one are closed too.
 - **Passwords are bcrypt, cost 12**, salted per hash; a corrupt or missing stored
   hash fails the check rather than raising, so one bad row cannot turn a login
   into a 500.
-
-### 401 versus 403
-
-401 means "who are you is unknown or unproven" — absent header, bad signature,
-expired, wrong type, unknown subject, inactive account, revoked token. 403 means
-"known, not permitted" — currently only the superuser check. Every 401 from a
-domain error carries `WWW-Authenticate: Bearer`.
-
-### Revocation store, and its limits
-
-`RevocationStore` is an in-process `dict` keyed by `jti`, purged on lookup, and
-expiring entries when the token would have expired anyway. Consequences to design
-around:
-
-- A restart clears it. Logout is not durable across a process restart.
-- It is not shared between processes. The stack runs one backend worker, so this
-  is correct today; a second worker needs Redis (the interface is deliberately
-  narrow for exactly that).
 - The frontend calls logout best-effort and clears local state regardless, so a
   failed logout never traps the user in a signed-in shell. It presents **both**
   tokens — `logoutRequest` in `frontend/src/services/auth.ts` puts the refresh
@@ -475,6 +564,123 @@ around:
   header, and sends `{ auth: false }` so an already-expired access token cannot
   trip the client's 401 recovery and rotate the very refresh token the call is
   revoking.
+
+### Sessions
+
+A refresh token is backed by a row in `sessions`: one row per browser or device,
+carrying a SHA-256 `token_hash` (never the raw token), the user agent, the client
+address, an absolute expiry, and `last_used_at` / `revoked_at`.
+
+| Rule | Consequence on the wire |
+| --- | --- |
+| Rotation **replaces** the row's `token_hash` rather than adding a row | Rotating a hundred times is still one device in `GET /auth/sessions`, and signing it out is one update |
+| A replayed (rotated-away) refresh token fails | 401, identical to every other session rejection — the caller cannot tell "signed out" from "already rotated" from "not yours" |
+| `MAX_ACTIVE_SESSIONS` (20) evicts the **oldest** live rows on sign-in | Sign-in beyond the cap still succeeds; the oldest device is signed out. A stolen refresh token cannot be replayed to accumulate access |
+| `SessionRead` omits `token_hash` and `user_id` | Nothing a caller needs, and no credential material in a list response |
+
+### Password policy
+
+A new password must be at least `PASSWORD_MIN_LENGTH` characters (default 8) and
+contain an uppercase letter, a lowercase letter, a digit, and one character that is
+neither a letter nor a digit — a space counts as the last of those. Enforced on
+register, on change and on reset by one validator, so a client cannot reach two
+different answers.
+
+A failure is a **422 `validation_error`** with `details.errors[].field` naming the
+password field, not a 403: the payload was schema-invalid.
+
+> **Known one-way divergence.** The browser's digit check is the Unicode property
+> escape `\p{Nd}` (decimal digits), while Python's `str.isdigit()` also accepts
+> other numeric categories — `²`, for instance. The client is therefore slightly
+> **stricter** than the server for exotic characters: a password containing `²` but
+> no ASCII digit is shown as failing and would in fact have been accepted. The
+> reverse never happens — nothing the checklist accepts is rejected server-side.
+> This is a UX affordance, never an authorisation decision; the server remains the
+> only authority.
+
+### 401 versus 403
+
+401 means "who are you is unknown or unproven" — absent header, bad signature,
+expired, wrong type, unknown subject, inactive account, revoked token. 403 means
+"known, not permitted" — the caller's role does not grant the required
+`Permission`. **A row the caller does not own is 404, not 403**; see
+[Ownership answers 404](#ownership-answers-404-not-403). Every 401 from a domain
+error carries `WWW-Authenticate: Bearer`.
+
+### Permissions
+
+`app/core/permissions.py` defines a `Permission` StrEnum — `users.read`,
+`users.write`, `projects.read`, `projects.write`, `tasks.read`, `tasks.write`,
+`analytics.read` — a `ROLE_PERMISSIONS` map, and a `require_permission()`
+dependency factory. A protected route declares the capability it is guarding:
+
+```python
+@router.patch(
+    "/me",
+    response_model=UserRead,
+    dependencies=[Depends(require_permission(Permission.USERS_WRITE))],
+)
+```
+
+Two properties are worth relying on. **It fails closed**: an unrecognised role
+gets an empty permission set and the request is denied, because that value is
+drifted *data* and a 500 on every protected endpoint for every user is worse than
+a denial. And **it runs after authentication, not instead of it**, so an anonymous
+request cannot tell "you are not signed in" from "you may not do that".
+
+`permissions` on `UserRead` is derived from this same map, so a client never has
+to re-implement it.
+
+### Password reset
+
+NEXUS is local-first and ships no mail service, so the reset token is returned in
+the response body instead of being emailed.
+
+| Property | Rule |
+| --- | --- |
+| `POST /auth/password/forgot` | **202** with `{"accepted": true, "dev_token": …}`. The body is byte-for-byte identical for a registered and an unregistered address, so the endpoint cannot enumerate accounts. The *only* difference is whether `dev_token` carries a token — which itself discloses the same fact, and is why `dev_token` is `null` whenever `ENVIRONMENT=production` |
+| `dev_token` | The raw reset token, **non-production only**. It is a bearer credential for a full account takeover. The field exists in the schema so the OpenAPI shape does not change between environments, not because it is safe to send anywhere |
+| `POST /auth/password/reset` | 204. Unknown, spent, expired and wrong-type tokens all answer with the identical 401 |
+| Sessions | A successful reset ends **every** session, including ones that existed when the reset was requested. This is the recovery path for a compromised account; leaving one behind would leave the compromise in place behind a new password |
+
+Password reset tokens are stored the same way refresh tokens are: a SHA-256 digest,
+compared with `hmac.compare_digest`.
+
+**Why SHA-256 and not bcrypt for tokens.** `hash_token()` in
+`app/core/security.py` digests refresh and reset tokens with SHA-256 rather than
+the bcrypt used for passwords, and the reason is the *input*, not the algorithm.
+A password is low-entropy, human-chosen and guessable, so it needs a deliberately
+expensive work factor to make offline attack cost anything. A refresh or reset
+token is a 256-bit cryptographically random signed value: there is no dictionary,
+so no work factor buys anything, and a slow hash would cost ~250 ms on every
+request that touches a session row. The raw token is never persisted and never
+logged, so a database leak yields digests that cannot be replayed — an attacker
+would have to recover the preimage of a 256-bit value. `token_fingerprint_matches`
+compares with `hmac.compare_digest` rather than `==`, because an ordinary string
+comparison short-circuits on the first differing byte and its timing is a weak but
+free-to-remove oracle.
+
+### Revocation store, and its limits
+
+There are **two** mechanisms, and they do different jobs.
+
+**Access tokens** are denylisted in memory. `RevocationStore` is an in-process
+`dict` keyed by `jti`, purged on lookup, expiring entries when the token would have
+expired anyway. Consequences to design around:
+
+- A restart clears it. An access-token logout is not durable across a process
+  restart.
+- It is not shared between processes. The stack runs one backend worker, so this
+  is correct today; a second worker needs Redis (the interface is deliberately
+  narrow for exactly that).
+
+**Refresh tokens and sessions** are database-backed, so they *are* durable and
+restart-safe. `sessions.revoked_at` is the record, `POST /auth/logout-all` and
+`PATCH /auth/password` are the bulk operations, and `DELETE /auth/sessions/{id}`
+is the per-device one. An access token whose session has been revoked is still
+cryptographically valid until it expires, but any refresh attempt against the dead
+session is refused — so the window is bounded by `ACCESS_TOKEN_EXPIRE_MINUTES`, not
+by `REFRESH_TOKEN_EXPIRE_DAYS`.
 
 ---
 
@@ -510,7 +716,9 @@ path. Either works; set the variable to `/api/v1` to go through the proxy.
 
 `Page[T]` and `PageMeta` in `backend/app/schemas/common.py` are the reserved
 envelope for the list endpoints of later phases. **No endpoint serves it yet** —
-the catalogue above is the complete set, and none of it paginates.
+the catalogue above is the complete set, and none of it paginates. That includes
+`GET /api/v1/users/`, which returns a bare array precisely because it is a
+permission fixture and not a product surface.
 
 ```json
 {
@@ -539,8 +747,9 @@ Rules for the endpoints that adopt it:
 
 `Message` (a `{"message": "…"}` acknowledgement body) is declared in the same
 module for endpoints that acknowledge an action and have nothing else to return.
-It is unused today; the two endpoints that would justify it (`logout`, and any
-future delete) return `204` instead, which is the stronger signal. Prefer `204`.
+It is unused: every action-only endpoint in the catalogue — `logout`,
+`logout-all`, session revoke, password change, password reset, account deletion —
+returns `204` instead, which is the stronger signal. Prefer `204`.
 
 ---
 
@@ -588,8 +797,8 @@ with the backend schemas; a mismatch is a runtime failure, not a compile error.
 | File | Role |
 | --- | --- |
 | `frontend/src/lib/api-client.ts` | `ApiClient`: base URL, bearer injection, query building, 30 s timeout, `ApiError` |
-| `frontend/src/services/*.ts` | One function per endpoint (`auth.ts`, `health.ts`) — no fetch logic elsewhere |
-| `frontend/src/types/api.ts` | Wire types mirroring the Pydantic models |
+| `frontend/src/services/*.ts` | One function per endpoint (`auth.ts`, `sessions.ts`, `users.ts`, `health.ts`) — no fetch logic elsewhere |
+| `frontend/src/types/api.ts` | Wire types mirroring the Pydantic models, including `UserRead`, `SessionRead` and `TokenPair.session_id` |
 
 Client behaviour worth relying on:
 
@@ -623,6 +832,11 @@ Router (`app/api/v1/<module>.py`) — thin, no business rules, no SQL:
 - [ ] Identity comes from a dependency: `AuthenticatedUser` for endpoints that
       must honour revocation, `CurrentUser` for the rest, `SuperUser` for
       privileged ones. Never read the token in the handler.
+- [ ] A capability-gated route carries `Depends(require_permission(Permission.…))`
+      in `dependencies=`, naming the capability rather than the role. Do not
+      hard-code a role comparison in the handler.
+- [ ] A route acting on a caller-scoped row scopes its lookup by the caller's id
+      and answers **404**, not 403, when the row is not theirs.
 - [ ] Write access goes through `Depends(get_*_service)`, which builds the
       request-scoped session → repository → service chain.
 - [ ] No `HTTPException` and no hand-built error body. Raise `NotFoundError`,
@@ -654,6 +868,10 @@ Cross-cutting:
 
 - [ ] The endpoint is reachable under `/api/v1/…` and appears in Swagger with a
       useful summary.
+- [ ] Anything security-relevant the new service does is written to the audit
+      trail (`AuditService.record`) with **no password, token or hash of either**
+      in `metadata` — that column is retained longer than the sessions it
+      describes.
 - [ ] `frontend/src/services/` gains exactly one function, and
       `frontend/src/types/api.ts` gains the matching wire type.
 - [ ] A test asserts the success shape *and* `assert_error_envelope` +
@@ -673,9 +891,11 @@ Cross-cutting:
 
 ## Worked example — the shape a future endpoint takes
 
-**Not implemented.** Projects arrive in Phase 2; this is the pattern a first
-list/create pair would follow, written against the real imports and the real
-conventions.
+**Not implemented.** Projects are the next module to arrive; this is the pattern a
+first list/create pair would follow, written against the real imports and the real
+conventions. A route that gates on a capability adds one line to the decorator —
+`dependencies=[Depends(require_permission(Permission.PROJECTS_WRITE))]` — and
+nothing else in the slice changes.
 
 Router:
 
@@ -749,10 +969,10 @@ Note what the client receives on the duplicate: `409`,
 Backend tests live in `backend/tests/`. Run them from `backend/`:
 
 ```bash
-# all 188 collected tests (needs the nexus_test database, created automatically)
+# all 499 collected tests (needs the nexus_test database, created automatically)
 python -m pytest
 
-# the 145 database-free tests — 43 deselected
+# the 366 database-free tests — 133 deselected
 python -m pytest -m "not integration"
 
 # one file
@@ -813,29 +1033,45 @@ Conventions that the suite encodes:
   `pytest -m "not integration"` subset must pass with PostgreSQL stopped.
 - The schema under test comes from Alembic, never from `Base.metadata.create_all`
   — a schema built from the models would prove nothing about the migration.
-- Frontend: `npm test` from `frontend/` (30 tests, 10 files) runs Vitest with React
+- Frontend: `npm test` from `frontend/` (134 tests, 22 files) runs Vitest with React
   Testing Library; `npm run typecheck` and `npm run lint` must also be clean.
 
-**What is verified and what is not.** The 145/188 backend split and the frontend
+**What is verified and what is not.** The 366/499 backend split and the frontend
 counts above were produced by running the suites; PostgreSQL was not available in
-that environment, so the 43 deselected `integration` tests have **not** been
+that environment, so the 133 deselected `integration` tests have **not** been
 executed, and nothing in this document that requires a live database — the
 `nexus_test` creation path, the Alembic upgrade, or `docker-compose.yml` itself —
-has been run against a running server.
+has been run against a running server. Nothing here claims otherwise.
 
 ---
 
 ## Known gaps
 
-Accurate as of Phase 1. Each is a deliberate omission, not a bug to route around:
+Accurate as of Phase 2. Each is a deliberate omission, not a bug to route around:
 
 - **Error responses are absent from the OpenAPI schema.** Operations declare only
   their success codes, so Swagger UI does not render the envelope. Fix by adding
   a shared `responses={...}` model and referencing it from each route.
+- **`GET /api/v1/users/` is a fixture, not a feature.** It exists so the role →
+  permission wiring has a route whose refusal is observable end to end. It
+  returns an unbounded list with no pagination, because a fixture that could
+  itself need pagination would be a worse fixture. Do not build UI on it.
+- **`audit_log_retention_days` is declared but not enforced.** No job prunes
+  `audit_logs`; the setting states a policy and gives the value somewhere to be
+  displayed. There is no endpoint to read the audit trail either.
+- **The access-token revocation denylist is in-process** — not restart-durable,
+  not shared between workers. Refresh tokens and sessions are database-backed and
+  do not have this problem; see [Revocation store](#revocation-store-and-its-limits).
+- **The client's password checklist is very slightly stricter than the server**
+  for exotic numeric characters (`\p{Nd}` vs Python's `str.isdigit()`). Documented
+  in [Password policy](#password-policy); the divergence is one-way and harmless,
+  because the server is the only authority.
 - **`rate_limited` is a reserved code with no implementation.** There is no rate
-  limiter, so nothing can return 429. `bad_request` is likewise never raised
-  deliberately, but it is *reachable*: `_status_code_to_code` returns it for any
-  unmapped 4xx, so it is the code a 413 or 415 will carry.
+  limiter, so nothing can return 429 — which also means the password-reset
+  endpoint is not rate-limited, and is protected from enumeration by returning an
+  identical body rather than by throttling. `bad_request` is likewise never
+  raised deliberately, but it is *reachable*: `_status_code_to_code` returns it
+  for any unmapped 4xx, so it is the code a 413 or 415 will carry.
 - **`Page` and `Message` are declared but unserved.** No endpoint returns either
   shape today.
 - **`frontend/src/types/pagination.ts` disagrees with the backend envelope, and
@@ -856,3 +1092,5 @@ Accurate as of Phase 1. Each is a deliberate omission, not a bug to route around
 - **`GET /api/v1/health` is unauthenticated**, which is correct for a readiness
   probe on a local-first, single-user system bound to loopback. It exposes
   `environment`, `version` and uptime and nothing else.
+- **There is no audit-trail endpoint.** Rows are written and never read by the
+  API. Nothing in the product surfaces them yet.

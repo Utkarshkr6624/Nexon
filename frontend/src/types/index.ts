@@ -25,4 +25,4 @@ export type {
   UUIDString,
 } from './api'
 
-export type { Paginated, PaginationParams } from './pagination'
+export type { PageMeta, Paginated, PaginationParams } from './pagination'

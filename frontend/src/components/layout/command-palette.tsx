@@ -140,6 +140,9 @@ function PaletteDialog() {
   // A stale index (e.g. from a longer result list) must never point nowhere.
   const activeIndex = selection.query === debouncedQuery ? Math.min(selection.index, items.length - 1) : 0
 
+  // The "No destinations match" branch renders no listbox at all.
+  const hasResults = items.length > 0
+
   const setActiveIndex = useCallback(
     (index: number) => setSelection({ query: debouncedQuery, index }),
     [debouncedQuery],
@@ -233,10 +236,16 @@ function PaletteDialog() {
             placeholder="Jump to a module…"
             aria-label="Filter destinations"
             role="combobox"
-            aria-expanded={items.length > 0}
-            aria-controls={LISTBOX_ID}
+            aria-expanded={hasResults}
+            // Both are only meaningful against a rendered listbox. The
+            // "No destinations match" branch has none, so pointing at the id
+            // would leave `aria-controls` and `aria-activedescendant` naming
+            // an element that does not exist.
+            aria-controls={hasResults ? LISTBOX_ID : undefined}
             aria-autocomplete="list"
-            aria-activedescendant={items[activeIndex] ? optionId(activeIndex) : undefined}
+            aria-activedescendant={
+              hasResults ? optionId(activeIndex) : undefined
+            }
             className="h-12 w-full bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
           />
           <Badge variant="outline" className="hidden shrink-0 font-normal sm:inline-flex">

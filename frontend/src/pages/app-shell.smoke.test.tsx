@@ -4,8 +4,10 @@ import { RouterProvider, createBrowserRouter } from 'react-router-dom'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { AppProviders } from '@/app/providers'
+import { NAV_GROUPS } from '@/features/modules/catalog'
 import { useAuthStore } from '@/stores/auth-store'
 import { useThemeStore } from '@/stores/theme-store'
+import type { User } from '@/types/api'
 
 /**
  * End-to-end smoke test for the application shell: routing guards, sign-in,
@@ -13,16 +15,30 @@ import { useThemeStore } from '@/stores/theme-store'
  * backend. It exercises the real router and the real stores.
  */
 
-const USER = {
+/*
+ * Typed as `User` on purpose. An untyped object literal satisfies any fetch
+ * stub, so the moment the wire shape drifts — `full_name` becoming
+ * `display_name`, `is_superuser` becoming `role` + `permissions` — the mock
+ * keeps answering with a body the app no longer understands and the failure
+ * surfaces as a confusing timeout somewhere else in the tree instead of a
+ * compile error here.
+ */
+const USER: User = {
   id: '11111111-1111-4111-8111-111111111111',
   email: 'ada@nexus.local',
-  full_name: 'Ada Lovelace',
+  username: 'ada',
+  display_name: 'Ada Lovelace',
+  avatar_url: null,
+  role: 'user',
+  permissions: [],
   is_active: true,
   is_verified: true,
-  is_superuser: false,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
+  last_login_at: null,
 }
+
+const SESSION_ID = '22222222-2222-4222-8222-222222222222'
 
 const HEALTH = {
   status: 'healthy',
@@ -32,6 +48,18 @@ const HEALTH = {
   database: { status: 'connected', latency_ms: 1.23 },
   uptime_seconds: 3725.5,
   timestamp: '2026-01-01T00:00:00Z',
+}
+
+/**
+ * `greetingFor` has four branches, not three: between midnight and 05:00 the
+ * dashboard says "Still up", so a three-way regex would fail by wall-clock time
+ * rather than by regression.
+ */
+const GREETING = /Good (morning|afternoon|evening)|Still up/
+
+/** The dashboard's `<h1>`, which greets by display name rather than by handle. */
+function dashboardHeading() {
+  return { name: new RegExp(`${GREETING.source}, Ada`) }
 }
 
 function json(body: unknown, status = 200): Response {
@@ -62,6 +90,7 @@ beforeEach(() => {
           refresh_token: 'refresh-token',
           token_type: 'bearer',
           expires_in: 3600,
+          session_id: SESSION_ID,
         })
       }
       if (url.includes('/auth/me')) return json(USER)
@@ -90,7 +119,9 @@ describe('application shell', () => {
     await router.navigate('/dashboard')
     renderApp()
 
-    expect(await screen.findByRole('heading', { name: 'Sign in to NEXUS' })).toBeInTheDocument()
+    // The brand is rendered by `AuthShell` separately from its title, so the
+    // heading is the screen's own name for itself and nothing more.
+    expect(await screen.findByRole('heading', { name: 'Sign in' })).toBeInTheDocument()
     expect(router.state.location.pathname).toBe('/login')
   })
 
@@ -98,24 +129,42 @@ describe('application shell', () => {
     const user = userEvent.setup()
     renderApp()
 
-    await screen.findByRole('heading', { name: 'Sign in to NEXUS' })
+    await screen.findByRole('heading', { name: 'Sign in' })
     await user.type(screen.getByLabelText('Email'), 'ada@nexus.local')
     await user.type(screen.getByLabelText('Password'), 'correct-horse-battery')
-    await user.click(screen.getByRole('button', { name: /sign in/i }))
+    await user.click(screen.getByRole('button', { name: 'Sign in' }))
 
-    expect(await screen.findByRole('heading', { name: /Good (morning|afternoon|evening), Ada/ })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', dashboardHeading())).toBeInTheDocument()
     expect(useAuthStore.getState().status).toBe('authenticated')
     expect(useAuthStore.getState().accessToken).toBe('access-token')
   })
 
   it('renders the shell, the sidebar groups and the live health card', async () => {
     renderApp()
-    await screen.findByText(/Good (morning|afternoon|evening), Ada/)
+    await screen.findByRole('heading', dashboardHeading())
 
     const nav = screen.getByRole('navigation', { name: 'Primary' })
-    expect(within(nav).getByRole('link', { name: 'Dashboard' })).toBeInTheDocument()
-    expect(within(nav).getByRole('link', { name: 'Knowledge' })).toBeInTheDocument()
-    expect(within(nav).getByRole('link', { name: 'Experiments' })).toBeInTheDocument()
+
+    // Grouping is a Phase 2 change: the rail now renders the registry's
+    // categories, so the expected order is derived from the registry rather
+    // than hand-listed here.
+    const grouped = NAV_GROUPS.flatMap((group) => group.items)
+    expect(grouped.length).toBeGreaterThan(1)
+    expect(within(nav).getAllByRole('link').map((link) => link.getAttribute('href'))).toEqual(
+      grouped.map((item) => item.to),
+    )
+
+    // A group of one is a home row, not a section: only the multi-item groups
+    // get a heading, so the Dashboard sits above "Work" with nothing over it.
+    const headings = within(nav).getAllByRole('heading').map((heading) => heading.textContent)
+    expect(headings).toEqual(
+      NAV_GROUPS.filter((group) => group.items.length > 1).map((group) => group.label),
+    )
+
+    // /settings is a footer row, outside the grouped rail.
+    expect(within(nav).queryByRole('link', { name: 'Settings' })).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Settings' })).toHaveAttribute('href', '/settings')
+
     expect(screen.getByText('Backend health')).toBeInTheDocument()
 
     // "healthy" is shown twice by design: once as the KPI, once as the status badge.
@@ -129,7 +178,7 @@ describe('application shell', () => {
   it('opens the command palette with Ctrl+K and navigates to a module', async () => {
     const user = userEvent.setup()
     renderApp()
-    await screen.findByText(/Good (morning|afternoon|evening), Ada/)
+    await screen.findByRole('heading', dashboardHeading())
 
     await user.keyboard('{Control>}k{/Control}')
 
@@ -150,7 +199,7 @@ describe('application shell', () => {
     const user = userEvent.setup()
     await router.navigate('/dashboard')
     renderApp()
-    await screen.findByText(/Good (morning|afternoon|evening), Ada/)
+    await screen.findByRole('heading', dashboardHeading())
 
     await user.click(screen.getByRole('button', { name: /Theme:/ }))
     await user.click(await screen.findByRole('menuitemradio', { name: 'Light' }))
@@ -174,12 +223,14 @@ describe('application shell', () => {
     await router.navigate('/dashboard')
     renderApp()
 
-    // The shared query client retries transport failures twice before settling.
+    // The shared query client retries transport failures twice before settling,
+    // with an exponential backoff — three attempts cost several seconds, which
+    // is past the default 5s test timeout and has to be allowed for explicitly.
     expect(
-      await screen.findByText('Cannot reach the NEXUS backend', {}, { timeout: 10_000 }),
+      await screen.findByText('Cannot reach the NEXUS backend', {}, { timeout: 20_000 }),
     ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument()
     // No stack traces, no raw transport internals.
     expect(screen.queryByText(/TypeError/)).not.toBeInTheDocument()
-  })
+  }, 30_000)
 })

@@ -10,7 +10,7 @@ import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
 import { Spinner } from '@/components/ui/spinner'
 import { ErrorState } from '@/components/feedback/error-state'
-import { STRENGTH_TOKENS } from '@/features/auth/password-strength'
+import { MAX_STRENGTH_SCORE, STRENGTH_TOKENS } from '@/features/auth/password-strength'
 import { usePasswordRules } from '@/features/auth/use-password-rules'
 import { toApiError } from '@/services/errors'
 import type { ApiError } from '@/lib/api-client'
@@ -92,9 +92,15 @@ export function PasswordField({
         <div className="space-y-2 pt-0.5">
           {value.length > 0 && (
             <div className="flex items-center gap-2">
+              {/* `max` is the meter's own scale, not the 0-100 default: the
+                  score runs 0..MAX_STRENGTH_SCORE, so without it a strong
+                  password renders a 10%-wide bar and is announced as "9 of
+                  100". The label carries the level in words so the state is
+                  never carried by the bar colour alone. */}
               <Progress
                 value={strength.score}
-                aria-label="Password strength"
+                max={MAX_STRENGTH_SCORE}
+                aria-label={`Password strength: ${tokens.label}`}
                 indicatorClassName={tokens.bar}
               />
               <span className={`w-12 shrink-0 text-xs font-medium ${tokens.text}`}>
@@ -236,7 +242,7 @@ export function PasswordForm() {
         </div>
       </Alert>
 
-      <form onSubmit={onSubmit} className="app-form-stack max-w-xl" noValidate>
+      <form onSubmit={onSubmit} className="app-form-stack" noValidate>
         {failure && <ErrorState error={failure} compact />}
 
         <PasswordField

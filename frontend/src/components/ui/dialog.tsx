@@ -264,14 +264,27 @@ const DialogContent = React.forwardRef<HTMLDivElement, DialogContentProps>(
       })
       lockBodyScroll()
 
-      const focusables = getFocusableElements(panel)
-      const first = focusables[0]
-      // With nothing focusable inside, the panel itself is the focus target —
-      // an element with tabIndex={-1}, so it holds focus without joining the
-      // page's tab order.
-      ;(first ?? panel).focus()
+      // The focus move is deferred by one frame, and must stay that way. The
+      // panel's accessible name is derived from a COUNT that `DialogTitle` and
+      // `DialogDescription` only register in their own passive effects, so on
+      // the commit the dialog opens that count is still 0: the panel is painted
+      // with the fallback `aria-label="Dialog"` and no `aria-labelledby`/
+      // `aria-describedby`, and the registration re-render that fixes it has not
+      // landed yet. Focusing synchronously in the same flush hands the screen
+      // reader the generic name, which it then keeps. Neither `useLayoutEffect`
+      // (same commit) nor registering during the child's render (React forbids
+      // setState in render) avoids this; only crossing a frame boundary does.
+      const frame = requestAnimationFrame(() => {
+        if (!panel.isConnected) return
+        // Recomputed rather than captured: the panel's children settle with it.
+        // With nothing focusable inside, the panel itself is the focus target —
+        // an element with tabIndex={-1}, so it holds focus without joining the
+        // page's tab order.
+        ;(getFocusableElements(panel)[0] ?? panel).focus()
+      })
 
       return () => {
+        cancelAnimationFrame(frame)
         const index = openDialogs.findIndex((entry) => entry.panel === panel)
         const entry = index === -1 ? undefined : openDialogs.splice(index, 1)[0]
         unlockBodyScroll()

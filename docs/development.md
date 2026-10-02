@@ -40,11 +40,11 @@ Two consequences worth stating plainly:
 | --- | --- |
 | [1. Clean-machine setup](#1-clean-machine-setup) | Prerequisite checks, the bootstrap script, the database, verifying the install |
 | [2. The daily loop](#2-the-daily-loop) | Edit → run → test, hot reload, what to run when |
-| [3. Adding a backend endpoint](#3-adding-a-backend-endpoint) | The layering rule, the vertical slice, error translation |
+| [3. Adding a backend endpoint](#3-adding-a-backend-endpoint) | The layering rule, a repository and a service, a permission-guarded route, error translation, audit events, the vertical slice |
 | [4. Migrations](#4-migrations) | autogenerate → check → apply, and the rules about revision files |
-| [5. Adding a frontend page](#5-adding-a-frontend-page) | The three-file pattern, the registry contract, real copy vs. sample data |
+| [5. Adding a frontend page](#5-adding-a-frontend-page) | The three-file pattern, the registry contract, a settings panel, real copy vs. sample data |
 | [6. Testing conventions](#6-testing-conventions) | `integration` marker, fixtures, `assert_error_envelope`, the regression rule |
-| [7. Design-system rules](#7-design-system-rules) | Tokens, `cva` variants, primitives, what not to build by hand |
+| [7. Design-system rules](#7-design-system-rules) | Tokens, `cva` variants, the Radix-backed and hand-rolled primitives, what not to build by hand |
 | [8. Code conventions](#8-code-conventions) | ruff, docstrings, TypeScript strictness, the react-refresh constraint |
 | [9. Before you open a pull request](#9-before-you-open-a-pull-request) | The checklist |
 | [10. Verified baseline and known limits](#10-verified-baseline-and-known-limits) | What was actually executed, and what was not |
@@ -199,8 +199,8 @@ worker carries its own connection pool and its own empty revocation denylist.
 
 | You changed | Run |
 | --- | --- |
-| Python, no schema or data | `python -m pytest -m "not integration"` — 145 tests, no database |
-| A model, a repository, or anything touching data | `python -m pytest` — the full 188, needs PostgreSQL |
+| Python, no schema or data | `python -m pytest -m "not integration"` — 366 tests, no database |
+| A model, a repository, or anything touching data | `python -m pytest` — the full 499, needs PostgreSQL |
 | TypeScript | `npm run typecheck && npm test` |
 | A component's markup or a route | `npm test`, plus `npm run build` — `tsc -b` catches types and import paths, but only a real build proves the module graph resolves |
 
@@ -239,7 +239,8 @@ Read the reference slice first. `backend/app/api/v1/auth.py` (router),
 `backend/app/services/auth_service.py` (rules),
 `backend/app/repositories/user.py` (SQL) and `backend/app/models/user.py` (table)
 together are the only complete vertical slice in the repository, and a new module
-should look like it.
+should look like it. `app/api/v1/users.py` is the second one, and the smallest —
+two routes over the caller — so it is the easier of the two to copy.
 
 ### 3.1 The layering rule
 
@@ -266,8 +267,8 @@ Two dependency modules, and the split matters:
 
 | Module | Owns | Import it from |
 | --- | --- | --- |
-| `app/core/deps.py` | Identity: bearer scheme, `CurrentUser`, optional user, `SuperUser`, session → repository. Imports no service, which keeps the graph acyclic. | `app/api/deps.py` re-exports it |
-| `app/api/deps.py` | Layering on top: `get_<module>_service` (session → repository → service), plus `get_authenticated_user`, which adds the revocation check | the routers |
+| `app/core/deps.py` | Identity and authorisation: bearer scheme, `CurrentUser`, optional user, `SuperUser`, the `sid` claim, `require_permission()`, session → repository. Imports no service, which keeps the graph acyclic. | `app/api/deps.py` re-exports it |
+| `app/api/deps.py` | Layering on top: `get_<module>_service` (session → repository → service), `get_authenticated_user` (which adds the revocation check), and `get_client_context(request)` → `(ip_address, user_agent)` | the routers |
 
 A new module adds one provider here, mirroring `get_auth_service`:
 
@@ -280,7 +281,54 @@ def get_project_service(repository: ProjectRepositoryDep) -> ProjectService:
 Routers then depend on `Annotated[ProjectService, Depends(get_project_service)]`
 and never construct a repository or a session themselves.
 
-### 3.3 The error-translation rule
+**`get_client_context` is how a router collects audit context.** Phase 2 added it
+because the routers must not reach into the request themselves: the API layer hands
+the services a plain `(ip_address, user_agent)` pair, and the services pass those to
+`AuditService.record`. It is also the one place the truncation to the column widths
+(45 and 512 characters) is applied, so no writer has to remember it. A new
+security-relevant router should take `ClientContext` and forward it, not re-derive
+the address.
+
+### 3.3 A permission-guarded endpoint
+
+Phase 2 added `app/core/permissions.py`. A protected route names the **capability**
+it guards; it never names a role.
+
+```python
+from app.core.deps import get_current_active_superuser, require_permission
+from app.core.permissions import Permission
+
+@router.patch(
+    "/me",
+    response_model=UserRead,
+    summary="Update the caller's profile",
+    dependencies=[Depends(require_permission(Permission.USERS_WRITE))],
+)
+async def update_me(payload: UserUpdate, current_user: AuthenticatedUser, …) -> User:
+    ...
+```
+
+Rules that follow:
+
+| Rule | Why |
+| --- | --- |
+| The route declares `Permission.X`, never `"admin"` | The role → permission map is the single place a grant is decided. A hard-coded role comparison is a second, drifting answer |
+| The check runs *after* authentication | `require_permission` returns a dependency that depends on `get_current_user`, so an anonymous caller gets 401, never 403 — otherwise it could tell "not signed in" from "not permitted" |
+| To use a capability you must add it to `ROLE_PERMISSIONS` | An unknown permission is treated as not held (`has_permission` returns `False` rather than raising), so declaring a route guard alone would deny everyone — including admins, since `ADMIN_ROLE` is `frozenset(Permission)` |
+| `Permission` is a `StrEnum`; its value is the stable string | It is persisted, returned in `UserRead.permissions`, and filtered on by clients. Never rename a value once it ships |
+| An **administrator-only** surface takes both gates | `GET /api/v1/users/` requires `USERS_READ` *and* `Depends(get_current_active_superuser)`: the permission says the capability exists, the superuser check narrows it to something that is not part of the product surface |
+
+**404, not 403, for a row the caller does not own.** If your endpoint acts on a
+caller-scoped resource, scope the lookup by the caller's id in the query
+(`get_by_id_for_user(session_id, user_id)`) and raise `NotFoundError`. A 403 would
+confirm the id exists and turn the route into a probe for real ids.
+`SessionService.revoke` is the reference implementation.
+
+**Add a permission to a new module's catalog, not to a route.** `projects.*`,
+`tasks.*` and `analytics.read` are declared in the map and nothing guards them yet;
+Projects and Tasks will consume them when they arrive.
+
+### 3.4 The error-translation rule
 
 Two halves, and both matter:
 
@@ -300,7 +348,33 @@ Corollary: **a router raises nothing.** Routers pick a success status and return
 out of the service; `install_exception_handlers` in `app/core/exceptions.py`
 renders them. Never construct an error-shaped `JSONResponse` by hand.
 
-### 3.4 Vertical-slice checklist
+### 3.5 Writing a repository and a service
+
+Phase 2 added three repositories and two services, and the shape did not change.
+
+**Repository — SQL only, no domain errors.** The reference is
+`app/repositories/session.py`.
+
+| Rule | Detail |
+| --- | --- |
+| Return `None` for a miss | `get_by_id`, `get_by_id_for_user`, `get_by_token_hash` all return `T \| None`. Unexpected driver errors propagate untouched |
+| Scope by the owner when the row is caller-scoped | `get_by_id_for_user(session_id, user_id)` filters on both in the query. This is what makes 404-not-403 possible without an ownership check afterwards |
+| Commit, then `refresh()` | `expire_on_commit=False` means a create can return populated attributes, but `created_at` / `updated_at` come from server defaults and still need a reload |
+| Expose intent, not SQL | `revoke_all_for_user`, `list_live_ordered_by_created`, `rotate_token` are methods. A router or service that has to know the ordering is a leak |
+| The module docstring states the surface | `session_service.py` lists the exact repository API it relies on, which is what makes the repository safe to refactor |
+
+**Service — the rules, and no FastAPI.** The references are `SessionService` and
+`UserService`.
+
+| Rule | Detail |
+| --- | --- |
+| Raise a domain error for every failure mode | Never return `None` to mean "not found" from a public method |
+| Normalise identifiers here | `_clean_username` trims without folding case; the uniqueness lookup then compares exactly what the column will hold |
+| Translate `IntegrityError` → `ConflictError` | On **both** the pre-check and the commit, so a race cannot leak a driver error. `AuthService._conflict_message` reads the constraint name so a username collision gets the username message |
+| Collapse equivalent failures into one message | Every rotation rejection answers "This session is no longer valid." A caller that can distinguish "signed out" from "already rotated" has learned something |
+| Take an optional `AuditService` and use it if present | `self.audit = audit` may be `None`, so the service can be exercised without an audit sink; production wires one |
+
+### 3.6 Vertical-slice checklist
 
 Order matters only in that the schema must exist before autogenerate sees the
 model. Every item is a real file in the repository or a real command.
@@ -315,14 +389,16 @@ model. Every item is a real file in the repository or a real command.
 | 6 | Provider: `get_<module>_service` | `app/api/deps.py` |
 | 7 | Router: `APIRouter(prefix="/<module>", tags=["<module>"])`, `response_model`, explicit `status_code`, one-line `summary` | `app/api/v1/<module>.py` |
 | 8 | Register the router | `app/api/v1/router.py` — `api_v1_router.include_router(<module>.router)` |
-| 9 | Tests | see [§6](#6-testing-conventions) |
-| 10 | Frontend pairing: one function in `frontend/src/services/`, the wire type in `frontend/src/types/api.ts` | cross-link the endpoint checklist in [`api-conventions.md`](api-conventions.md#checklist-for-a-new-endpoint) |
+| 9 | **Permissions**: add `projects.<verb>` to `ROLE_PERMISSIONS`, and `Depends(require_permission(…))` to each guarded route | `app/core/permissions.py`, `app/api/v1/<module>.py` — see [§3.3](#33-a-permission-guarded-endpoint) |
+| 10 | **Audit**: record the security-relevant events from the service, never the router | `app/services/audit_service.py` — see [§3.8](#38-recording-an-audit-event) |
+| 11 | Tests | see [§6](#6-testing-conventions) |
+| 12 | Frontend pairing: one function in `frontend/src/services/`, the wire type in `frontend/src/types/api.ts`, and a catalog entry if the page appears in the sidebar or palette | cross-link the endpoint checklist in [`api-conventions.md`](api-conventions.md#checklist-for-a-new-endpoint) |
 
-Step 10 is the one most often forgotten, and the failure is a runtime mismatch
+Step 12 is the one most often forgotten, and the failure is a runtime mismatch
 rather than a compile error — the backend schema and the TypeScript type are
 checked by nothing except agreement.
 
-### 3.5 The wire contract
+### 3.7 The wire contract
 
 Status codes, error envelopes, auth per route, pagination, request ids — all
 owned by [`api-conventions.md`](api-conventions.md). Do not restate them here;
@@ -330,6 +406,36 @@ read that document's
 [checklist for a new endpoint](api-conventions.md#checklist-for-a-new-endpoint)
 before writing the route decorator, because it is more specific than anything
 this document could say.
+
+### 3.8 Recording an audit event
+
+`AuditService.record()` is called from the **service**, never from the router —
+that is what makes the same event recorded whether it came from an HTTP endpoint
+or, later, from a background job.
+
+```python
+await self.audit.record(
+    AuditEvent.SESSION_REVOKED,
+    user_id=user_id,
+    ip_address=ip_address,
+    user_agent=user_agent,
+    metadata={"session_id": str(session_id)},
+)
+```
+
+| Rule | Detail |
+| --- | --- |
+| Add a new `AuditEvent` member for a genuinely new event; do not reuse one | The values are persisted and are what consumers filter on. `validate_audit_event` rejects an unknown one rather than writing a row no filter can match |
+| **`metadata` may never contain a password, a token, or a hash of either** | It is JSONB, written verbatim, rendered into exports, and retained longer than the sessions it describes. Nothing is filtered on the way in, because a redaction list eventually misses the one field that matters |
+| Keep it minimal and non-secret | A session id, a username, a count of sessions ended. Not the values that were submitted |
+| `user_id` may be `None` | A failed sign-in against an address with no account is exactly the event worth recording, and it has no user row. The column is nullable for that reason |
+| **Never retry a failed write** | `record()` already swallowed the error and logged it at WARNING. A write that failed partway is not safe to assume did not happen, and re-recording a security event is how a trail stops being evidence |
+| Do not branch on the return value | `record()` returns `AuditLog \| None`; the `None` is a diagnostic, not a condition the service should act on. Audit must not be able to deny service |
+| Record `ACCOUNT_DELETED` **before** the row is deleted | `audit_logs.user_id` is `ON DELETE SET NULL`, so the trail survives — but only the rows already written |
+
+The twelve current events are listed in `app/models/audit.py`. `audit_log_retention_days`
+states a retention policy that **no job enforces**; if you add the job, it is a
+background worker and it needs the same event-loop factory as everything else.
 
 ---
 
@@ -370,12 +476,13 @@ which is `integration`-marked and so only runs when one is available.
 ### 4.2 Rules for revision files
 
 **A migration must not import a model.** `migrations/versions/0001_initial_create_users.py`
-says so in its own module docstring, and it is the single most important rule in
-this section: a revision is explicit DDL that happens to look like what the
-model describes today. If it imported `app.models.user`, then editing the model
-later would silently change the *meaning* of an already-applied migration — and
-on a fresh database, or after a `downgrade`, that old revision would produce a
-different schema than it did the day it was written.
+and `0002_phase2_identity_sessions.py` both say so in their own module docstring,
+and it is the single most important rule in this section: a revision is explicit
+DDL that happens to look like what the model describes today. If it imported
+`app.models.user`, then editing the model later would silently change the
+*meaning* of an already-applied migration — and on a fresh database, or after a
+`downgrade`, that old revision would produce a different schema than it did the
+day it was written.
 
 Corollary: autogenerate output is a **draft**. Rename a column in a generated
 `op.alter_column`, add `server_default=`, or add a comment, and the drift check
@@ -424,15 +531,22 @@ DATABASE_URL=postgresql+psycopg://nexus:nexus@127.0.0.1:5432/nexus_test \
 The chain has exactly one head and is asserted to be linear by
 `backend/tests/test_migrations.py::test_the_migration_chain_is_linear_and_has_a_single_head`.
 
-> **Known constraint, unchanged here.** That test asserts the full revision list
-> literally — `== ["0001"]`. Adding a second revision makes it fail until the
-> list is extended. That is a deliberate pin on the current chain, not an
-> oversight, but it does mean a new migration comes with a one-line test update.
-> It has been left as-is here because tests are outside this document's scope.
+> **Known constraint.** That test asserts the full revision list literally —
+> `== ["0002", "0001"]`, head `0002` — so adding a third revision makes it fail
+> until the list is extended. That is a deliberate pin on the current chain, not an
+> oversight. Phase 2 updated it from `["0001"]` when it added `0002`.
 
 Drift is also a test, not just a command:
 `test_autogenerate_reports_no_drift` compares the live schema against
-`Base.metadata` with the same options `env.py` uses.
+`Base.metadata` with the same options `env.py` uses. It is `integration`-marked,
+so it has not been run in the environment these documents were written in.
+
+`backend/tests/test_migration_ddl.py` is the database-free substitute, and it is
+worth reading before you add a revision. It renders the whole chain to SQL
+**offline** (`as_sql=True` into a buffer) and compares every emitted `CREATE
+TABLE` column, foreign key and index against `Base.metadata`. Adding a revision
+without adding it to `MIGRATION_MODULES` in that file means the offline check
+silently stops covering the new head.
 
 ---
 
@@ -512,7 +626,35 @@ A placeholder page that starts fetching needs, in addition:
 | Server state | a hook in `frontend/src/features/<module>/` | TanStack Query; the query client suppresses retries for 4xx |
 | Error handling | `ApiError` | branch on `code`, never on `message` |
 
-### 5.5 No fabricated data
+### 5.5 A settings panel
+
+`/settings` is the one page in the product that is a *composition* rather than a
+module: a five-tab surface (`Profile`, `Account`, `Security`, `Sessions`,
+`Preferences`) with one panel per tab in `frontend/src/features/settings/`. A new
+account-level capability belongs there rather than in a new page.
+
+The pattern, from `sessions-panel.tsx`:
+
+| Layer | File | Rule |
+| --- | --- | --- |
+| Transport | `frontend/src/services/sessions.ts` | One exported function per endpoint. `listSessions`, `revokeSession`, `logoutAll` — and nothing calls `fetch` outside `lib/api-client.ts` |
+| Query | `useQuery` / `useMutation` in the panel | Invalidate on success rather than refetching by hand; `onSessionChange` is what the query layer subscribes to so cached account data cannot outlive the session that fetched it |
+| Presentation | the panel file | No `ApiError` strings hard-coded in JSX — branch on `code`, and route a 404 in the session-revoke path to "already gone" rather than to an error banner, because that is what a double-click produces |
+| Destructive actions | `dialog.tsx` + `danger-zone.tsx` | A confirm dialog for anything irreversible, and a red-bordered region that says so in words |
+| Success feedback | `useToast()` | A mutation that succeeds says so. Silent success is indistinguishable from a dropped click |
+
+Two rules the account work established, which a new panel must not break:
+
+- **An action that ends other sessions must be visible next to the session list.**
+  A password change revokes every session except the caller's, so `Security` and
+  `Sessions` are separate tabs but the consequence is stated in the copy of both.
+  Do not hide a cross-panel side effect.
+- **A destructive request carries its own proof.** `DELETE /users/me` requires the
+  account password *and* `confirm: true` in the body, because a token left in a
+  shared browser is enough to read an account but not enough to destroy one. A new
+  irreversible endpoint should follow that pattern rather than rely on the dialog.
+
+### 5.6 No fabricated data
 
 **A module page renders real copy, not invented numbers.** Every metric tile on
 a placeholder renders an em dash and states what it will need:
@@ -549,7 +691,7 @@ no-op.
 | What to mark | Any test that touches the database — which in practice means any test whose signature pulls in `client`, `db_session` or `truncated_database` |
 | How | Module-level `pytestmark = pytest.mark.integration`, as in `test_auth.py`, `test_repositories.py`, `test_errors.py`, `test_migrations.py`; per-test `@pytest.mark.integration` where only one test needs it |
 | What must pass offline | `python -m pytest -m "not integration"` with PostgreSQL stopped |
-| Current split | 145 offline, 43 integration, 188 collected |
+| Current split | 366 offline, 133 integration, 499 collected |
 
 Mark a test `integration` because it genuinely needs a database — not because it
 is easier to get green that way. The offline subset is the fast inner loop; a
@@ -624,7 +766,7 @@ internal package path. Pair it with `assert_error_envelope`.
 | Config | `test` block in `frontend/vite.config.ts`; `include: ['src/**/*.{test,spec}.{ts,tsx}']` |
 | Setup | `src/test/setup.ts`, applied per test: `@testing-library/jest-dom/vitest`, `cleanup()`, and shims for `scrollIntoView`, `matchMedia` and `AbortSignal` |
 | Location | Colocated next to the subject (`components/ui/button.test.tsx`), not in a `__tests__` folder |
-| Current suite | 10 files, 30 tests |
+| Current suite | 22 files, 134 tests |
 
 Individual test files should not add their own environment shims — the setup
 file installs them in `beforeEach` and `unstubAllGlobals` in `afterEach` would
@@ -680,6 +822,34 @@ convention (configured in `frontend/components.json`, new-york style, lucide
 icons): the component source lives in this repository rather than in
 `node_modules`, so a change to a primitive is a normal edit.
 
+**But only seven of them are over Radix.** `frontend/package.json` installs
+exactly these: `@radix-ui/react-avatar`, `-dropdown-menu`, `-label`,
+`-scroll-area`, `-separator`, `-slot`, `-tooltip`. Phase 2 needed six more
+primitives and the corresponding packages were not installed, so it wrote them by
+hand:
+
+| Primitive | Over Radix? | What it has to get right |
+| --- | --- | --- |
+| `dialog.tsx` | **no** | Focus trap, focus restore to the trigger on close, `Escape`, overlay dismissal, scroll lock, `aria-modal`, `role="dialog"` + `aria-labelledby` |
+| `tabs.tsx` | **no** | Full ARIA: `tablist` / `tab` / `tabpanel`, `aria-selected`, `aria-controls`, `aria-labelledby`, arrow-key navigation and a **roving tabindex** (exactly one tab is `tabIndex=0`; the rest `-1`) |
+| `progress.tsx` | **no** | `role="progressbar"` with `aria-valuenow` / `aria-valuemin` / `aria-valuemax` / `aria-valuetext` |
+| `alert.tsx` | **no** | `role="alert"` for an urgent message, `role="status"` for a polite one |
+| `switch.tsx` | **no** | `role="switch"` + `aria-checked` on a `<button>`; Space and Enter both toggle |
+| `select.tsx` | **no** | **A native `<select>`, deliberately** — see below |
+| `toast.tsx` / `toaster.tsx` | **no** | A Zustand store plus an ARIA live region; `role="status"` for polite, `role="alert"` for destructive |
+
+`select.tsx` is the one that looks like an oversight and is not. A hand-built
+listbox is where accessibility goes to die: type-ahead and its buffer, `Home` /
+`End`, arrow wrap-around, screen-reader announcements of the active option and of
+how many options exist, and the platform picker on touch are all hard to get
+right, and the native element gets every one of them from the OS. The price is
+that it cannot be styled like the rest of the system on every platform — the
+correct trade for a control that picks a colour scheme, and the reason it is
+documented here rather than left as an apparent inconsistency.
+
+`avatar`, `dropdown-menu`, `label`, `scroll-area`, `separator`, `slot` and
+`tooltip` **are** Radix, and should stay that way.
+
 The pattern, from `button.tsx`:
 
 ```tsx
@@ -706,7 +876,24 @@ Rules that follow from it:
 | `asChild` renders the child with the styles, via Radix `Slot` | `<Button asChild><Link/></Button>` is the correct composition; nesting a button in an anchor is not |
 | Forward refs; set `displayName` | Radix and the React DevTools both depend on them |
 
-### 7.3 Structural helpers, and what not to build by hand
+### 7.3 Writing a new design-system primitive
+
+If the primitive is not over Radix, it is yours to maintain — so it owes the same
+things a Radix package would have given you:
+
+| Obligation | Detail |
+| --- | --- |
+| Full ARIA, not decorative | Every interactive primitive needs its role, its state attributes, and the label/control relationships a screen reader needs. `tabs.tsx` and `switch.tsx` are the models |
+| Keyboard parity with a native control | Arrows, `Home`/`End`, `Space` and `Enter` — whatever the platform equivalent would do. A primitive that only responds to a mouse is a bug |
+| Focus management | Roving tabindex for a set, focus trap and restore for an overlay, visible focus from the global `:focus-visible` rule |
+| An escape hatch | `className` merged through `cn`, so a caller can adjust layout without a new variant |
+| A colocated test | `button.test.tsx`, `card.test.tsx`, `dialog.test.tsx` and `tabs.test.tsx` are all colocated in `components/ui/`. A hand-rolled primitive with real behaviour and no test is the one thing this repository does not ship |
+
+**Prefer not to build one.** The list above is the cost, and it is why
+`select.tsx` is a native element: the cost of not having Radix should be paid
+where the platform already did the work.
+
+### 7.4 Structural helpers, and what not to build by hand
 
 `index.css` also owns a small `@layer components` block:
 
@@ -725,12 +912,19 @@ Beyond that, prefer the existing building blocks over a new one:
 | Unhandled render error | `components/feedback/app-error-boundary.tsx`, wired as the router's `errorElement` |
 | Page title block | `components/feedback/page-header.tsx` — takes `eyebrow`, `title`, `description`, `badges` |
 | A modal, menu, tooltip, separator, avatar | The matching `components/ui/` primitive |
+| Confirmation before something irreversible | `components/ui/dialog.tsx`, plus the `danger-zone.tsx` pattern in `features/settings/` |
+| Tabbed settings or a tabbed sub-view | `components/ui/tabs.tsx` — full ARIA and roving tabindex already implemented |
+| A transient confirmation, or a non-blocking error | `useToast()` from the toast store; do not use a dialog for something the user did not have to answer |
+| A password field with a reveal toggle and a live checklist | `features/auth/components/password-field.tsx` and `password-rules-checklist.tsx` |
+| A binary setting | `components/ui/switch.tsx`; `input.tsx` for text |
 
 Accessibility is not optional styling. `:focus-visible` is defined globally in
 `index.css` so focus is visible on native *and* Radix elements; `prefers-reduced-motion`
 collapses durations rather than removing transitions. Decorative icons carry
 `aria-hidden="true"` (`module-page.tsx` does this on every icon it renders) so
-they are not announced.
+they are not announced. The hand-rolled primitives carry their own ARIA
+([§7.3](#73-writing-a-new-design-system-primitive)) — if you extend one, extend the
+roles with it.
 
 ---
 
@@ -861,9 +1055,15 @@ And, not command-shaped:
 - [ ] Every bug fix landed with a test that fails when the fix is reverted
       ([§6.6](#66-the-regression-rule)).
 - [ ] Nothing fabricated: no placeholder renders a number it cannot source
-      ([§5.5](#55-no-fabricated-data)).
+      ([§5.6](#56-no-fabricated-data)).
 - [ ] The wire contract still holds — errors raised from the service, not the
       router; schemas own their constraints.
+- [ ] A new endpoint touching a caller-scoped row scopes its lookup by the caller
+      and answers **404**, not 403 ([§3.3](#33-a-permission-guarded-endpoint)).
+- [ ] A new protected route declares a `Permission`, and that permission is
+      actually granted in `ROLE_PERMISSIONS` — an unlisted one denies admins too.
+- [ ] Nothing written to `audit_logs.metadata` is a password, a token, or a hash
+      of either ([§3.8](#38-recording-an-audit-event)).
 - [ ] New lines are below the DEV MARKER side of `backend/requirements.txt`, or
       above it and genuinely needed at runtime. The Dockerfile strips everything
       below the marker.
@@ -879,12 +1079,12 @@ projections.
 
 | Command | Working directory | Result |
 | --- | --- | --- |
-| `pytest -m "not integration"` | `backend/` | **145 passed, 43 deselected** (188 collected) |
-| `ruff check .` | `backend/` | clean, 44 files |
-| `ruff format --check .` | `backend/` | clean, 44 files |
+| `pytest -m "not integration"` | `backend/` | **366 passed, 133 deselected** (499 collected) |
+| `ruff check .` | `backend/` | clean, 62 files |
+| `ruff format --check .` | `backend/` | clean, 62 files |
 | `npm run typecheck` | `frontend/` | clean |
 | `npm run lint` | `frontend/` | clean |
-| `npm test` | `frontend/` | 10 files, **30 tests** passing |
+| `npm test` | `frontend/` | 22 files, **134 tests** passing |
 | `npm run build` | `frontend/` | succeeds |
 | `python scripts/verify_compose.py` | repository root | passes — 14 Compose variables, all documented in `.env.example` |
 
@@ -894,18 +1094,19 @@ Uncompressed `frontend/dist/assets/` chunk sizes from that build:
 | --- | --- |
 | `react` | 222,295 |
 | `radix` | 113,444 |
-| `router` | 91,288 |
-| `index` (entry) | 84,474 |
-| `data` | 35,764 |
-| `icons` | 13,240 |
-| `dashboard-page` | 11,903 |
-| `settings-page` | 4,828 |
-| per-page placeholder chunks | ~0.36 kB each |
+| `router` | 92,153 |
+| `index` (entry) | 91,633 |
+| `settings-page` | 39,952 |
+| `data` | 37,974 |
+| `icons` | 19,199 |
+| `dashboard-page` | 11,760 |
+| per-page placeholder chunks | ~0.40 kB each |
 
-A page that renders nothing but the registry is ~0.36 kB, because the code
-lives in `ModulePage` and the registry. That is the shape of the code-splitting
-strategy working, and a useful signal: if a placeholder chunk grows by kilobytes,
-something page-specific has crept in.
+Two things to read off that table. A page that renders nothing but the registry is
+~0.40 kB, because the code lives in `ModulePage` and the registry — so a placeholder
+chunk growing by kilobytes means something page-specific has crept in. And
+`settings-page` went from 4.8 kB in Phase 1 to 39.9 kB, which is route splitting
+working: the page that grew got its own chunk rather than inflating the entry.
 
 ### What was **not** verified here
 
@@ -914,12 +1115,23 @@ That means:
 
 | Not run | Why it matters |
 | --- | --- |
-| `pytest` in full (the 43 integration tests) | The offline subset is green; the database-backed half has not been executed there. Run it before trusting a change to a model, repository or migration |
+| `pytest` in full (the 133 integration tests) | The offline subset is green; the database-backed half has not been executed there. This matters more in Phase 2 than in Phase 1, because Phase 2 changed the `users` table, added three more, and put a session row behind nearly every auth path — all of it on the side that has never been exercised here. Run the full suite before trusting a change to a model, repository or migration |
 | `docker compose up` | `docker-compose.yml` has never been executed by `docker compose`. `scripts/verify_compose.py` validates it statically — Compose v2 syntax, three services, real build contexts, existing bind mounts, every `${VAR}` documented — and cannot tell you the stack starts. Treat the first run as untested |
-| `alembic check` against a live database | The drift assertion in `test_migrations.py` covers it, but that test is integration-marked and so was not run |
+| `alembic upgrade head` against a live database | `tests/test_migration_ddl.py` renders `0001` and `0002` to SQL offline and compares the emitted DDL against `Base.metadata` — that is real evidence about the DDL, and it is **not** the same as having applied it. A migration can render correctly and still fail on a real server. `alembic check` and `test_autogenerate_reports_no_drift` both need a database and were not run |
 
 Nothing in this document should be read as a claim that those three were
 exercised. They are the parts that still need a machine with a database.
+
+Two further limitations that are properties of the code, not of the environment,
+so that neither is mistaken for a bug to route around:
+
+- **`audit_log_retention_days` has no enforcing job.** The setting states a policy
+  and gives the value somewhere to be displayed; nothing prunes `audit_logs`, so the
+  table grows for as long as the install lives.
+- **`GET /api/v1/users/` is a permission-system fixture, not a product feature.**
+  It exists so the role → permission wiring has a route whose refusal is observable
+  end to end, and it returns an unbounded list because a fixture that could itself
+  need pagination would be a worse fixture. Do not build UI on it.
 
 ---
 

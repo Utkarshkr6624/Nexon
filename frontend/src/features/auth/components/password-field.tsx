@@ -64,13 +64,17 @@ export function PasswordField({
   const hasValue = value.length > 0
   const errorId = `${id}-error`
   const strengthId = `${id}-strength`
+  const rulesId = `${id}-rules`
   const tokens = STRENGTH_TOKENS[strength.level]
   const showMeter = showStrength && hasValue
 
   // The level is named in text beside the bar, so the meter never relies on
   // colour alone; pointing the input's description at that label is what makes
-  // the reading available at the moment of focus rather than on sight.
-  const describedBy = [error ? errorId : null, showMeter ? strengthId : null]
+  // the reading available at the moment of focus rather than on sight. The
+  // checklist is described the same way, so a screen reader is handed the
+  // requirements when it arrives at the field instead of only after the user
+  // goes looking for them.
+  const describedBy = [error ? errorId : null, showMeter ? strengthId : null, showRules ? rulesId : null]
     .filter(Boolean)
     .join(' ')
 
@@ -140,7 +144,9 @@ export function PasswordField({
         </div>
       )}
 
-      {showRules && <PasswordRulesChecklist results={results} className="pt-0.5" />}
+      {showRules && (
+        <PasswordRulesChecklist results={results} id={rulesId} className="pt-1" />
+      )}
 
       {error && (
         <p id={errorId} className="app-form-error">

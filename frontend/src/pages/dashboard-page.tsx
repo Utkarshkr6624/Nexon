@@ -24,6 +24,7 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { useHealth } from '@/features/health/use-health'
+import { MODULES, SETTINGS_MODULE, getModule } from '@/features/modules/catalog'
 import {
   formatLatency,
   formatRelative,
@@ -133,18 +134,25 @@ const ACTIVITY_SAMPLE: ReadonlyArray<{
   },
 ]
 
-const PHASE_PLAN: ReadonlyArray<{ phase: number; modules: string; live?: boolean }> = [
-  { phase: 1, modules: 'Dashboard, Settings', live: true },
-  { phase: 2, modules: 'Projects, Tasks' },
-  { phase: 3, modules: 'Planner' },
-  { phase: 4, modules: 'Knowledge, Search' },
-  { phase: 5, modules: 'Analytics' },
-  { phase: 6, modules: 'Developer' },
-  { phase: 7, modules: 'Learning' },
-  { phase: 8, modules: 'Career' },
-  { phase: 9, modules: 'AI Assistant' },
-  { phase: 10, modules: 'Experiments' },
-]
+/**
+ * The module build sequence, read from the registry rather than restated here:
+ * one row per phase, naming the destinations that ship in it. Deriving it means
+ * a module added to `catalog.ts` cannot quietly go missing from this list.
+ */
+const BUILD_SEQUENCE: ReadonlyArray<{ phase: number; modules: string; live: boolean }> = (() => {
+  const byPhase = new Map<number, string[]>()
+  for (const module of MODULES) {
+    const existing = byPhase.get(module.phase)
+    if (existing) existing.push(module.label)
+    else byPhase.set(module.phase, [module.label])
+  }
+  // Settings shares the Dashboard's phase and is not in `MODULES`, so it is
+  // named alongside it rather than leaving that row one destination short.
+  byPhase.set(1, [getModule('/dashboard').label, SETTINGS_MODULE.label])
+  return [...byPhase.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([phase, labels]) => ({ phase, modules: labels.join(', '), live: phase === 1 }))
+})()
 
 const QUICK_ACTIONS: ReadonlyArray<{ to: string; label: string; icon: LucideIcon }> = [
   { to: '/projects', label: 'Review projects', icon: FolderKanban },
@@ -175,8 +183,9 @@ export default function DashboardPage() {
             {greetingFor(now)}, {selectDisplayName(user)}
           </h1>
           <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
-            Phase 1 delivers the workspace shell and the platform underneath it. Live backend
-            health is on this page; every other module is wired and waiting for its phase.
+            The workspace foundation and the full account system are live: sign-in, sessions,
+            password changes and account deletion. Backend health is on this page; every other
+            module is wired and waiting for the phase it ships in.
           </p>
         </div>
 
@@ -220,7 +229,7 @@ export default function DashboardPage() {
           icon={FolderKanban}
           tone="muted"
           value="—"
-          hint="Projects, tasks and notes start storing records in Phase 2"
+          hint="Projects, tasks and notes start storing records as those modules ship"
         />
         <KpiCard
           label="Decisions to review"
@@ -399,7 +408,7 @@ export default function DashboardPage() {
           </CardHeader>
           <CardContent>
             <ul className="divide-y divide-border">
-              {PHASE_PLAN.map((entry) => (
+              {BUILD_SEQUENCE.map((entry) => (
                 <li key={entry.phase} className="flex items-center gap-3 py-2 first:pt-0 last:pb-0">
                   <span
                     className={cn(

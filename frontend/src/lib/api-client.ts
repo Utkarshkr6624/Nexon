@@ -21,12 +21,49 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 export type TokenGetter = () => string | null | undefined | Promise<string | null | undefined>
 
 /**
- * Recovery hook invoked once per 401 on a request the client authenticated. It
- * returns a fresh bearer token to replay the failed request with, or null when
- * the session cannot be renewed — the client then surfaces the original 401
- * rather than retrying, and the hook is responsible for ending the session.
+ * What the recovery hook made of a 401.
+ *
+ * The client replays the failed request only for `renewed`. The other three all
+ * mean "do not replay", but they are not the same answer and collapsing them
+ * costs the caller the truth:
+ *
+ * - `rejected` — the backend refused the refresh token. The session is over and
+ *   the original 401 is a fair report of that.
+ * - `unreachable` — the renewal never reached the backend, so the 401 that
+ *   triggered it is not evidence about the session. Throwing the transport
+ *   error instead lets the caller retry on the failure it is actually looking
+ *   at, rather than settle into a permanent 401 state it cannot retry out of.
+ * - `superseded` — the store moved on while the renewal was in flight (a
+ *   sign-out, or a newer sign-in). Its session must not be touched, and this
+ *   request must not be replayed under whatever token lives in the store now.
  */
-export type UnauthorizedHandler = () => Promise<string | null | undefined>
+export type TokenRecovery =
+  | { kind: 'renewed'; token: string }
+  | { kind: 'rejected' }
+  | { kind: 'unreachable'; error: ApiError }
+  | { kind: 'superseded' }
+
+/**
+ * Recovery hook invoked once per 401 on a request the client authenticated. It
+ * reports what it did with the session, as a `TokenRecovery`.
+ */
+export type UnauthorizedHandler = () => Promise<TokenRecovery>
+
+/**
+ * Called when the session has stopped answering to its own renewal. Fires once
+ * per streak, not once per request: without it, a client whose 401 recovery can
+ * never satisfy a given endpoint rotates a single-use refresh token on every
+ * call and signs the user in forever.
+ */
+export type SessionRejectedHandler = () => void
+
+/**
+ * Requests in a row that came back 401 *after* a successful renewal. Two is
+ * enough: one is the ordinary case of a token spent mid-flight, two means the
+ * endpoint is refusing every bearer the store mints, and continuing past that
+ * only burns refresh tokens.
+ */
+const MAX_CONSECUTIVE_RENEWAL_FAILURES = 2
 
 export type QueryValue = string | number | boolean | null | undefined
 export type QueryParams = Record<string, QueryValue>
@@ -218,15 +255,21 @@ export class ApiClient {
   private timeoutMs: number
   private getToken: TokenGetter | null
   private unauthorizedHandler: UnauthorizedHandler | null
+  private sessionRejectedHandler: SessionRejectedHandler | null
   private fetchImpl: typeof fetch
   /** Shared 401 recovery, so a burst of parallel 401s renews the session once. */
-  private recovery: Promise<string | null> | null = null
+  private recovery: Promise<TokenRecovery> | null = null
+  /** Running count of requests that stayed 401 after a successful renewal. */
+  private consecutiveRenewalFailures = 0
+  /** Latches so the streak reports the session once, however long it runs. */
+  private sessionRejectionReported = false
 
   constructor(options: ApiClientOptions = {}) {
     this.baseUrl = options.baseUrl ?? resolveBaseUrl()
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.getToken = options.getToken ?? null
     this.unauthorizedHandler = null
+    this.sessionRejectedHandler = null
     this.fetchImpl = options.fetchImpl ?? ((...args) => globalThis.fetch(...args))
   }
 
@@ -246,6 +289,11 @@ export class ApiClient {
   /** Installs (or clears) the hook that recovers an expired session on a 401. */
   setUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
     this.unauthorizedHandler = handler
+  }
+
+  /** Installs (or clears) the hook that ends a session renewal cannot save. */
+  setSessionRejectedHandler(handler: SessionRejectedHandler | null): void {
+    this.sessionRejectedHandler = handler
   }
 
   getBaseUrl(): string {
@@ -321,20 +369,20 @@ export class ApiClient {
   }
 
   /**
-   * Runs the recovery hook, collapsing concurrent 401s onto a single renewal.
-   * A hook that throws is treated as "not recoverable": the original 401 is
+   * Runs the recovery hook, collapsing concurrent 401s onto a single renewal. A
+   * hook that throws is treated as "not recoverable": the original 401 is
    * surfaced to the caller instead of being retried.
    */
-  private async recoverToken(): Promise<string | null> {
+  private async recoverToken(): Promise<TokenRecovery> {
     const handler = this.unauthorizedHandler
-    if (!handler) return null
+    if (!handler) return { kind: 'rejected' }
     if (this.recovery) return this.recovery
 
     const recovery = (async () => {
       try {
-        return (await handler()) ?? null
+        return await handler()
       } catch {
-        return null
+        return { kind: 'rejected' } as const
       }
     })().finally(() => {
       this.recovery = null
@@ -384,14 +432,50 @@ export class ApiClient {
       this.send({ path, query, method, headers, payload, signal, timeoutMs })
 
     let response = await send()
+    let rejectedAfterRenewal = false
 
     if (response.status === 401 && authenticated) {
-      const renewedToken = await this.recoverToken()
-      if (renewedToken) {
+      const recovery = await this.recoverToken()
+      if (recovery.kind === 'unreachable') {
+        // The renewal never reached the backend, so this 401 is not evidence
+        // that the session is spent. Reporting it would tell the caller the
+        // backend rejected the session when in fact it never answered, and
+        // React Query does not retry a 4xx — the query would sit in a wrong
+        // error state for the rest of the cache's life.
+        throw recovery.error
+      }
+      if (recovery.kind === 'renewed') {
         // Replay at most once: a second 401 is a real rejection, not an
         // expiry, and the caller sees it as such.
-        headers.set('Authorization', `Bearer ${renewedToken}`)
+        headers.set('Authorization', `Bearer ${recovery.token}`)
         response = await send()
+        rejectedAfterRenewal = response.status === 401
+      }
+    }
+
+    // Only a request the client authenticated belongs to the streak. The
+    // recovery call travels through this same client unauthenticated — login,
+    // refresh and logout all pass `auth: false` — so counting it would reset
+    // the counter it exists to advance, and the streak could never reach two.
+    if (authenticated) {
+      // A request that was not refused after a renewal breaks the streak, so
+      // the count measures consecutive failures rather than total requests.
+      if (!rejectedAfterRenewal) {
+        this.consecutiveRenewalFailures = 0
+        this.sessionRejectionReported = false
+      } else {
+        this.consecutiveRenewalFailures += 1
+        if (
+          this.consecutiveRenewalFailures >= MAX_CONSECUTIVE_RENEWAL_FAILURES &&
+          !this.sessionRejectionReported
+        ) {
+          // Renewal succeeds and the endpoint still says 401, repeatedly: the
+          // session cannot be saved by rotating again. Report it once, so the
+          // loop stops instead of spending a single-use refresh token per
+          // request for as long as the panel is open.
+          this.sessionRejectionReported = true
+          this.sessionRejectedHandler?.()
+        }
       }
     }
 

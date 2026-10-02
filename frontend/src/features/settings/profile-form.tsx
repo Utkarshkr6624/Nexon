@@ -187,7 +187,7 @@ export function ProfileForm() {
 
         <Separator className="my-6" />
 
-        <form onSubmit={onSubmit} className="app-form-stack max-w-xl" noValidate>
+        <form onSubmit={onSubmit} className="app-form-stack" noValidate>
           {failure && <ErrorState error={failure} compact />}
 
           <div className="app-form-field">

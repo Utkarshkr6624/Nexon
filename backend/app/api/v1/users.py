@@ -11,9 +11,9 @@ merely declared. See its docstring.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 
-from app.api.deps import AuthenticatedUser, UserServiceDep
+from app.api.deps import AuthenticatedUser, UserServiceDep, get_client_context
 from app.core.deps import get_current_active_superuser, require_permission
 from app.core.permissions import Permission
 from app.models.user import User
@@ -32,6 +32,7 @@ async def update_me(
     payload: UserUpdate,
     current_user: AuthenticatedUser,
     users: UserServiceDep,
+    request: Request,
 ) -> User:
     """Update the caller's own profile.
 
@@ -49,9 +50,12 @@ async def update_me(
     (verification, session revocation, audit rows) that a profile edit has no
     business performing.
 
-    Errors: 409 when the requested username is taken.
+    Errors: 409 when the requested username is held by another account. A
+    username the caller already holds is not a conflict — the profile form
+    resubmits it on every save.
     """
-    return await users.update(current_user, payload)
+    ip, agent = get_client_context(request)
+    return await users.update(current_user, payload, ip_address=ip, user_agent=agent)
 
 
 @router.delete(
@@ -59,11 +63,18 @@ async def update_me(
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
     summary="Delete the caller's account",
+    # No ``require_permission`` dependency, unlike the PATCH above. That is not
+    # a deliberate asymmetry to read meaning into: both roles currently hold
+    # USERS_WRITE, so the gate here would be a no-op that happens to pass. The
+    # password re-check in the payload is what actually authorises this one, and
+    # it is stronger than a role check. Add the dependency if USERS_WRITE ever
+    # stops being universal.
 )
 async def delete_me(
     payload: UserDeletion,
     current_user: AuthenticatedUser,
     users: UserServiceDep,
+    request: Request,
 ) -> Response:
     """Delete the caller's account permanently.
 
@@ -82,7 +93,13 @@ async def delete_me(
 
     Errors: 401 when the password does not verify.
     """
-    await users.delete_account(user=current_user, password=payload.password)
+    ip, agent = get_client_context(request)
+    await users.delete_account(
+        user=current_user,
+        password=payload.password,
+        ip_address=ip,
+        user_agent=agent,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -116,4 +133,5 @@ async def list_users(users: UserServiceDep) -> list[User]:
     return await users.list_all()
 
 
+#: The router only; the handlers are reached through it, not imported directly.
 __all__ = ["router"]

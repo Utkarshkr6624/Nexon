@@ -7,10 +7,18 @@ import type { RuleResult } from '../password-rules'
 export interface PasswordRulesChecklistProps {
   results: RuleResult[]
   className?: string
+  /** Referenced by the field's `aria-describedby` so the requirements are read at focus. */
+  id?: string
 }
 
 /**
  * The live policy checklist under a password field.
+ *
+ * Each row states the requirement itself — "At least 8 characters", not
+ * "Minimum length" — because a list that names its rows makes the reader
+ * translate every one of them. The rows stay one line each and the line height
+ * is tightened below the body default: a checklist that has to be scrolled past
+ * stops being a reference and becomes an obstacle to the field above it.
  *
  * The icon *changes shape* between a check and a hollow circle, and not only
  * its colour: colour alone is invisible to anyone with a colour vision
@@ -22,14 +30,15 @@ export interface PasswordRulesChecklistProps {
 export function PasswordRulesChecklist({
   results,
   className,
+  id,
 }: PasswordRulesChecklistProps): JSX.Element {
   return (
-    <ul className={cn('flex flex-col gap-0.5', className)}>
+    <ul id={id} className={cn('flex flex-col', className)}>
       {results.map((result) => (
         <li
           key={result.id}
           className={cn(
-            'flex items-center gap-2 text-xs leading-5 transition-colors duration-150 ease-out',
+            'flex items-center gap-2 text-xs leading-[18px] transition-colors duration-150 ease-out',
             result.satisfied ? 'text-success' : 'text-muted-foreground',
           )}
         >
@@ -39,7 +48,7 @@ export function PasswordRulesChecklist({
             <Circle className="size-3.5 shrink-0 opacity-60" strokeWidth={1.75} aria-hidden="true" />
           )}
           <span>
-            {result.label}
+            {result.hint}
             <span className="sr-only">{result.satisfied ? ' — met' : ' — not met yet'}</span>
           </span>
         </li>

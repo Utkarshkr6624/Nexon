@@ -1,18 +1,21 @@
 # NEXUS — Architecture
 
-Reference for the Phase 1 technical foundation. This document explains *how the
-system is put together and why*, and defers to [`../README.md`](../README.md)
-for installation, day-to-day commands and troubleshooting. Everything below was
-read from the code; where a number appears it came from the repository, not from
-intention. Where something could **not** be exercised here — which currently means
-anything needing a live PostgreSQL or a running container — that is said
-explicitly rather than glossed: see [What has not been run](#what-has-not-been-run).
+Reference for the Phase 2 platform: the Phase 1 technical foundation plus identity,
+sessions and security. This document explains *how the system is put together and why*,
+and defers to [`../README.md`](../README.md) for installation, day-to-day commands and
+troubleshooting. Everything below was read from the code; where a number appears it came
+from the repository, not from intention. Where something could **not** be exercised here —
+which currently means anything needing a live PostgreSQL or a running container — that is
+said explicitly rather than glossed: see [What has not been run](#what-has-not-been-run).
 
-**Scope.** Phase 1 delivers the platform skeleton and one working vertical slice
-(auth + `users` table). Projects, Tasks, Planner, Knowledge, Search, Analytics,
-Developer, Learning, Career, AI Assistant and Experiments are placeholder pages.
-They are described here only as *seams* — see
-[Extension roadmap](#extension-roadmap).
+**Scope.** Phase 1 delivered the platform skeleton and one working vertical slice
+(auth + `users` table). Phase 2 grew that slice into a real account system: persistent
+device sessions, a password policy, password recovery, role-based permissions, an audit
+trail, and the settings surface to drive them. Projects, Tasks, Planner, Knowledge, Search,
+Analytics, Developer, Learning, Career, AI Assistant and Experiments remain placeholder
+pages, and there is still **no module API at all** — every operation the backend serves
+belongs to auth, users or health. The modules are described here only as *seams* — see
+[Extension roadmap](#15-extension-roadmap).
 
 ---
 
@@ -25,7 +28,7 @@ They are described here only as *seams* — see
 | [3. Request lifecycle](#3-request-lifecycle) | What happens to a request, in order |
 | [4. Error contract](#4-error-contract) | The one envelope and the code table |
 | [5. Health and readiness](#5-health-and-readiness) | Liveness vs. the database probe |
-| [6. Authentication and authorisation](#6-authentication-and-authorisation) | Tokens, rotation, revocation, dependency ladder |
+| [6. Authentication and authorisation](#6-authentication-and-authorisation) | Tokens, sessions, rotation, revocation, RBAC, the password policy, password reset, the audit trail |
 | [7. Persistence](#7-persistence) | Engine, pool, models, migrations, test database |
 | [8. Configuration model](#8-configuration-model) | One `Settings` object, derived URLs, production guards |
 | [9. Observability](#9-observability) | Logging sinks, redaction, correlation |
@@ -108,24 +111,35 @@ what makes "one translation point" true rather than aspirational:
 
 | Path | Pre-check | Race guard |
 | --- | --- | --- |
-| `AuthService.register` | `exists_by_email` → `ConflictError` | `IntegrityError` → the same `ConflictError`, chained |
-| `UserService.update` (email) | `get_by_email`, ignoring the caller's own row → `ConflictError` | `IntegrityError` on commit → the same `ConflictError`, chained |
+| `AuthService.register` | `exists_by_email` / `exists_by_username` → `ConflictError` | `IntegrityError` → the same `ConflictError`, chained, with the *specific* message chosen from the constraint name |
+| `UserService.update` (username) | `get_by_username` → `ConflictError` | `IntegrityError` on commit → the same `ConflictError`, chained |
 
 Without the second column, a concurrent writer would win the race and the loser
-would surface a driver error as a 500. `UserService.update` normalises the e-mail
+would surface a driver error as a 500. `UserService.update` normalises the handle
 itself before the lookup, so the value the uniqueness check compares against is
-the value the column will hold, whichever caller is writing.
+the value the column will hold, whichever caller is writing. Username uniqueness
+was added in Phase 2 alongside the column; `UserService.update` now has a router
+(`app/api/v1/users.py`) and tests.
 
-`UserService` is wired into `app/api/deps.py` (`get_user_service`) but has **no
-router yet** — there is no `users` endpoint, and `UserService.update` has no test.
-It is a seam, and is listed as one under [Extension roadmap](#15-extension-roadmap).
+Phase 2 did not relax the rule, it repeated it: a new repository
+(`SessionRepository`, `PasswordResetRepository`, `AuditRepository`) returns `None`
+for a miss and lets driver errors propagate, and the service in front of it —
+`SessionService`, `AuthService`, `UserService` — is what raises `NotFoundError`,
+`UnauthorizedError`, `ConflictError` or `ForbiddenError`.
 
 Two dependency providers split the HTTP wiring:
 
 | Module | Responsibility |
 | --- | --- |
-| `app/core/deps.py` | Identity only: bearer scheme, current user, optional user, superuser, session→repository. Talks to the repository directly and imports no service, which keeps the graph acyclic. |
-| `app/api/deps.py` | Layering on top: session → repository → service, plus the revocation check that turns a cryptographically valid JWT into a rejected one. Re-exports the `core` names so routers have one import site. |
+| `app/core/deps.py` | Identity and authorisation: bearer scheme, current user, optional user, superuser, the `sid` claim, `require_permission()`, session → repository. Talks to the repository directly and imports no service, which keeps the graph acyclic. |
+| `app/api/deps.py` | Layering on top: session → repository → service, the revocation check that turns a cryptographically valid JWT into a rejected one, and `get_client_context()` (client address + user agent, gathered once and handed to the services). Re-exports the `core` names so routers have one import site. |
+
+`app/core/permissions.py` also lives in the infrastructure layer, and the reason
+it can: it deliberately duplicates the two role strings from
+`app.models.user.UserRole` as plain constants, because `app.core` must stay
+importable without pulling in the ORM (Alembic's `env` imports it). The two
+definitions must change in the same commit — see
+[Role-based access control](#role-based-access-control).
 
 Schemas (`app/schemas/`) sit on the HTTP boundary and are the only place Pydantic
 validation runs. `hashed_password` is absent from every model that can leave the
@@ -144,7 +158,7 @@ outermost first.
 | 2 | `BodyCaptureMiddleware` | `app.add_middleware` — only when `LOG_REQUEST_BODY=true` | Buffers the ASGI body messages, publishes a capped copy on `scope["state"]`, replays them verbatim. |
 | 3 | `CORSMiddleware` | `app.add_middleware`, first | Preflight and header work. `X-Request-ID` is in `expose_headers`; credentials are allowed. |
 | 4 | `ServerErrorMiddleware` | Starlette, in `build_middleware_stack` | Catches anything escaping layer 5 and renders it through the catch-all handler. |
-| 5 | `ExceptionMiddleware` → router → dependencies | Starlette, in `build_middleware_stack` | Registered handlers, routing, `app/api/v1/router.py` (`health` + `auth`), mounted at `settings.api_v1_prefix`. |
+| 5 | `ExceptionMiddleware` → router → dependencies | Starlette, in `build_middleware_stack` | Registered handlers, routing, `app/api/v1/router.py` (`health` + `auth` + `users`), mounted at `settings.api_v1_prefix`. |
 
 `add_middleware` inserts outermost-last, which is why body capture ends up
 *outside* CORS: `create_app` adds CORS first and then, from inside
@@ -308,8 +322,10 @@ the reason above — `docker-compose.yml`'s `backend` healthcheck and the
 `HEALTHCHECK` line in `backend/Dockerfile` both curl `127.0.0.1:$NEXUS_PORT/health`.
 
 The Dashboard health card on the frontend polls `/api/v1/health` every 30 s with
-a 5 s `staleTime` (`frontend/src/features/health/use-health.ts`). It is the only
-live data dependency in the shell.
+a 5 s `staleTime` (`frontend/src/features/health/use-health.ts`). In Phase 1 it
+was the only live data dependency in the shell; Phase 2 added the settings
+Sessions tab, which queries `/auth/sessions` on mount and after every mutation,
+and the account forms, which are mutation-only.
 
 ---
 
@@ -326,7 +342,8 @@ HS256 JWTs signed with `SECRET_KEY`. Lifetimes come from
 | `sub` | `app/core/security.py` | user id (UUID, string-encoded) |
 | `type` | `app/core/security.py` | `access` or `refresh` — the claim that stops a refresh token being replayed as a bearer credential |
 | `iat`, `nbf`, `exp` | `app/core/security.py` | standard time claims |
-| `jti` | `app/services/auth_service.py` | token id; the key of the revocation denylist |
+| `jti` | `app/services/auth_service.py`, `app/services/session_service.py` | token id; the key of the access-token revocation denylist |
+| `sid` | `app/services/session_service.py` | **New in Phase 2.** The `sessions` row this token belongs to |
 
 `decode_token()` requires `exp`, `sub` and `type` to be present, restricts the
 accepted algorithm to `settings.jwt_algorithm`, and converts *every* failure —
@@ -338,15 +355,49 @@ Passwords use bcrypt at cost 12, chosen above the library default because ~250 m
 per hash on commodity hardware is the intended trade against brute force. Input is
 truncated to bcrypt's 72-byte ceiling rather than allowed to raise.
 
+`sid` is what makes a token attributable to a device. It is an *enrichment*, never
+a gate: `get_current_session_id()` returns `None` for anything it cannot parse
+rather than raising, because every endpoint that needs one already resolved the
+user first, and a cosmetic lookup should never produce a second, differently-worded
+401 on top of the first.
+
+### The user model
+
+Phase 2 grew the `users` table and changed what leaves the process.
+
+| Column | Status | Note |
+| --- | --- | --- |
+| `email` | unchanged | Unique; lower-cased by a `mode="before"` validator before storage and before every uniqueness check |
+| `username` | **new** | 3–32 chars, must start alphanumeric, then `A-Za-z0-9_-`. Unique, and **case-preserving** — trimmed, never folded, so the handle a user is shown is the handle they can type |
+| `display_name` | **renamed** from `full_name` | The product surface calls it a display name everywhere; keeping a differently-named column would force a translation at every call site |
+| `avatar_url` | **new** | Optional, absolute `http`/`https` only |
+| `role` | **new** | `user` / `admin` as a plain string with an application-side `UserRole`, *not* a Postgres enum: adding an enum value needs `ALTER TYPE … ADD VALUE`, which cannot run inside a transaction block on some deployment paths and is exactly the kind of migration that fails halfway through a deploy. The cost is that the database no longer rejects a misspelled role on its own |
+| `password_changed_at` | **new** | Nullable and deliberately **not** defaulted to the creation time — rows predating the column have nothing truthful to backfill, and a fabricated "password set at" would log every pre-existing session out on first sign-in. `NULL` reads as "never changed since signup" |
+| `last_login_at` | existed | Stamped on a successful login |
+| `is_superuser` | **superseded** | The column remains and is still honoured, because Phase 1 rows can only be promoted by setting it and dropping the check would silently un-promote every pre-Phase-2 administrator. It is gone from `UserRead` — publishing both it and `role` invites a client to branch on the one that is no longer consulted |
+
+`UserRead` also carries `permissions`, a `list[str]` **derived from `role` at
+serialisation time** and sorted, so two responses diff cleanly. It is never stored.
+The point is that a client branches on "may I open this screen?" and never
+re-implements the role → permission map.
+
 ### Flows
 
 | Flow | Endpoint | Rules |
 | --- | --- | --- |
-| Register | `POST /api/v1/auth/register` | Duplicate e-mail → `409`, checked twice: a pre-check for the common case and an `IntegrityError` catch for the concurrent-registration race. |
-| Login | `POST /api/v1/auth/login` | Every failed check returns the same message *and takes comparable time*, so probing cannot distinguish "unknown email" from "wrong password" — see below. On success `last_login_at` is stamped. Inactive accounts are rejected separately. |
-| Refresh | `POST /api/v1/auth/refresh` | Single-use rotation: the presented token is revoked before the new pair is issued, so a replay fails with 401. |
-| Logout | `POST /api/v1/auth/logout` | Optional body and/or bearer token; revokes whatever is parseable and returns 204. Unparseable tokens are ignored — logout must never fail. |
+| Register | `POST /api/v1/auth/register` | Duplicate e-mail **or username** → `409`, checked twice: a pre-check for the common case and an `IntegrityError` catch for the concurrent-registration race, with the constraint name selecting which message comes back. The new account gets `role = "user"`. |
+| Login | `POST /api/v1/auth/login` | Every failed check returns the same message *and takes comparable time*, so probing cannot distinguish "unknown email" from "wrong password" — see below. On success `last_login_at` is stamped and a device session is opened. Inactive accounts are rejected separately. |
+| Refresh | `POST /api/v1/auth/refresh` | Single-use rotation: the presented token's digest is replaced on the session row before the new pair is issued, so a replay finds no match and fails with 401. The row is *kept*, so the device stays the same device. |
+| Logout | `POST /api/v1/auth/logout` | Optional body and/or bearer token; revokes whatever is parseable and returns 204. Unusable tokens are ignored — logout must never fail. |
+| Log out everywhere | `POST /api/v1/auth/logout-all` | Revokes every session except the caller's own, identified by `sid`. Without that exemption the endpoint would end the session it was called from. |
 | Me | `GET /api/v1/auth/me` | Resolves the caller through `AuthenticatedUser`, which is the only place the revocation denylist is consulted. |
+| Sessions | `GET /api/v1/auth/sessions` | The caller's live devices, with `is_current` computed by comparing each row's id against the `sid` claim. `token_hash` and `user_id` are absent from `SessionRead`. |
+| Revoke one | `DELETE /api/v1/auth/sessions/{id}` | Scoped to the caller's own rows; **404, never 403**, for anyone else's. See below. |
+| Change password | `PATCH /api/v1/auth/password` | Requires the current password, ends every session except the caller's, and stamps `password_changed_at`. A new password equal to the current one is a `409`. |
+| Request reset | `POST /api/v1/auth/password/forgot` | Identical body for a known and an unknown address. |
+| Redeem reset | `POST /api/v1/auth/password/reset` | Ends **every** session, including ones that predate the request. |
+| Update profile | `PATCH /api/v1/users/me` | `display_name`, `avatar_url`, `username`. `email` and `password` are deliberately *not* editable here — both are identity/credential transitions with rules a routine profile edit has no business performing. |
+| Delete account | `DELETE /api/v1/users/me` | Requires the account password **and** `confirm: true`. Sessions and reset tokens go by cascade; audit rows do not. |
 
 `AuthenticatedUser` layers on top of `CurrentUser`: a JWT remains cryptographically
 valid after logout, and `get_authenticated_user` is what makes the denylist
@@ -377,6 +428,243 @@ if user is None or not password_ok:
 Both failures then cost one bcrypt verify plus one index lookup, and say the same
 thing.
 
+The password-reset endpoint takes the other approach, because it cannot afford the
+cost: `request_password_reset` writes a row only when the address is registered,
+but the *response* is byte-for-byte identical either way, so the only observable
+difference is `dev_token` — which is `null` in production, precisely because it
+would otherwise disclose the same fact.
+
+### Sessions
+
+Phase 1 had exactly one durable thing to say about a credential: the in-process
+denylist. Phase 2 added a `sessions` table and made a session a first-class row.
+
+```text
+POST /auth/login ─► SessionService.issue()
+                      1. insert the row (id minted by the repository)
+                      2. mint the refresh token carrying sid = row.id
+                      3. rotate_token() → store hash_token(refresh)
+                      4. touch() → last_used_at = now
+                      5. mint the access token carrying the same sid
+                      6. _enforce_session_cap()
+```
+
+One row is one browser. Rotation **replaces** `token_hash` on the row rather than
+inserting a second one, which is what makes "sign out everywhere" a single
+`UPDATE … WHERE user_id = ?` instead of a search through a token table, and what
+lets the sessions screen show a revoked device as "signed out on …" rather than as
+gone.
+
+| Column | Holds | Why it exists |
+| --- | --- | --- |
+| `token_hash` | SHA-256 hex of the **current** refresh token | The raw token is never persisted and never logged, so a database dump yields digests that cannot be replayed |
+| `user_agent` | Raw header, verbatim | The device label the sessions UI shows; truncated to 512 at the storage boundary |
+| `ip_address` | Client address, as text not `inet` | An audit aid for "where did this sign-in come from", **not** an authorisation control — a spoofed value costs nothing |
+| `expires_at` | Absolute, from `SESSION_ABSOLUTE_LIFETIME_DAYS` | Compared against `func.now()` server-side, so a stale clock cannot revive a row. Independent of rotation: a rotating token would otherwise let a session that is never signed out of live forever, outliving any actual sign-in event |
+| `last_used_at` | Stamped on each rotation | Drives "last active" in the sessions UI; nullable because a session that has never been refreshed has no such moment |
+| `revoked_at` | `NULL` means live | The single column the repository filters and updates to revoke |
+
+No `User.sessions` relationship is declared. A plain relationship defaults to lazy
+`select` loading, which under AsyncIO raises `MissingGreenlet` the moment a caller
+touches it outside an awaited query; the repositories query these rows explicitly.
+
+**The session cap.** `MAX_ACTIVE_SESSIONS` (20) does not refuse a sign-in. It
+evicts the *oldest* live rows until the account is back under the cap, excluding the
+session just created. A refresh token is a long-lived bearer credential, and nothing
+stops an attacker who has stolen one from replaying it to sign in again and again;
+each replay leaves another live session behind, so without a bound the account
+accumulates sessions at the attacker's convenience and the legitimate owner gets no
+signal, because every one of them looks like an ordinary device. Evicting the oldest
+means attacker and owner are treated identically. The exclusion is not cosmetic:
+`created_at` is a server default with one-second resolution, so two sign-ins in the
+same second can tie, and a tie must never let a brand-new session evict itself.
+
+**Every rotation rejection answers identically.** `SessionService.rotate` collapses
+"this session was signed out", "this token was already rotated away", "this session
+belongs to someone else" and "this session has expired" into one
+`UnauthorizedError("This session is no longer valid.")`. A caller that can tell those
+apart has learned something an attacker wants.
+
+### Role-based access control
+
+`app/core/permissions.py` is the whole authorisation system: a `Permission` StrEnum,
+a `ROLE_PERMISSIONS` map, and a `require_permission()` factory.
+
+```python
+USERS_READ, USERS_WRITE,
+PROJECTS_READ, PROJECTS_WRITE,
+TASKS_READ, TASKS_WRITE,
+ANALYTICS_READ
+```
+
+A route names the **capability** it guards, never a role:
+
+```python
+@router.patch(
+    "/me",
+    response_model=UserRead,
+    dependencies=[Depends(require_permission(Permission.USERS_WRITE))],
+)
+```
+
+Four decisions in that module are load-bearing:
+
+- **A map, not a `roles`/`permissions` join table.** The role set is tiny and fixed
+  (`user`, `admin`) and is chosen in the file, not by an operator at runtime. A table
+  would buy mutability nobody has a use for and cost a query on every protected
+  request, plus a class of bug where the database says one thing and the code assumes
+  another. When the role set stops being fixed, the map is the only thing that has to
+  change: the call sites already ask for a `Permission`, never for a role.
+- **It fails closed.** `permissions_for()` returns an empty set for an unrecognised
+  role instead of raising. A role value that has drifted out of step with the module is
+  a *data* problem, and raising on every protected endpoint would turn it into a 500
+  for every user. Denying is the correct degraded behaviour: the request is refused,
+  the incident is visible, and nobody's working session breaks.
+- **It runs after authentication, not instead of it.** An anonymous request must not
+  be able to tell "you are not signed in" from "you may not do that".
+- **`role` values are duplicated from the ORM as plain strings.** `app.core` must stay
+  importable without pulling in the declarative base, or Alembic's `env` — and every
+  other consumer of the module — would pay for a full model import. The duplication is
+  the price of the layering and is stated in both files.
+
+`PATCH /users/me` carries `USERS_WRITE` even though ownership is implicit, because
+the route has no path parameter and the token alone answers *whose*. The permission
+answers *whether the capability exists at all* — removing the dependency would not make
+the route safer, only unguarded, and would leave a future route added next to it with
+no obvious place to hang the check.
+
+### Ownership answers 404, not 403
+
+`SessionService.revoke` fetches with `get_by_id_for_user(session_id, user_id)` —
+scoped in the query — and raises `NotFoundError` on a miss.
+
+Fetching by id alone and checking ownership afterwards would be an IDOR: any
+authenticated user who guessed a session id could revoke another user's session. And
+because "exists but not yours" and "does not exist" would then produce *different*
+answers, the endpoint would also be a probe for which session ids are real. Scoping
+the query makes another user's session indistinguishable from one that never
+existed. This is the rule for every caller-scoped row from here on; `forbidden` stays
+reserved for a capability the role map does not grant.
+
+### Password policy
+
+One validator, attached to the `Password` type itself:
+
+```python
+Password = Annotated[str, Field(max_length=128, ...), AfterValidator(validate_password_strength)]
+```
+
+Attaching it to the type rather than per field is what makes it impossible for a
+schema to forget: registration, password change and password reset all accept the same
+`Password`, so all three reject the same values. `password_min_length()` is resolved
+on *every call* from settings rather than captured at import, so the value stays a
+deployment setting and a test can exercise a stricter policy.
+
+The minimum length is deliberately **not** in the `Field`: it is a setting, not a
+constant, and duplicating it there would let the advertised schema and the enforced
+rule disagree.
+
+A "special" character is anything that is neither a letter nor a digit, so **a space
+counts**. Enumerating a fixed punctuation set would be the textbook rule and the
+wrong one: it rejects good passphrases and good non-ASCII symbols while adding nothing
+an attacker does not already consider. The property worth enforcing is "this is not one
+word from a dictionary", and a separator satisfies that as well as `!` does.
+
+`PASSWORD_RULES` and `password_rule_status()` expose the rule ids, labels and
+per-rule satisfaction to the client, which renders them as a live checklist. The
+backend and the frontend therefore agree on *which* rules there are and in what
+order, instead of each keeping its own list. The client copy is a UX affordance and
+never an authority — a value that passes every browser check can still be rejected
+server-side.
+
+**One known one-way divergence.** The browser's digit rule is the Unicode property
+escape `\p{Nd}` (decimal digits); Python's `str.isdigit()` also accepts other numeric
+categories, `²` for instance. The client is therefore slightly **stricter** than the
+server for exotic characters. The reverse never happens, so this can only cost a user
+one confusing round trip, never a rejected password they were told was fine.
+
+### Token digests: why SHA-256 and not bcrypt
+
+Refresh and password-reset tokens are stored as SHA-256 digests and compared with
+`hmac.compare_digest`, while passwords use bcrypt at cost 12. The reason is the
+**input**, not the algorithm:
+
+| | Password | Refresh / reset token |
+| --- | --- | --- |
+| Entropy | Low, human-chosen, guessable | 256 bits of cryptographic randomness |
+| Attack on a leaked hash | Dictionary / brute force | Preimage of a 256-bit value |
+| What bcrypt's work factor buys | Everything | Nothing — there is no dictionary to slow down |
+| What it costs | ~250 ms, acceptable once per sign-in | ~250 ms on **every request that touches a session row**, including every refresh |
+
+The raw token is never persisted and never logged. `token_fingerprint_matches()`
+compares with `hmac.compare_digest` rather than `==` because an ordinary string
+comparison short-circuits on the first differing byte, and the length and timing of
+that difference is a weak but free-to-remove oracle for a stored digest.
+
+### Password reset
+
+Implemented for real, because NEXUS is local-first and ships no mail service — a
+local install that cannot recover its own account is broken, not strict.
+
+```text
+POST /auth/password/forgot      → 202 {"accepted": true, "dev_token": "…"|null}
+POST /auth/password/reset       → 204, every session revoked
+```
+
+| Property | Rule |
+| --- | --- |
+| Response shape | Identical for a known and an unknown address. There is no 404 |
+| `dev_token` | The raw token, **non-production only**, so the OpenAPI shape does not change between environments. It is a bearer credential for a full account takeover; `AuthService.request_password_reset` returns `None` whenever `settings.is_production` |
+| Storage | `password_reset_tokens.token_hash` is the SHA-256 digest. Rows are never deleted on use or on expiry — the `users` foreign key cascade stays the only way a row disappears, and an attempt to reuse a spent token stays distinguishable from one that never existed |
+| Redemption | Unknown, spent, expired and wrong-type tokens all answer with the identical 401 |
+| Sessions | **Every** session is ended, including ones that existed when the reset was requested. This is the recovery path for a compromised account; leaving one behind would leave the compromise in place behind a new password |
+| Why no email enumeration defence by throttling | `rate_limited` is still a reserved code with no limiter; the equal-body guarantee is doing the work instead |
+
+### The audit trail
+
+`audit_logs` records twelve security-relevant events, written by the **services**, not
+the routers — so the same event is recorded whether it was triggered by an HTTP
+endpoint or by a background job later.
+
+```text
+user_registered            user_login           user_login_failed
+user_logout                password_changed     password_reset_requested
+password_reset_completed   session_created      session_revoked
+sessions_revoked_all       account_updated      account_deleted
+```
+
+Four properties of the table are deliberate and worth stating:
+
+- **`record()` is best-effort and never raises.** Audit writing is observability, not
+  business logic, and it must not be able to deny service. If the audit table is
+  unavailable, a service that propagated the error would refuse to let *anyone* sign in
+  — an attacker who can fill the table would take authentication down for every user.
+  A failed write is logged at WARNING with `exc_info` and returns `None`. The cost is
+  that a broken trail is silent at the request level, which is exactly why the failure
+  is logged rather than swallowed. The one thing a caller must not do is *retry*: a
+  write that failed partway is not safe to assume did not happen.
+- **`user_id` is `ON DELETE SET NULL`.** A failed sign-in against an address with no
+  account is exactly the event worth recording and has no user row to point at, so the
+  column is nullable; and deleting an account must not take its own security history
+  with it. `UserService.delete_account` records `account_deleted` *before* the row goes,
+  so the surviving record still names who it was. `sessions` and
+  `password_reset_tokens` cascade, which is right: they are live credentials, not
+  history.
+- **No `updated_at`.** `AuditLog` deliberately does not use `TimestampMixin`; the
+  mixin's `updated_at` column and its `onupdate` hook would both be lies for a row
+  whose entire value is that it has not changed. A write-only guarantee is also a
+  retention guarantee — purging old audit data is an explicit operation rather than a
+  side effect of editing a row.
+- **`metadata` may only ever receive non-sensitive, already-sanitised values.** It is
+  JSONB, written verbatim, rendered into exports and retained longer than the sessions
+  it describes. Nothing is filtered on the way in, because a redaction list eventually
+  misses the one field that matters. No audit row may contain a password, a token, or a
+  hash of either.
+
+`AUDIT_LOG_RETENTION_DAYS` is **declared but not enforced**: there is no pruning job,
+so the table grows for as long as the install lives. The setting states the policy and
+gives the value somewhere to be displayed.
+
 ### Revocation store
 
 ```python
@@ -394,6 +682,15 @@ live. The interface is deliberately narrow so a later phase can back it with Red
 without touching the auth service. It is a module singleton
 (`get_revocation_store()`) and therefore **per process**; see
 [Process model](#11-process-model).
+
+**What it covers, and what it does not.** Phase 2 narrowed its job. It still denylists
+**access**-token `jti`s, so logout denylists the access token and `AuthenticatedUser`
+consults it. It says nothing about refresh tokens or sessions: those are
+database-backed and therefore restart-durable and shared, which the in-memory dict is
+not. An access token whose session has been revoked stays cryptographically valid until
+it expires, but any refresh against the dead session is refused — so the exposure
+window is bounded by `ACCESS_TOKEN_EXPIRE_MINUTES`, not by
+`REFRESH_TOKEN_EXPIRE_DAYS`.
 
 ---
 
@@ -459,7 +756,32 @@ to hand it back.
 `Base.metadata` is the single source of truth for autogenerate. `users.email`
 uniqueness lives on a unique index (`ix_users_email`), because SQLAlchemy folds
 `unique=True, index=True` into the index rather than emitting a separate
-constraint — the migration records that explicitly with a comment.
+constraint — the migration records that explicitly with a comment. `users.username`
+does the same.
+
+### The Phase 2 tables
+
+| Table | Purpose | Delete behaviour |
+| --- | --- | --- |
+| `users` | The account. Five columns added by `0002` | — |
+| `sessions` | One row per device sign-in; holds the SHA-256 digest of the *current* refresh token | `ON DELETE CASCADE` from `users` — it is a live credential, not history |
+| `password_reset_tokens` | One row per outstanding reset request, single-use via `used_at` | `ON DELETE CASCADE` from `users` |
+| `audit_logs` | Append-only security trail, twelve event types | `ON DELETE SET NULL` from `users` — **the trail outlives the account** |
+
+Two index decisions are worth stating because both are cases where the obvious
+index is the wrong one. `ix_sessions_user_id` is deliberately the *only* index on
+the session lookup path: both real queries — "list this user's live sessions" and
+"revoke this user's live sessions" — filter on `user_id` first, and `revoked_at` is
+then applied to the handful of rows that index returns. A composite
+`(user_id, revoked_at)` would duplicate a prefix that is already indexed, in a
+table where one account holds a few dozen rows at most; an index on `revoked_at`
+alone would be worse, because revoking is always scoped to one user so almost no
+query could use it.
+
+`audit_logs` uses `metadata_` as the **attribute** and `metadata` as the column:
+the bare name is reserved on the declarative class, where it already means the
+collection of mapped columns. Callers use the attribute; raw SQL and Alembic see
+the column.
 
 ### Migrations
 
@@ -472,9 +794,18 @@ constraint — the migration records that explicitly with a comment.
 | Scope | `include_object` restricts autogenerate to the `public` schema and excludes `alembic_version`, `spatial_ref_sys` |
 | Rendering | `render_item` emits `postgresql.UUID(as_uuid=True)` so generated migrations state the dialect explicitly |
 
-Current chain: one revision, `0001_initial_create_users`. Models are deliberately
-**not** imported by migration files, so editing `app/models/user.py` cannot rewrite
-history.
+Current chain: two revisions, `0001_initial_create_users` → `0002_phase2_identity_sessions`.
+Models are deliberately **not** imported by migration files, so editing `app/models/`
+cannot rewrite history.
+
+`0002` does three things autogenerate cannot do for it, and each is a case where
+the generated draft would have been wrong:
+
+| Operation | Why it is hand-written |
+| --- | --- |
+| `op.alter_column("users", "full_name", new_column_name="display_name")` | Autogenerate cannot see a rename; it emits drop + add, which loses the data |
+| `username` added nullable → backfilled → `SET NOT NULL` | `users` is not empty by then. A `server_default` would be fewer statements but hands every row the *same* literal, so the unique index below fails on any database with more than one user. The chosen backfill is `left(split_part(email,'@',1), 15) \|\| '_' \|\| left(replace(id::text,'-',''), 16)` — 32 characters exactly, deterministic, and unique by construction because of the UUID suffix |
+| `role`, `avatar_url`, `password_changed_at` | `password_changed_at` in particular must be added with **no** default: rows that predate it have nothing truthful to backfill |
 
 Commands, all from `backend/`:
 
@@ -487,12 +818,24 @@ python -m alembic check                   # autogenerate drift check
 ```
 
 `alembic check` is the command for drift, and
-`backend/tests/test_migrations.py::test_autogenerate_reports_no_drift` asserts
-the same thing with `compare_type` and `compare_server_default` enabled, so drift
-is a test failure rather than a discovery. Neither can be *run* without a live
-PostgreSQL; the one-revision chain itself is checked by
-`test_the_migration_chain_is_linear_and_has_a_single_head`, which parses the
-version files and needs no database.
+`backend/tests/test_migrations.py::test_autogenerate_reports_no_drift` asserts the
+same thing with `compare_type` and `compare_server_default` enabled, so drift is a
+test failure rather than a discovery. Neither can be *run* without a live
+PostgreSQL.
+
+Two database-free checks exist, and they are not the same claim:
+
+- `test_migrations.py::test_the_migration_chain_is_linear_and_has_a_single_head`
+  parses the version files and asserts the literal chain
+  `["0002", "0001"]` with head `0002`. It needs no database, and it does mean a new
+  revision comes with a one-line test update — a deliberate pin, not an oversight.
+- `tests/test_migration_ddl.py` renders `0001` and `0002` **offline** (`as_sql=True`
+  into a buffer), parses the emitted SQL and compares every `CREATE TABLE` column,
+  foreign key and index against `Base.metadata`. That is real evidence that *the DDL
+  the migrations emit and the DDL the models describe are the same schema* — and it
+  is **not** the same as having applied them. Nothing about the live schema is
+  asserted, and `alembic upgrade head` has never been run against a database in the
+  environment this document was written in.
 
 ### Extensions
 
@@ -543,6 +886,19 @@ module other than this one reads `os.environ` for application settings.
 An explicit URL always wins over the parts. That is what lets the same `.env`
 drive both a host install and the compose stack, where the URL must name the
 `postgres` service rather than `127.0.0.1`.
+
+### Security and session settings
+
+Phase 2 added five. Their defaults are documented in `.env.example`; the two
+comments worth repeating here are the ones a reader is most likely to mis-set.
+
+| Setting | Default | Note |
+| --- | --- | --- |
+| `password_min_length` | 8 | Read on **every** policy evaluation rather than captured at import, so it stays a deployment setting |
+| `password_reset_expire_minutes` | 30 | Short because the token is a bearer credential for a full account takeover |
+| `session_absolute_lifetime_days` | 30 | Bounds a session independently of rotation |
+| `max_active_sessions` | 20 | Evicts the oldest on sign-in; never refuses the sign-in |
+| `audit_log_retention_days` | 400 | **Declared, not enforced.** No pruning job exists |
 
 ### Production guards
 
@@ -716,8 +1072,15 @@ it follows from two per-process pieces of state:
 
 | State | Consequence of a second worker |
 | --- | --- |
-| `RevocationStore` singleton | A logout recorded in worker A is invisible to worker B, so a revoked refresh token stays replayable. |
+| `RevocationStore` singleton | An **access-token** logout recorded in worker A is invisible to worker B, so that access token stays usable until it expires. |
 | Lazy engine + session factory | One pool per worker; `NEXUS_RELOAD=true` forks a second process that would carry its own pool and its own empty denylist. |
+
+Phase 2 shrank the first row considerably: refresh tokens and sessions are
+database-backed, so *session* revocation is shared across workers by construction
+and the blast radius of the in-memory denylist is bounded by
+`ACCESS_TOKEN_EXPIRE_MINUTES` (60 by default) rather than by the seven-day refresh
+lifetime. The single-worker constraint still stands, now for the access-token
+window and for the pool.
 
 `run.py` therefore defaults `NEXUS_RELOAD` to `false` and Compose forces it to
 `"false"`. Horizontal scaling, when it is ever needed, comes from running more
@@ -736,9 +1099,16 @@ backend Dockerfile notes the same constraint next to its `CMD`.
 ```text
 QueryClientProvider      server state, 30 s staleTime, no refetch on focus
 └── ThemeProvider        resolves light|dark|system, applies `.dark` to <html>
-    └── TooltipProvider  Radix, 200 ms delay
-        └── AuthBootstrap  calls store.hydrate() once, then renders
+    ├── TooltipProvider  Radix, 200 ms delay
+    │   └── AuthBootstrap  calls store.hydrate() once, then renders
+    └── Toaster          a SIBLING of the routed tree, inside ThemeProvider
 ```
+
+`Toaster` being a sibling rather than a child is not an accident of the JSX. It
+has to sit *outside* `AuthBootstrap`'s subtree so a notification survives a route
+throwing into its error boundary, and outside the guards so an auth failure — the
+one case where there may be no page at all — is still reportable. Inside
+`ThemeProvider` so a toast inherits the palette of the page it reports on.
 
 The theme is applied in `useLayoutEffect`, and a blocking inline script in
 `index.html` applies the persisted theme *before* the bundle executes. The script
@@ -756,7 +1126,13 @@ declared in `routes/lazy-pages.ts` so the router file stays a pure route table.
 | --- | --- | --- |
 | `/` | — | Redirects to `/dashboard` |
 | `AppLayout` children | `RequireAuth` | dashboard, projects, tasks, planner, knowledge, search, analytics, developer, learning, career, assistant, experiments, settings, `*` → not found |
-| `RequireAnonymous` children | `RequireAnonymous` | `/login`, `/register` |
+| `RequireAnonymous` children | `RequireAnonymous` | `/login`, `/register`, `/forgot-password`, `/reset-password` |
+
+Password recovery sits on the anonymous branch deliberately: there is no session
+to authenticate with, and a signed-in user has no reason to see either screen. The
+route table stays token-free — `ResetPasswordPage` reads the token from a
+`?token=` query parameter with `useSearchParams` and is the single place that does,
+so a reset token never reaches a loader or an error message.
 
 While `status === 'initializing'` (a persisted session is being verified against
 `GET /auth/me`) both guards render a branded `BootScreen` rather than redirecting,
@@ -782,9 +1158,9 @@ Enter and Escape.
 | Layer | File | Rule |
 | --- | --- | --- |
 | Transport | `lib/api-client.ts` | Framework-agnostic typed `fetch` wrapper: base URL, bearer injection, timeout (`DEFAULT_TIMEOUT_MS` = 30 000), `AbortSignal` support, and a single `ApiError` type. No React, no React Query. |
-| Endpoints | `services/*.ts` | One exported function per endpoint. `auth.ts` and `health.ts` are the only two endpoint files today; `errors.ts` holds the single `unknown → ApiError` conversion every caller shares. |
+| Endpoints | `services/*.ts` | One exported function per endpoint. `auth.ts`, `sessions.ts`, `users.ts` and `health.ts` are the four endpoint files today; `errors.ts` holds the single `unknown → ApiError` conversion every caller shares. |
 | Server state | `app/query-client.ts` | Retries suppressed for 4xx (a rejected request does not become accepted by asking again); transport failures get two attempts, which covers "the backend is still starting". |
-| Client state | `stores/*.ts` | Zustand: `auth-store` (persisted to `nexus.auth`, `status` deliberately not persisted) and `theme-store`. |
+| Client state | `stores/*.ts` | Zustand: `auth-store` (persisted to `nexus.auth`, `status` deliberately not persisted), `theme-store`, and `toast-store` (ephemeral, deliberately not persisted). |
 
 The auth store wires two hooks onto the shared client at module load:
 
@@ -838,7 +1214,56 @@ from the breakpoint, so resizing to desktop cannot strand an open sheet.
 
 Design tokens are HSL channel triplets in `src/index.css`, mapped to Tailwind
 utilities in `tailwind.config.ts` with `<alpha-value>` placeholders.
-`components/ui/` holds shadcn-style primitives over Radix with `cva` variants.
+`components/ui/` holds the primitives.
+
+**Some of them are hand-rolled, and that is a consequence of what is installed.**
+`frontend/package.json` ships seven Radix packages — avatar, dropdown-menu, label,
+scroll-area, separator, slot, tooltip — and nothing else. There is no
+`@radix-ui/react-dialog`, `-tabs`, `-progress`, `-switch` or `-select` in the lockfile,
+so Phase 2 wrote those five by hand rather than adding a dependency:
+
+| Primitive | Why hand-rolled | What it had to reproduce |
+| --- | --- | --- |
+| `dialog.tsx` | no Radix dialog | Focus trap, focus restore on close, `Escape` to dismiss, overlay dismissal, scroll lock, `aria-modal` |
+| `tabs.tsx` | no Radix tabs | Full ARIA: `role="tablist"/"tab"/"tabpanel"`, `aria-selected`, `aria-controls`, `aria-labelledby`, arrow-key navigation and a **roving tabindex** |
+| `progress.tsx` | no Radix progress | `role="progressbar"` with `aria-valuenow/min/max` |
+| `alert.tsx` | no Radix alert | `role="alert"` / `role="status"` by severity |
+| `switch.tsx` | no Radix switch | `role="switch"` + `aria-checked` on a `<button>` |
+| `select.tsx` | no Radix select | **A native `<select>`, deliberately** — see below |
+
+`select.tsx` is worth singling out because it looks like an omission and is not.
+A hand-built listbox is where accessibility goes to die: type-ahead, type-ahead
+buffer, `Home`/`End`, arrow wrapping, screen-reader announcements of the active
+option and of the number of options, and the platform picker on touch are all
+hard, and the native element gets every one of them from the OS for free. The cost
+is that it cannot be styled like the rest of the system on every platform — which is
+the correct trade for a setting that picks a colour scheme.
+
+`toast-store.ts` / `toast.tsx` / `toaster.tsx` are likewise hand-built: a Zustand
+store plus an ARIA live-region announcer. The store is deliberately **not**
+persisted — a toast is about something that just happened, and one that survives a
+reload is a lie.
+
+The account work added three feature modules that are pure domain logic, not
+components: `features/auth/password-rules.ts` (a mirror of the server policy, with
+the documented `\p{Nd}` divergence), `password-strength.ts` (scoring) and
+`session-labels.ts` (turning a user agent into "Chrome on Windows"). The last one is
+why `sessions.user_agent` is stored verbatim: the same derivation must produce the
+same label every time, which it cannot if the string is normalised on the way in.
+
+### The settings page
+
+`/settings` is a five-tab surface — Profile, Account, Security, Sessions,
+Preferences — with one panel per tab in `features/settings/`. It is the first page
+in the product that is *about* the account rather than *showing* one, and it is
+where most of the Phase 2 endpoints are exercised: profile update, password change,
+per-session revoke, "sign out everywhere", and a password-protected account
+deletion behind a confirmation dialog.
+
+`Security` and `Sessions` are deliberately separate tabs. A password change revokes
+every *other* session, so doing it and looking at the session list are one action and
+one question, and splitting them across tabs would make the consequence of the first
+invisible while the second is on screen.
 
 ### Build
 
@@ -853,19 +1278,25 @@ built by `npm run build`:
 | --- | --- |
 | `react` (largest vendor) | 222 295 |
 | `radix` | 113 444 |
-| `router` | 91 288 |
-| `index` (entry) | 84 474 |
-| `data` | 35 764 |
-| `icons` | 13 240 |
-| `dashboard-page` (largest route) | 11 903 |
-| `settings-page` | 4 828 |
-| per-page placeholders | ~0.36 kB each |
+| `router` | 92 153 |
+| `index` (entry) | 91 633 |
+| `settings-page` | 39 952 |
+| `data` | 37 974 |
+| `icons` | 19 199 |
+| `dashboard-page` | 11 760 |
+| `forgot-password-page` | 5 587 |
+| `register-page` | 5 812 |
+| per-page placeholders | ~0.40 kB each |
 
 Ten of the eleven placeholder routes render the shared `ModulePage` and cost
-358–370 bytes each; the eleventh, `/search`, adds a small card for its shortcut
-hint and lands at 1 239. Route splitting is therefore paying for the pages that
-will grow, not the ones that exist — only `dashboard-page` (11 903) and
-`settings-page` (4 828) are substantive today.
+396–404 bytes each; the eleventh, `/search`, adds a small card for its shortcut
+hint and lands at 1 269. `settings-page` is the largest route chunk by a wide
+margin — 4.8 kB in Phase 1, 39.9 kB now — because it carries five panels, the
+session list, the password checklist, the strength meter and two dialogs. That is
+route splitting working as intended: the page that grew got its own chunk, and the
+stub pages stayed at a few hundred bytes because the code lives in `ModulePage` and
+the registry. A placeholder chunk growing by kilobytes would be the signal that
+something page-specific had crept into it.
 
 The dev server and `vite preview` (4173) share the same proxy configuration, so a
 previewed production bundle behaves like the reverse proxy that will eventually
@@ -879,8 +1310,8 @@ front the API.
 
 ```bash
 # from backend/
-python -m pytest                        # 188 collected, needs nexus_test
-python -m pytest -m "not integration"   # 145 pass, 43 deselected, no database required
+python -m pytest                        # 499 collected, needs nexus_test
+python -m pytest -m "not integration"   # 366 pass, 133 deselected, no database required
 ```
 
 `pytest.ini` sets `testpaths = tests`, `pythonpath = .`, `asyncio_mode = auto`,
@@ -906,20 +1337,34 @@ app-scoped rule really does precede the blanket ignore in `warnings.filters`.
 That last assertion is the one that catches someone reordering the file into a
 rule that looks right and does nothing.
 
-| File | Tests (non-integration) | Covers |
-| --- | --- | --- |
-| `test_middleware.py` | 40 | Access-log fields, body-preview redaction, query redaction, capture cap vs. verbatim replay, non-default `create_app(settings=…)` wiring (CORS, OpenAPI/docs/redoc URLs) |
-| `test_logging.py` | 41 | JSON and human formatter shape, `REDACTED_KEYS` folding, hyphenated keys, `ContextFilter` request-id propagation |
-| `test_security.py` | 23 | JWT issue/verify, `type` enforcement, tamper and expiry rejection, bcrypt behaviour |
-| `test_error_handling.py` | 16 | The 5xx path: what a client may see, `X-Request-ID` on a 500, the no-echo rule for a 5xx `detail`, unmapped statuses as 4xx |
-| `test_config.py` | 14 | Settings assembly, derived URLs, production guards, the `get_settings` cache |
-| `test_health.py` | 5 (+3 integration) | Liveness never touching the database, header propagation, and the **degraded** path; the detailed endpoint and the lifespan are integration |
-| `test_event_loop.py` | 3 | The factory survives a delegating policy, builds a `SelectorEventLoop` with `add_reader`, and yields a fresh loop each call |
-| `test_warnings.py` | 3 | The `filterwarnings` rules above |
-| `test_errors.py` | integration | The envelope, the code table, `FORBIDDEN_FRAGMENTS` — the shared leak assertions other files import |
-| `test_auth.py` | integration | Register / login / refresh / logout / me end to end |
-| `test_repositories.py` | integration | SQL against the real test database |
-| `test_migrations.py` | integration | Linear single-head chain, schema present, no drift |
+| File | Offline | Integration | Covers |
+| --- | --- | --- | --- |
+| `test_migration_ddl.py` | 59 | — | Renders both migrations to SQL offline and compares the emitted DDL against `Base.metadata` |
+| `test_password_policy.py` | 55 | — | Each rule in isolation, the length bound, and that the message states the actual configured number |
+| `test_permissions.py` | 42 | — | The `Permission` enum, `ROLE_PERMISSIONS`, the fail-closed unknown-role path, `has_all` / `has_any` |
+| `test_logging.py` | 41 | — | JSON and human formatter shape, `REDACTED_KEYS` folding, hyphenated keys, `ContextFilter` request-id propagation |
+| `test_middleware.py` | 40 | — | Access-log fields, body-preview redaction, query redaction, capture cap vs. verbatim replay, non-default `create_app(settings=…)` wiring (CORS, OpenAPI/docs/redoc URLs) |
+| `test_security.py` | 39 | — | JWT issue/verify, `type` enforcement, tamper and expiry rejection, bcrypt behaviour, `hash_token` / `token_fingerprint_matches` |
+| `test_models.py` | 37 | — | Model-level invariants that need no database |
+| `test_error_handling.py` | 16 | — | The 5xx path: what a client may see, `X-Request-ID` on a 500, the no-echo rule for a 5xx `detail`, unmapped statuses as 4xx |
+| `test_config.py` | 14 | — | Settings assembly, derived URLs, production guards, the `get_settings` cache |
+| `test_password_reset.py` | 12 | — | The reset *policy* — token issuance shape, digest comparison, single-use — without touching the database. The end-to-end flow is in `test_auth_phase2.py` |
+| `test_health.py` | 5 | 3 | Liveness never touching the database, header propagation, and the **degraded** path; the detailed endpoint and the lifespan are integration |
+| `test_warnings.py` | 3 | — | The `filterwarnings` rules above |
+| `test_event_loop.py` | 3 | — | The factory survives a delegating policy, builds a `SelectorEventLoop` with `add_reader`, and yields a fresh loop each call |
+| `test_auth_phase2.py` | — | 41 | The Phase 2 auth surface end to end: sessions, password change, reset, logout-all |
+| `test_sessions.py` | — | 19 | Session issue, rotation, the session cap, listing and revocation |
+| `test_errors.py` | — | 15 | The envelope, the code table, `FORBIDDEN_FRAGMENTS` — the shared leak assertions other files import |
+| `test_account.py` | — | 15 | Profile update, account deletion, the cascade and `SET NULL` behaviour |
+| `test_auth.py` | — | 14 | Register / login / refresh / logout / me end to end |
+| `test_rbac.py` | — | 12 | The permission gate end to end, including the admin listing fixture |
+| `test_repositories.py` | — | 9 | SQL against the real test database |
+| `test_migrations.py` | — | 5 | Linear single-head chain (pinned to `["0002", "0001"]`), schema present, no drift |
+| **Total** | **366** | **133** | |
+
+The whole of `test_migrations.py` is `integration`-marked, so even the chain-shape
+assertion is deselected offline; `test_migration_ddl.py` is the database-free
+substitute for the *DDL agreement* half of it.
 
 Two of these deserve a note on what they changed.
 
@@ -978,38 +1423,54 @@ test that drives `lifespan_context` explicitly.
 
 ```bash
 # from frontend/
-npm test               # vitest run — 30 tests in 10 files
+npm test               # vitest run — 134 tests in 22 files
 npm run typecheck      # tsc -b
 npm run lint           # eslint .
 npm run build          # tsc -b && vite build
 ```
 
-Vitest runs in `jsdom` with `src/test/setup.ts`. The ten test files are
-`lib/api-client`, `lib/utils`, `stores/theme-store`, `features/modules/catalog`,
-`components/ui/button`, `components/ui/card`, `components/feedback/error-state`,
-`components/feedback/app-error-boundary`, `components/layout/app-shell` and
-`pages/app-shell.smoke` — which exercises the real routes: sign-in through the
-actual auth endpoints, Ctrl+K palette navigation, and the retryable error state
-when the backend is down.
+Vitest runs in `jsdom` with `src/test/setup.ts`. The suite grew from 10 files in
+Phase 1 to 22; the additions are the hand-rolled primitives that carry real
+behaviour (`dialog`, `tabs`), the auth pages (`login`, `register`, the shared
+form-error flattening), the password rules and strength scoring, the toast store,
+and an end-to-end smoke pass over the real routes — sign-in through the actual auth
+endpoints, Ctrl+K palette navigation, and the retryable error state when the
+backend is down.
 
 ### What is not covered
 
 Single-user local-first product: no load, concurrency, migration-from-an-older-
-schema, or browser-matrix testing.
+schema, or browser-matrix testing. No audit-log retention test, because there is no
+retention job to test.
 
 ### What has not been run
 
-Every number in the two command blocks above was produced on Windows. The 43
+Every number in the two command blocks above was produced on Windows. The 133
 `integration` tests have **never been executed** — there is no PostgreSQL and no
 Docker in the environment this document was last revised in, so `nexus_test` is
-never created, and the repository, auth, migration and detailed-health assertions
-are unverified. They are written against the schema and the endpoints described
-here, but "the suite collects 188 tests" is not "the suite passes 188 tests".
+never created, and the repository, session, account, RBAC, password-reset,
+migration and detailed-health assertions are unverified. They are written against
+the schema and the endpoints described here, but "the suite collects 499 tests" is
+not "the suite passes 499 tests", and nothing in this document claims otherwise.
 
-Likewise `docker-compose.yml` has never been executed by `docker compose` — it
-is structurally validated by `scripts/verify_compose.py`, which confirms that all
-14 interpolated variables are documented in `.env.example`, and which cannot tell
-you that the stack actually starts.
+That matters more in Phase 2 than it did in Phase 1. Phase 2 changed the shape of
+the `users` table, added three tables, and made almost every auth path depend on a
+session row — all of which lives on the database side, which is exactly the side
+that has never been exercised here. The 366 tests that pass need no database and
+therefore say very little about the migration or the new queries.
+
+Likewise:
+
+- **`alembic upgrade head` has never been run against a live database.**
+  `tests/test_migration_ddl.py` renders `0001` and `0002` offline and compares the
+  emitted DDL against the models. That is real evidence about the DDL, and it is
+  **not** the same as having applied it — a migration can render correctly and
+  still fail on a real server (locks, permissions, a constraint that already
+  exists).
+- **`docker-compose.yml` has never been executed by `docker compose`** — it is
+  structurally validated by `scripts/verify_compose.py`, which confirms that all
+  14 interpolated variables are documented in `.env.example`, and which cannot tell
+  you that the stack actually starts.
 
 And the Linux/macOS behaviour of the event-loop factory is asserted by a unit
 test that reproduces the recursion, not by having run the suite on either
@@ -1050,23 +1511,27 @@ uid 10001 with `libpq5` and `curl` only.
 
 <a id="extension-roadmap"></a>
 
-The seams below exist in Phase 1. None of the *destinations* is implemented; the
+The seams below exist today. None of the *destinations* is implemented; the
 "Today" column says what is already in place to reach it.
 
 | Seam | Today | Later | Touch points that must not change |
 | --- | --- | --- | --- |
-| Token revocation | `RevocationStore`, in-process | Redis-backed denylist | `RevocationStore` interface, `get_revocation_store()` |
-| Horizontal scaling | one worker per container | more containers behind a load balancer | once revocation is shared, `run.py`'s single-worker assumption relaxes |
+| Access-token revocation | `RevocationStore`, in-process | Redis-backed denylist | `RevocationStore` interface, `get_revocation_store()` |
+| Audit retention | `audit_log_retention_days` declared; **no pruning job** | a scheduled delete of rows older than the window | `AuditRepository`; the job must not delete `account_deleted` rows before the account is gone |
+| Horizontal scaling | one worker per container | more containers behind a load balancer | sessions and reset tokens are already database-backed and shared; the access-token denylist is what still forces the single worker |
 | Background work | none | worker process | `scripts/` for process orchestration; jobs need the same event-loop factory |
 | Search | `pg_trgm` + `unaccent` enabled | retrieval index over Knowledge | extension availability is already a prerequisite |
 | Local LLM | none | Ollama-backed assistant | never leaves the machine; the catalog already fixes the Phase 9 contract |
 | Repository analysis | none | local git history scan | read-only, from disk |
 | Module data | `catalog.ts` registry | per-module routers and pages | add a route entry and a catalog entry; nothing else |
-| Profile update | `UserService` + `get_user_service`, no router | a `users` router and a test | the service translates `IntegrityError` itself, so the router needs no try/except |
+| Role set | `user` / `admin` in a Python map | custom roles, per-tenant roles, delegated scopes | call sites ask for a `Permission`, never a role, so only `ROLE_PERMISSIONS` and the duplicated role constants change |
+| Module permissions | `projects.*` / `tasks.*` / `analytics.read` declared, nothing guards them | Projects and Tasks arrive and consume them | `require_permission()` is the only place a capability is checked |
 
 Phase numbering is not invented here — it is the `phase` field in
 `frontend/src/features/modules/catalog.ts`, and the module list it drives is the
-single source of truth for the sidebar, the palette and the roadmap.
+single source of truth for the sidebar, the palette and the roadmap. That module
+numbering is a different axis from the platform phasing in the README's Status
+table, which is why both are called "Phase 2".
 
 ---
 
@@ -1083,7 +1548,7 @@ single source of truth for the sidebar, the palette and the roadmap.
 | Repository never raises domain errors | One translation point; `IntegrityError` becomes `409` in one place | Services must be prepared for raw DB exceptions |
 | `bearer_scheme(auto_error=False)` | FastAPI's built-in failure is a 403 with the wrong shape; ours is the shared 401 envelope | Every auth dependency must handle the `None` credentials case |
 | `type` claim + expected-type check | Stops a refresh token being used as a bearer credential | Two token types to reason about |
-| In-memory `RevocationStore` | Real logout in Phase 1 with no new dependency | Per-process only; forces single-worker, and caps future scale-out |
+| In-memory `RevocationStore` | Real logout in Phase 1 with no new dependency | Per-process only; forces single-worker, and caps future scale-out. Phase 2 shrank the job to access tokens only — refresh tokens and sessions are database-backed — so the exposure window is now `ACCESS_TOKEN_EXPIRE_MINUTES` rather than the refresh lifetime |
 | `expire_on_commit=False` | Response models read attributes without a reload | Callers must not assume a refresh happened |
 | `pool_pre_ping=True` | A database restart should not surface as a request error | One extra round trip per checkout |
 | Stdlib logging, not structlog | One thing needed (request context), achieved with `contextvars` + a `Formatter` | Handlers, formatters and a filter to maintain by hand |
@@ -1106,6 +1571,23 @@ single source of truth for the sidebar, the palette and the roadmap.
 | Module registry as the single declaration | Sidebar, palette, headers and placeholders cannot drift apart | Adding a module still needs a route entry |
 | React Query for server state, Zustand for client state | Caching/polling and session/theme are different problems | Two state libraries |
 | Placeholder pages that render an em dash | No fabricated data; the UI states plainly what does not exist | Screenshots and demos look emptier than a mock would |
+| **One `sessions` row per device; rotation replaces the token hash** | "Sign out everywhere" becomes one `UPDATE` rather than a search through a token table, and the sessions screen can show a revoked device as signed out rather than gone | The row holds only the *current* digest, so there is no token history and a rotated-away token is indistinguishable from any other invalid one — which is the intended answer |
+| **`max_active_sessions` evicts the oldest instead of refusing the sign-in** | A stolen refresh token must not be able to accumulate sessions, but refusing a legitimate sign-in is a worse failure than signing out an old device | An attacker and the owner are treated identically, so a user can lose a session they still wanted |
+| **Sessions have an absolute lifetime independent of rotation** | A rotating refresh token would otherwise let a session that is never signed out of outlive any actual sign-in event | A user who refreshes on a phone every few days is signed out at 30 days regardless |
+| **SHA-256 for tokens, bcrypt for passwords** | The input decides: a password is low-entropy and needs a work factor; a 256-bit signed token has no dictionary, so a work factor buys nothing and would cost ~250 ms on every session read | Two hashing schemes to reason about, and a reviewer has to know which is which to catch a mistake |
+| **`permissions` derived from `role`, never stored, never in a table** | The role set is tiny and fixed; a join table would buy runtime mutability nobody has a use for and cost a query per protected request | A role value that drifts from the map is only caught at the point of use — mitigated by failing closed rather than raising |
+| **Unknown role → empty permission set, not an exception** | A drifted role value is *data*, and raising would turn it into a 500 on every protected endpoint for every user | The failure is silent at the request level; it is visible in logs, and the request is denied |
+| **`require_permission()` runs after authentication** | An anonymous request must not be able to tell "not signed in" from "not permitted" | Every protected route carries two dependency hops |
+| **A row the caller does not own answers 404, not 403** | A 403 confirms the id exists, turning the endpoint into a probe for real ids; 404 is what a non-existent id returns too | The two cases are indistinguishable even to a legitimate operator debugging by hand |
+| **`role` is a string, not a Postgres enum** | Adding an enum value needs `ALTER TYPE … ADD VALUE`, which cannot run inside a transaction block on some deployment paths — exactly the kind of migration that fails halfway through a deploy | The database no longer rejects a misspelled role on its own |
+| **`audit_logs.user_id` is `ON DELETE SET NULL`, `sessions` cascade** | A failed sign-in against an unknown address is the event worth recording and has no user row; and an account's security history must outlive the account, or a deletion cannot be investigated | Two different delete semantics to remember, and orphan audit rows by design |
+| **`AuditService.record` never raises** | An audit sink must not be able to deny service — a full table would otherwise take authentication down for every user | A broken trail is silent at the request level, so the failure is logged at WARNING rather than swallowed |
+| **`AuditLog` has no `updated_at`** | The mixin's `onupdate` hook would rewrite the timestamp of the one row that must not change; a write-only guarantee is also a retention guarantee | The table has one timestamp instead of two, which looks inconsistent next to the others |
+| **No filtering of `audit_logs.metadata` on write** | A redaction list eventually misses the one field that matters, and this column is retained longer than the sessions it describes | Every caller is trusted; the cost of getting it wrong is unrecoverable |
+| **Password reset returns `dev_token` outside production** | NEXUS is local-first and ships no mail service; a local install that cannot recover its own account is broken, not strict | The field carries a full-takeover credential in dev, and it is the field's presence in the schema that proves the guard has to exist |
+| **The hand-rolled dialog/tabs/progress/alert/switch primitives** | No Radix package exists for them in `frontend/package.json`, and no new dependency was in scope | Each one carries accessibility behaviour Radix would have handled — focus trap, roving tabindex, ARIA wiring — and each is now code this repository must maintain and test |
+| **A native `<select>` rather than a hand-built listbox** | Type-ahead, `Home`/`End`, wrap-around and screen-reader announcements are all hard to get right, and the platform gets them right | It cannot be styled like the rest of the system on every platform, which is the correct trade for a colour-scheme picker |
+| **Security and Sessions are separate settings tabs** | A password change revokes every other session, so the consequence of the action and the list it affects should be on screen together | One more tab to navigate |
 
 ---
 

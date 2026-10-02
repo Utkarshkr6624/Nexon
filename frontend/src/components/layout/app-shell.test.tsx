@@ -14,6 +14,12 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 
 const originalMatchMedia = window.matchMedia
 
+/**
+ * The same tabbable definition the rail's own trap uses, so "the first
+ * destination" in a test is the first element the trap cycles through.
+ */
+const FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
 afterEach(() => {
   window.matchMedia = originalMatchMedia
 })
@@ -102,6 +108,39 @@ describe('AppShell accessibility', () => {
 
     await user.keyboard('{Escape}')
     await waitFor(() => expect(document.activeElement).toBe(trigger))
+  })
+
+  it('keeps the sheet dismiss control inside the keyboard trap', async () => {
+    useViewport(false)
+    const user = userEvent.setup()
+    renderShell()
+
+    await user.click(screen.getByRole('button', { name: 'Open navigation' }))
+
+    const rail = sidebar()
+    const dismiss = screen.getByRole('button', { name: 'Close navigation' })
+
+    // Forward: Tab from the last destination reaches the dismiss control. As a
+    // sibling of the rail it was outside every `querySelector` the trap runs, so
+    // the cycle wrapped from the last destination straight back to the first and
+    // Escape was the only way out (WCAG 2.1.1).
+    const links = within(rail).getAllByRole('link')
+    expect(links.length).toBeGreaterThan(1)
+    links.at(-1)?.focus()
+    await user.tab()
+    expect(document.activeElement).toBe(dismiss)
+
+    // It is the last tabbable in the root, so the cycle wraps on from it.
+    await user.tab()
+    expect(rail.contains(document.activeElement)).toBe(true)
+    expect(document.activeElement).not.toBe(dismiss)
+
+    // Backward: Shift+Tab from the first destination reaches it too.
+    const first = rail.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)
+    expect(first).not.toBeNull()
+    first?.focus()
+    await user.tab({ shift: true })
+    expect(document.activeElement).toBe(dismiss)
   })
 
   it('restores the collapse preference instead of resetting it on mount', async () => {

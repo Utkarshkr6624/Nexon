@@ -27,7 +27,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { toast } from '@/stores/toast-store'
 import type { AuthSession, SessionListResponse } from '@/types'
 
-export const SESSIONS_QUERY_KEY = ['auth', 'sessions'] as const
+const SESSIONS_QUERY_KEY = ['auth', 'sessions'] as const
 
 /** `SessionLabel.iconHint` values; anything unexpected falls back to a monitor. */
 const DEVICE_ICONS: Readonly<Record<string, LucideIcon>> = {
@@ -38,14 +38,31 @@ const DEVICE_ICONS: Readonly<Record<string, LucideIcon>> = {
   tablet: Tablet,
 }
 
-function deviceIcon(hint: string): LucideIcon {
-  return DEVICE_ICONS[hint] ?? Monitor
+function DeviceGlyph({ hint, className }: { hint: string; className?: string }) {
+  const Icon = DEVICE_ICONS[hint] ?? Monitor
+  return <Icon className={className} aria-hidden="true" />
 }
 
 function recency(session: AuthSession): number {
   const raw = session.last_used_at ?? session.created_at
   const parsed = new Date(raw).getTime()
   return Number.isNaN(parsed) ? 0 : parsed
+}
+
+/**
+ * Whether a row is still a live sign-in.
+ *
+ * The backend is being changed to return only live rows; until that lands this
+ * panel stays honest on its own rather than counting a device the person can
+ * no longer use. A session is dead if it was revoked or if its token has
+ * already expired, and an unreadable `expires_at` counts as expired — a
+ * timestamp we cannot parse is not evidence of a working session.
+ */
+function isExpired(session: AuthSession, now: Date): boolean {
+  if (session.revoked_at !== null) return true
+  const expiry = new Date(session.expires_at).getTime()
+  if (Number.isNaN(expiry)) return true
+  return expiry <= now.getTime()
 }
 
 function SessionSkeleton() {
@@ -109,6 +126,11 @@ export function SessionsPanel() {
   const signOutEverywhere = useMutation({
     mutationFn: async () => {
       await logoutAll()
+      // The store reports a failed revoke through `error` rather than by
+      // throwing, so a silent "success" has to be ruled out here — otherwise the
+      // user is told they were signed out while their other devices are still in.
+      const error = useAuthStore.getState().error
+      if (error) throw error
       // `logout-all` spares the caller's own session on the server; "everywhere"
       // is supposed to include this browser too, so the local session is ended
       // unless the store already did it as part of the call.
@@ -135,11 +157,29 @@ export function SessionsPanel() {
     })
   }, [sessions.data])
 
-  const otherCount = ordered.filter((session) => !session.is_current).length
+  // One clock reading for the whole pass, so a session cannot be counted as
+  // live in the summary and rendered as expired a few lines below it.
+  const now = new Date()
+  const isLive = (session: AuthSession) => !isExpired(session, now)
+
+  // A dead row stays in the list — it is still a row somebody may want to clear
+  // out — but it is not a device, so it leaves every count, including the
+  // `otherCount` that decides whether "Sign out everywhere" has anything to do.
+  const activeCount = ordered.filter(isLive).length
+  const otherCount = ordered.filter((session) => isLive(session) && !session.is_current).length
   const canSignOutEverywhere = !sessions.isPending && !sessions.isError && otherCount > 0
 
+  const countSummary = (() => {
+    if (activeCount === 0) return 'No active devices — every session below has expired or been revoked.'
+    if (activeCount > 1) {
+      return `${activeCount} devices signed in · ${otherCount} other${otherCount === 1 ? '' : 's'}`
+    }
+    // Only the current row gets the reassuring line; a lone live session that
+    // is not this one is the interesting case, not a trivial one.
+    return otherCount === 0 ? '1 device signed in — this one.' : '1 other device signed in.'
+  })()
+
   const pendingLabel = pendingSession ? describeUserAgent(pendingSession.user_agent) : null
-  const PendingIcon = deviceIcon(pendingLabel?.iconHint ?? 'monitor')
 
   return (
     <Card>
@@ -147,8 +187,8 @@ export function SessionsPanel() {
         <div className="min-w-0 space-y-1.5">
           <CardTitle>Active sessions</CardTitle>
           <CardDescription>
-            Every device signed in to this account. Revoking one takes effect on its next
-            request.
+            Every device signed in to this account, including any that have since expired.
+            Revoking one takes effect on its next request.
           </CardDescription>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -158,11 +198,6 @@ export function SessionsPanel() {
             size="sm"
             disabled={!canSignOutEverywhere || signOutEverywhere.isPending}
             onClick={() => setConfirmSignOutEverywhere(true)}
-            title={
-              canSignOutEverywhere
-                ? undefined
-                : 'No other devices are signed in to this account.'
-            }
           >
             {signOutEverywhere.isPending ? <Spinner size="sm" /> : <Power aria-hidden="true" />}
             Sign out everywhere
@@ -191,22 +226,18 @@ export function SessionsPanel() {
           />
         ) : (
           <>
-            <p className="pb-3 text-xs text-muted-foreground">
-              {ordered.length === 1
-                ? '1 device signed in — this one.'
-                : `${ordered.length} devices signed in · ${otherCount} other${otherCount === 1 ? '' : 's'}`}
-            </p>
+            <p className="pb-3 text-xs text-muted-foreground">{countSummary}</p>
             <ul className="divide-y divide-border">
               {ordered.map((session) => {
                 const label = describeUserAgent(session.user_agent)
-                const Icon = deviceIcon(label.iconHint)
+                const expired = !isLive(session)
                 return (
                   <li
                     key={session.id}
                     className="flex flex-col gap-3 py-4 first:pt-1 sm:flex-row sm:items-center sm:gap-4"
                   >
                     <span className="flex size-9 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground">
-                      <Icon className="size-4" aria-hidden="true" />
+                      <DeviceGlyph hint={label.iconHint} className="size-4" />
                     </span>
 
                     <div className="min-w-0 flex-1">
@@ -217,9 +248,14 @@ export function SessionsPanel() {
                         {session.is_current ? (
                           <Badge variant="default">This device</Badge>
                         ) : null}
+                        {expired ? <Badge variant="secondary">Expired</Badge> : null}
                       </div>
                       <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                        Last active: {formatRelativeTime(session.last_used_at)}
+                        {expired ? (
+                          <>Expired {formatRelativeTime(session.expires_at)}</>
+                        ) : (
+                          <>Last active: {formatRelativeTime(session.last_used_at)}</>
+                        )}
                         {session.ip_address ? (
                           <>
                             {' · '}
@@ -267,7 +303,7 @@ export function SessionsPanel() {
           {pendingSession && (
             <div className="flex items-center gap-3 rounded-md border border-border bg-muted/40 p-3">
               <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground">
-                <PendingIcon className="size-4" aria-hidden="true" />
+                <DeviceGlyph hint={pendingLabel?.iconHint ?? 'monitor'} className="size-4" />
               </span>
               <div className="min-w-0">
                 <p className="truncate text-sm font-medium text-foreground">

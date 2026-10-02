@@ -4,8 +4,10 @@ The repository owns SQL only. It never raises domain errors — an unexpected
 ``IntegrityError`` is allowed to propagate so the service layer can translate
 it into the API contract.
 
-The single-use guarantee is enforced here, in the query, rather than by the
-service checking a flag after the fact.
+The single-use guarantee is enforced here, in the database, rather than by the
+service checking a flag after the fact: the read filters on ``used_at IS NULL``
+to keep the common path cheap, and the write (:meth:`PasswordResetRepository.spend`)
+repeats the same condition so the check and the claim are one atomic step.
 """
 
 from __future__ import annotations
@@ -43,15 +45,26 @@ class PasswordResetRepository:
         """Return the token only if it is unused and unexpired at ``now``.
 
         Both conditions are part of the ``WHERE`` clause rather than a check
-        applied to a fetched row. Reading the row first and deciding afterwards
-        leaves a window in which two concurrent redemptions of the same link
-        both see ``used_at IS NULL`` and both go on to change the password;
-        filtering in the database means only one of them matches at all.
+        applied to a fetched row, but that is a convenience, not the guarantee.
+        This read runs under READ COMMITTED, where a plain ``SELECT`` does not
+        wait behind another transaction's uncommitted write: two redemptions of
+        the same link arriving at the same moment both see ``used_at IS NULL``
+        and both walk away holding this row. It is :meth:`spend` that decides
+        the winner, and a caller that is about to change a password must call
+        it before it acts on what it read here.
 
         ``now`` is supplied by the caller rather than read from the database
         because the service needs the same instant for the rest of the reset
         flow, and two different "now"s within one request are a bug waiting to
         happen.
+
+        Args:
+            token_hash: The digest of the presented token.
+            now: The instant the token must still be unexpired at.
+
+        Returns:
+            The matching token row, or ``None`` when the digest is unknown,
+            already spent or expired.
         """
         result = await self.session.execute(
             select(PasswordResetToken).where(
@@ -62,20 +75,42 @@ class PasswordResetRepository:
         )
         return result.scalar_one_or_none()
 
-    async def mark_used(
-        self, token: PasswordResetToken, *, used_at: datetime
-    ) -> PasswordResetToken:
-        """Spend the token, after which the same link can never be redeemed again.
+    async def spend(self, token_id: uuid.UUID, *, used_at: datetime) -> bool:
+        """Claim the token, and report whether this caller is the one that got it.
 
-        Single-use is really enforced by :meth:`get_valid_by_token_hash`, which
-        stops matching a row the moment this writes ``used_at``; this method is
-        the write that makes that true.
+        ``used_at IS NULL`` is repeated in the ``WHERE`` clause of the write, so
+        the check and the claim are a single statement rather than a read
+        followed by a decision. Under READ COMMITTED a losing redemption blocks
+        on the row lock until the winner commits, then re-evaluates the
+        predicate against the updated row, matches nothing, and is told so by
+        its rowcount. A blind write by primary key cannot do that: it would
+        overwrite ``used_at`` and report success to a second caller, which is
+        exactly the window in which a stolen reset link could overwrite the
+        password the legitimate owner had just set.
+
+        The rowcount is read before the commit so the answer describes the
+        statement rather than the connection state.
+
+        Args:
+            token_id: The row to claim.
+            used_at: The instant the token is spent.
+
+        Returns:
+            ``True`` if this caller claimed the token; ``False`` if it was
+            already spent, in which case the caller must abandon whatever it
+            was about to do with it.
         """
-        token.used_at = used_at
-        self.session.add(token)
+        result = await self.session.execute(
+            update(PasswordResetToken)
+            .where(
+                PasswordResetToken.id == token_id,
+                PasswordResetToken.used_at.is_(None),
+            )
+            .values(used_at=used_at)
+        )
+        claimed = bool(result.rowcount)
         await self.session.commit()
-        await self.session.refresh(token)
-        return token
+        return claimed
 
     async def invalidate_all_for_user(self, user_id: uuid.UUID, *, used_at: datetime) -> int:
         """Spend every outstanding reset token for a user and return the count.

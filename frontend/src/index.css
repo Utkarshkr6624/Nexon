@@ -81,10 +81,12 @@
        as a separate place from the signed-in app without a gradient doing it. */
     --auth-background: 240 12% 97%;
 
-    /* Hairline grid drawn over the auth canvas. At 1px and low alpha it is
-       texture rather than content, and it sits far enough below the text to
-       leave body contrast untouched. */
-    --auth-grid: 240 8% 86%;
+    /* Peak opacity of the wash over that canvas. Low enough that the canvas
+       reads as one flat plane: on a near-white ground an accent that is
+       perceptible rather than felt starts competing with the form. Chosen per
+       theme — a light surface and a near-black one do not take the same amount
+       of accent to read as tinted. */
+    --auth-tint-alpha: 0.05;
 
     --chart-1: 212 85% 50%;
     --chart-2: 160 64% 34%;
@@ -146,7 +148,10 @@
     --ring-offset: 240 10% 4%;
 
     --auth-background: 240 12% 5%;
-    --auth-grid: 240 6% 16%;
+    /* Stronger than the light value, and chosen for its own reason rather than
+       inverted: the dark canvas is already almost black, so the wash has to
+       carry more of the accent before it registers as a tint at all. */
+    --auth-tint-alpha: 0.08;
 
     --chart-1: 212 90% 58%;
     --chart-2: 160 70% 45%;
@@ -233,28 +238,33 @@
   }
 
   /*
-   * Canvas for the signed-out surfaces. Static by construction — a wide radial
-   * tint plus a 32px hairline grid, no keyframes and no transitions — so
-   * `prefers-reduced-motion` has nothing to switch off here. The tint peaks at
-   * 7% of the accent and the grid sits at 60% of --auth-grid, both far below
-   * anything that would move body-text contrast, and the panel that holds the
-   * form is a solid surface on top of it.
+   * Canvas for the signed-out surfaces. Static by construction — one wide
+   * radial wash and nothing else, no keyframes and no transitions — so
+   * `prefers-reduced-motion` has nothing to switch off here.
+   *
+   * The earlier hairline grid is gone. At 32px it read as graph paper across
+   * the whole viewport and pulled the eye away from the one thing on the page
+   * that matters; a texture that competes with content is not a background.
+   * What is left peaks at `--auth-tint-alpha` of the accent at the top edge
+   * and falls to flat within ~60% of the height, so the panel that holds the
+   * form sits on a single quiet plane and no foreground contrast is touched —
+   * the wash sits behind an opaque card and fades out well before the text.
+   *
+   * The padding is deliberately modest, too: `min-h-screen` plus `items-center`
+   * centres the column anyway, so it buys nothing on a tall window and is the
+   * first thing that pushes the register form past the fold on a 900px laptop.
    */
   .app-auth-backdrop {
-    @apply relative flex min-h-screen items-center justify-center overflow-hidden px-4 py-12;
+    @apply relative flex min-h-screen items-center justify-center overflow-hidden px-4 py-8;
     background-color: hsl(var(--auth-background));
-    background-image:
-      radial-gradient(120% 80% at 50% 0%, hsl(var(--primary) / 0.07), transparent 60%),
-      linear-gradient(to right, hsl(var(--auth-grid) / 0.6) 1px, transparent 1px),
-      linear-gradient(to bottom, hsl(var(--auth-grid) / 0.6) 1px, transparent 1px);
-    background-size:
-      100% 100%,
-      32px 32px,
-      32px 32px;
-    background-position:
-      center top,
-      center top,
-      center top;
+    background-image: radial-gradient(
+      120% 70% at 50% 0%,
+      hsl(var(--primary) / var(--auth-tint-alpha)),
+      transparent 62%
+    );
+    background-size: 100% 100%;
+    background-position: center top;
+    background-repeat: no-repeat;
   }
 
   /*

@@ -11,8 +11,19 @@ from app.core.security import create_access_token
 
 pytestmark = pytest.mark.integration
 
-CREDENTIALS = {"email": "ada@nexus.dev", "password": "correct-horse-battery"}
-SECOND_USER = {"email": "grace@nexus.dev", "password": "another-strong-pass"}
+#: Every password satisfies the policy in ``app.schemas.user``: at least
+#: ``settings.password_min_length`` characters with an uppercase letter, a
+#: lowercase letter, a digit and a non-alphanumeric character.
+CREDENTIALS = {
+    "username": "ada",
+    "email": "ada@nexus.dev",
+    "password": "Correct-Horse-7",
+}
+SECOND_USER = {
+    "username": "grace",
+    "email": "grace@nexus.dev",
+    "password": "Another-Strong-Pass-9",
+}
 
 
 async def _register(client, payload: dict) -> dict:
@@ -30,23 +41,31 @@ def _bearer(token: str) -> dict[str, str]:
 
 
 async def test_register_returns_201_without_credential_material(client):
-    response = await _register(client, {**CREDENTIALS, "full_name": "Ada Lovelace"})
+    response = await _register(client, {**CREDENTIALS, "display_name": "Ada Lovelace"})
 
     assert response.status_code == 201, response.text
     user = response.json()
     assert set(user) == {
         "id",
         "email",
-        "full_name",
+        "username",
+        "display_name",
+        "avatar_url",
+        "role",
+        "permissions",
         "is_active",
         "is_verified",
-        "is_superuser",
         "created_at",
         "updated_at",
+        "last_login_at",
     }
     assert user["email"] == CREDENTIALS["email"]
-    assert user["full_name"] == "Ada Lovelace"
+    assert user["username"] == CREDENTIALS["username"]
+    assert user["display_name"] == "Ada Lovelace"
     assert user["is_active"] is True
+    # The role is the single answer to "what may this account do", so the
+    # superseded ``is_superuser`` flag is gone from the wire entirely.
+    assert "is_superuser" not in user
     assert "hashed_password" not in user
     assert CREDENTIALS["password"] not in response.text
 
@@ -54,21 +73,26 @@ async def test_register_returns_201_without_credential_material(client):
 async def test_register_rejects_a_duplicate_email(client, assert_error_envelope):
     await _register(client, CREDENTIALS)
 
-    response = await _register(client, {**CREDENTIALS, "full_name": "Someone Else"})
+    response = await _register(client, {**CREDENTIALS, "username": "someone-else"})
 
     error = assert_error_envelope(response, status_code=409, code="conflict")
     assert CREDENTIALS["password"] not in error["message"]
 
 
 async def test_register_normalises_the_email(client):
-    response = await _register(client, {"email": "  ADA@Nexus.DEV ", "password": "a-strong-pass"})
+    response = await _register(
+        client,
+        {"username": "ada", "email": "  ADA@Nexus.DEV ", "password": "a-Strong-Pass-1"},
+    )
 
     assert response.status_code == 201
     assert response.json()["email"] == "ada@nexus.dev"
 
 
 async def test_register_rejects_a_short_password(client, assert_error_envelope):
-    response = await _register(client, {"email": "shorty@nexus.dev", "password": "abc"})
+    response = await _register(
+        client, {"username": "shorty", "email": "shorty@nexus.dev", "password": "abc"}
+    )
 
     error = assert_error_envelope(response, status_code=422, code="validation_error")
     assert any(entry["field"] == "password" for entry in error["details"]["errors"])
@@ -79,8 +103,15 @@ async def test_login_returns_a_token_pair(client):
 
     body = await _tokens(client)
 
-    assert set(body) == {"access_token", "refresh_token", "token_type", "expires_in"}
+    assert set(body) == {
+        "access_token",
+        "refresh_token",
+        "token_type",
+        "expires_in",
+        "session_id",
+    }
     assert body["token_type"] == "bearer"
+    assert uuid.UUID(body["session_id"])
     assert body["expires_in"] > 0
     assert body["access_token"] != body["refresh_token"]
 

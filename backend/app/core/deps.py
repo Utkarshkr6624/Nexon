@@ -85,16 +85,51 @@ async def get_current_active_superuser(
 ) -> User:
     """Resolve the caller and require administrator privileges.
 
-    Two things grant it, and both must: the ``role`` column and the legacy
-    ``is_superuser`` boolean. The role is authoritative — it is what
-    :mod:`app.core.permissions` consults, and a permission gate that disagrees
-    with the superuser gate on the same request is a bug waiting to happen. The
-    column is still honoured because Phase 1 rows can only be promoted by setting
-    it, so dropping it here would silently un-promote every administrator created
-    before the role column existed. New code should set ``role``; the column stays
-    until a migration proves no row still relies on it.
+    **The ``role`` column is the only thing that grants it.** ``role == 'admin'``
+    passes; nothing else does, including the legacy ``is_superuser`` boolean.
+
+    That is a deliberate change of behaviour, and it is worth being explicit
+    about why, because the flag used to be honoured:
+
+    - ``role`` is the documented authority. :mod:`app.core.permissions` derives
+      every capability from it, and :class:`~app.schemas.user.UserRead` advertises
+      a caller's grants by looking it up. With the old ``or`` semantics a row
+      could clear the superuser gate while advertising none of the seven
+      ``user`` capabilities, so the client's UI gate and the server's authority
+      disagreed about the same request. A permission gate that disagrees with the
+      superuser gate on the same request is a bug waiting to happen.
+    - Nothing can set the flag. No endpoint, service or repository update writes
+      ``is_superuser`` — ``UserRepository`` lists it as a column that survives
+      for compatibility and nothing more — so the OR branch was reachable only by
+      hand-editing the database, which makes it a liability with no upside.
+    - The documented direction is the other way. :mod:`app.repositories.user`
+      calls the flag "superseded by ``role``", and
+      ``test_the_legacy_superuser_flag_alone_does_not_grant_the_listing`` already
+      asserts that the flag alone grants nothing.
+
+    **The migration bridge, stated exactly.** A row that is
+    ``is_superuser=True`` *and* ``role='user'`` — a Phase 1 administrator carried
+    across migration ``0002``, which added ``role`` with a ``'user'`` server
+    default and did **not** backfill it from the flag — used to pass this gate
+    and now does not. Promoting such a row is a one-off data fix, not a code
+    change::
+
+        UPDATE users SET role = 'admin' WHERE is_superuser AND role <> 'admin';
+
+    The column is kept so that fix is possible and so old rows stay readable; it
+    is not consulted by any authorisation decision. Once a migration proves no
+    row still carries the flag, the column should be dropped.
+
+    Args:
+        current_user: The caller, already resolved and known to be active.
+
+    Returns:
+        The caller, unchanged.
+
+    Raises:
+        ForbiddenError: If the caller's role is not ``admin``.
     """
-    if not current_user.is_superuser and current_user.role != UserRole.ADMIN.value:
+    if current_user.role != UserRole.ADMIN.value:
         raise ForbiddenError("This action requires superuser privileges.")
     return current_user
 

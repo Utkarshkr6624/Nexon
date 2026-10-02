@@ -60,7 +60,7 @@ export const MODULES: ModuleDefinition[] = [
     summary:
       'Your cross-module briefing: what needs attention today, which surfaces are live, and the state of the platform underneath.',
     vision:
-      'The dashboard is the only module that ships in Phase 1, and it stays deliberately thin until the modules around it have real data to report. It reads live service health from the backend today; once Projects, Tasks and Planner exist it becomes the daily triage surface, surfacing overdue work, stale notes and the decisions waiting on you.',
+      'The dashboard and Settings are the modules that ship in Phase 1, and the dashboard stays deliberately thin until the modules around it have real data to report. It reads live service health from the backend today and, since the account system landed, the signed-in identity; once Projects, Tasks and Planner exist it becomes the daily triage surface, surfacing overdue work, stale notes and the decisions waiting on you.',
     phase: 1,
     icon: LayoutDashboard,
     keywords: ['home', 'overview', 'today', 'briefing'],
@@ -429,28 +429,29 @@ export const SETTINGS_MODULE: ModuleDefinition = {
   label: 'Settings',
   summary: 'Your account, appearance and the platform preferences that apply everywhere.',
   vision:
-    'Settings is split into two halves. Appearance, theme and session preferences are live now because they need no backend data. Everything that depends on a stored profile or a notification stream lands with the modules that own the underlying records, rather than being stubbed here.',
+    'Settings is the account surface. Identity, credentials and sessions are served from the backend, so they are the same everywhere and survive a new browser; appearance and layout preferences are device-local and stored in this browser alone. Anything that needs a stored record NEXUS does not have yet is stated as missing rather than stubbed with a control that would do nothing.',
   phase: 1,
   icon: Settings,
   keywords: ['preferences', 'account', 'profile', 'theme', 'configuration'],
   capabilities: [
     {
-      title: 'Appearance (live)',
-      description: 'Light, dark or system theme, persisted to this browser only.',
-    },
-    {
-      title: 'Session (live)',
-      description: 'Sign out of this device and inspect the session the shell is holding.',
-    },
-    {
-      title: 'Account preferences',
+      title: 'Account (live)',
       description:
-        'Profile, notification and data-retention settings arrive with the modules that need them.',
+        'Profile, password, active sessions and account deletion, all served by the backend.',
+    },
+    {
+      title: 'Appearance (live)',
+      description: 'Light, dark or system theme, plus layout and motion. Browser-local.',
+    },
+    {
+      title: 'Notification and retention',
+      description:
+        'These arrive with the modules that own the underlying records and event stream.',
     },
   ],
   metrics: [
     { label: 'Theme', hint: 'Stored in this browser' },
-    { label: 'Session', hint: 'Held in this browser' },
+    { label: 'Identity', hint: 'Stored on the backend' },
     { label: 'Notifications', hint: 'Requires a notification stream' },
   ],
 }

@@ -40,7 +40,33 @@ def test_the_migration_chain_is_linear_and_has_a_single_head():
 
     assert len(heads) == 1, f"multiple heads, the chain has diverged: {heads}"
     assert heads[0] == script.get_current_head()
-    assert [revision.revision for revision in script.walk_revisions()] == ["0001"]
+    # ``walk_revisions`` yields head first, so this is the reverse of the applied
+    # order. Phase 2 added ``0002_phase2_identity_sessions`` and Phase 3 added
+    # ``0003_phase3_projects_tasks``; a revision added later must extend this list
+    # rather than replace it.
+    assert [revision.revision for revision in script.walk_revisions()] == [
+        "0003",
+        "0002",
+        "0001",
+    ]
+
+
+def test_every_revision_is_reachable_from_the_single_head():
+    """No orphan file in ``versions/`` and no unapplied fork.
+
+    ``walk_revisions`` above already proves the order; this proves the graph is
+    exactly a chain — each revision names a ``down_revision`` that exists, and
+    the tip of it is the single head. A revision left behind pointing at a
+    ``down_revision`` that has since been renamed cannot slip in unnoticed.
+    """
+    script = ScriptDirectory.from_config(_alembic_config("postgresql+psycopg://unused"))
+
+    assert {revision.revision: revision.down_revision for revision in script.walk_revisions()} == {
+        "0003": "0002",
+        "0002": "0001",
+        "0001": None,
+    }
+    assert head_revision() == "0003"
 
 
 async def test_the_test_database_is_migrated_to_head(engine):

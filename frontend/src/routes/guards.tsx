@@ -10,8 +10,12 @@ import { useAuthStore } from '@/stores/auth-store'
  * branded and silent — the alternative is a flash of the login screen on every
  * reload for a signed-in user.
  *
- * Exported so the auth route boundary can reuse it for the lazy chunks behind
- * /login instead of keeping a near-identical private copy.
+ * Note for anyone tempted to import this from `auth-boundary.tsx`: that
+ * boundary keeps its own private fallback rather than importing this, because
+ * it is a Suspense placeholder for the lazy /login chunk, not a session check.
+ * Collapsing the two would mean importing a session concept into a loading
+ * boundary, so the duplication is deliberate and this is the only definition of
+ * the boot screen.
  */
 export function BootScreen() {
   return (

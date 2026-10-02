@@ -358,7 +358,23 @@ class UserUpdate(_NameNormaliser, BaseModel):
     could silently rotate credentials. ``email`` is absent for the same class
     of reason: it is an identity, and changing one has to be a verified
     transition rather than a field edit.
+
+    ``extra="forbid"`` is what turns that from a silent no-op into an answer.
+    Pydantic's default is ``"ignore"``, under which a client sending
+    ``{"email": "attacker@nexus.dev"}`` gets a cheerful 200 with the field
+    dropped — and a caller who reads that as "my address changed" has believed
+    something false about their own identity, which is the exact outcome a
+    forbid-listing exists to prevent. Rejecting names the offending field in a
+    422 instead, so the client is told the route does not own it.
+
+    The read schemas deliberately do **not** do this:
+    :class:`UserRead` is validated from ORM attributes and from response
+    serialisation, where an unexpected key is this layer's own business rather
+    than a client's, and forbidding there would turn every added column into a
+    500.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     display_name: str | None = Field(default=None, max_length=255)
     avatar_url: str | None = Field(default=None, max_length=MAX_AVATAR_URL_LENGTH)

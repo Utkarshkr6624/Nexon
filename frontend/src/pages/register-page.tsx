@@ -140,8 +140,9 @@ export default function RegisterPage() {
   const [confirm, setConfirm] = useState('')
 
   // Errors stay hidden until a submit has been attempted, except the
-  // confirmation mismatch, which is a fact the form can settle on its own and
-  // that a password manager restoring both fields should surface immediately.
+  // confirmation mismatch: that one is a fact the form can settle on its own,
+  // and it surfaces as soon as the field is left — which is also when a
+  // password manager filling both fields gets to see it.
   const [attempted, setAttempted] = useState(false)
   const [confirmTouched, setConfirmTouched] = useState(false)
 
@@ -172,7 +173,8 @@ export default function RegisterPage() {
   // Nothing else is reported twice: the banner stays for what a field cannot
   // express — transport failures, a conflict with no locatable field, a 5xx.
   const hasFieldErrors = Object.keys(fieldErrors).length > 0
-  const showBanner = error !== null && conflict === null && !(error.isValidationError && hasFieldErrors)
+  const showBanner =
+    error !== null && conflict === null && !(error.isValidationError && hasFieldErrors)
 
   // The button is blocked only once the mismatch is actually on screen. A
   // disabled control cannot be focused, so blocking it before its explanation
@@ -184,15 +186,14 @@ export default function RegisterPage() {
     event.preventDefault()
     setAttempted(true)
 
-    // The mismatch is the one error that blocks the button. A disabled submit
-    // with no explanation is a screen-reader dead end, so the button stays
-    // enabled for everything the server could have an opinion about — the
-    // policy checklist and the shape of the username are already visible
-    // above it, and clicking submits them for judgement. The confirmation is
-    // different: it is a transcription of a value already in the form, the
-    // client can settle it definitively with no round trip, and blocking it
-    // hides nothing. Requiring one extra click to learn you mistyped the
-    // password you just typed would be the user-hostile reading.
+    // The mismatch is the one error that blocks the button, and only once it
+    // is visible. A disabled submit with no explanation is a keyboard dead
+    // end, so the button stays enabled for everything the server could have an
+    // opinion about — the policy checklist and the shape of the username are
+    // already on screen above it, and submitting hands them over for
+    // judgement. The confirmation is different: it is a transcription of a
+    // value the form already holds, the client settles it definitively with no
+    // round trip, and showing the error first costs nothing.
     if (confirmMismatch) {
       confirmRef.current?.focus()
       return
@@ -245,11 +246,17 @@ export default function RegisterPage() {
       <Card>
         {/* No `CardHeader` — `AuthShell` already owns the page masthead — so the
             content keeps the card's own side padding instead of `pt-0`. */}
-        <CardContent className="pt-6">
+        <CardContent className="pt-5">
           {/* `noValidate` for the same reason as the sign-in form: the validation
               below is the one that runs, and a native bubble would pre-empt
-              every inline message it replaces. */}
-          <form onSubmit={onSubmit} noValidate className="app-form-stack">
+              every inline message it replaces.
+
+              `gap-4` over the shared `gap-5`: this is the tallest form in the
+              product, and it is the one screen that has to fit a 900px laptop.
+              Five fields, a live checklist and a strength meter add up, so the
+              rhythm is tightened here rather than anywhere the gap is load
+              bearing. */}
+          <form onSubmit={onSubmit} noValidate className="app-form-stack gap-4">
             {showBanner && error && <ErrorState error={error} compact />}
 
             <div className="app-form-field">
@@ -292,8 +299,7 @@ export default function RegisterPage() {
                 </p>
               ) : (
                 <p id="username-hint" className="app-form-hint">
-                  3–32 characters. Letters, numbers, underscores and hyphens; must start with a
-                  letter or a number.
+                  3–32 characters. Must start with a letter or number; _ and - allowed.
                 </p>
               )}
             </div>
@@ -361,15 +367,14 @@ export default function RegisterPage() {
               <Button
                 type="submit"
                 className="w-full"
-                disabled={pending || confirmMismatch}
+                disabled={pending || confirmBlocked}
                 aria-busy={pending}
               >
                 {pending && <Spinner size="sm" label="Creating your account" />}
                 {pending ? 'Creating account…' : 'Create account'}
               </Button>
               <p className="app-form-hint">
-                Creating the account signs you in immediately. Your password is never sent anywhere
-                but this machine's database.
+                Creating the account signs you in. Nothing leaves this machine.
               </p>
             </div>
           </form>

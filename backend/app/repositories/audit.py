@@ -6,6 +6,15 @@ Audit rows are append-only, so there is no ``update_fields`` here by design: the
 only way a row's contents can change is if the repository offers a way to change
 them, and it should not.
 
+.. note::
+   :meth:`AuditRepository.record` commits on the caller's request-scoped session,
+   which every other repository in the request also holds. A failed commit
+   therefore leaves that session needing a ``rollback()`` before anyone else can
+   use it. Restoring it is not this layer's job — an audit write must never
+   dictate what happens to shared state — so it belongs to
+   :meth:`app.services.audit_service.AuditService.record`, which owns the
+   best-effort contract and calls ``rollback()`` in its handler.
+
 .. warning::
    ``metadata`` must never receive a password, a token, or a hash of either. The
    value is written verbatim into JSONB, is included in log exports, and is
