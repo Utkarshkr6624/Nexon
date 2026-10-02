@@ -41,19 +41,25 @@ const COPY: Record<
     icon: ShieldCheck,
     title: 'No significant risk detected yet',
     description:
-      'The engine checks deadlines, workload, estimates, project signals and recorded activity on every run, and reports a finding only when the recorded data shows a gap. Finding nothing is a normal result — it means the data so far does not point at a condition worth acting on.',
+      'The engine checks deadlines, workload, estimates, project signals and ' +
+      'recorded activity on every run, and reports a finding only when the ' +
+      'recorded data shows a gap. Finding nothing is a normal result — it means ' +
+      'the data so far does not point at a condition worth acting on.',
   },
   recommendations: {
     icon: Lightbulb,
     title: 'No suggestions open',
     description:
-      'Suggestions are raised from a detected risk, one per condition, and they close when the condition closes. Nothing here means no rule currently has something to propose.',
+      'Suggestions are raised from a detected risk, one per condition, and they ' +
+      'close when the condition closes. Nothing here means no rule currently has ' +
+      'something to propose.',
   },
   filtered: {
     icon: Filter,
     title: 'Nothing matches this filter',
     description:
-      'The records exist, but none of them match what is selected. Clearing the filter shows them again.',
+      'The records exist, but none of them match what is selected. Clearing the ' +
+      'filter shows them again.',
   },
 }
 

@@ -39,6 +39,8 @@ from app.services.risk.scoring import (
     NOT_ENOUGH_DATA,
     PROJECT_SCHEDULING_WEIGHTS,
     PROJECT_WEIGHTS,
+    TASK_RESCHEDULE_THRESHOLD,
+    TASK_WEIGHTS,
     RiskEvidence,
     RiskResult,
     consistency_risk,
@@ -48,6 +50,7 @@ from app.services.risk.scoring import (
     project_risk,
     risk_severity_for,
     scheduling_risk,
+    task_risk,
     workload_risk,
 )
 
@@ -1152,3 +1155,141 @@ def test_no_scored_result_ever_escapes_the_zero_to_one_hundred_scale():
             continue
         assert isinstance(result.score, int), result.metadata
         assert 0 <= result.score <= 100, result.metadata
+
+
+# ---------------------------------------------------------------------------
+# Task risk — the seventh detector
+# ---------------------------------------------------------------------------
+
+
+def test_one_blocked_task_scores_sixty_and_is_high():
+    """The blocked signal on its own is ``0.60 x 100 = 60``, the ``high`` band.
+
+    A blocked task is binary because its remaining duration is unbounded rather
+    than large: one is exactly as blocking as five, so a weight scaled by a count
+    of blocked tasks would be scaling by how much of the plan the user has
+    already noticed.
+    """
+    result = task_risk(blocked=True, title="Ship the quarterly report")
+
+    assert result.risk_type is RiskType.TASK
+    assert result.score == 60
+    assert result.severity is RiskSeverity.HIGH
+    assert result.available is True
+    assert result.reason_if_unavailable is None
+    assert result.metadata["blocked"] is True
+    assert result.metadata["reschedules"] == 0
+    assert result.metadata["reschedule_threshold"] == TASK_RESCHEDULE_THRESHOLD
+    assert result.metadata["title"] == "Ship the quarterly report"
+    assert result.metadata["signals"] == {"blocked": 1.0}
+
+
+def test_three_recorded_reschedules_scores_forty_and_is_medium():
+    """The threshold itself is the signal, not the beginning of a ramp.
+
+    ``0.40 x 100 = 40`` for the third move and for the ninth. The action the
+    number leads to — break the task into pieces — is the same at both, and a
+    ramp would let a task moved nine times outrank one that cannot be worked on
+    at all, which is the wrong order for the same list.
+    """
+    threshold = task_risk(reschedules=TASK_RESCHEDULE_THRESHOLD)
+    beyond = task_risk(reschedules=TASK_RESCHEDULE_THRESHOLD + 6)
+
+    assert threshold.score == beyond.score == 40
+    assert threshold.severity is RiskSeverity.MEDIUM
+    assert threshold.metadata["signals"] == {"rescheduled": 1.0}
+    assert _by_label(threshold, "Repeatedly rescheduled").detail == (
+        "3 reschedules recorded against this task, against a threshold of 3"
+    )
+
+
+def test_a_blocked_task_that_was_also_rescheduled_saturates_the_scale():
+    """``0.60 + 0.40`` is every point there is, and the weights are the whole score.
+
+    Asserted as the weight table as well as the number, because the weights are
+    the design decision and a formula that quietly stopped adding them up would
+    produce a plausible-looking score from no stated reason.
+    """
+    result = task_risk(blocked=True, reschedules=TASK_RESCHEDULE_THRESHOLD)
+
+    assert sum(TASK_WEIGHTS.values()) == pytest.approx(1.0)
+    assert result.score == 100
+    assert result.severity is RiskSeverity.CRITICAL
+    assert result.metadata["signals"] == {"blocked": 1.0, "rescheduled": 1.0}
+    assert sum(line.contribution for line in result.evidence) == pytest.approx(
+        result.score, abs=0.5
+    )
+
+
+def test_two_reschedules_is_a_measured_zero_that_explains_the_threshold():
+    """Below the threshold the answer is zero with evidence, never unavailability.
+
+    "Not enough data" is for a detector that *cannot* judge. This one can: it has
+    counted two reschedules and the threshold is three, and that is a
+    measurement. The detail line carries both numbers so the zero can be read
+    rather than assumed.
+    """
+    result = task_risk(reschedules=TASK_RESCHEDULE_THRESHOLD - 1)
+
+    assert result.available is True
+    assert result.score == 0
+    assert result.severity is RiskSeverity.LOW
+    assert result.metadata["signals"] == {}
+    assert _labels(result) == ["No task-level condition recorded"]
+    assert _by_label(result, "No task-level condition recorded").detail == (
+        "not blocked, and 2 reschedule(s) against a threshold of 3"
+    )
+
+
+def test_the_task_evidence_names_the_record_and_nothing_about_the_person():
+    """The count is the claim; whether the task is too large is not stated.
+
+    The brief's worked example pairs the condition with the break-it-down
+    suggestion, and it is worth keeping the inference in the recommendation and
+    out of the risk: the rows record how often a date moved, not why.
+    """
+    result = task_risk(blocked=True, reschedules=4)
+
+    details = " ".join(line.detail.lower() for line in result.evidence)
+    assert "4 reschedules" in details
+    for forbidden in ("lazy", "too large", "failing", "disorganised", "unproductive"):
+        assert forbidden not in details
+
+
+def test_task_risk_counts_its_evidence_from_the_rows_it_read():
+    """One blocked row plus the moves behind it, and nothing invented.
+
+    ``evidence_strength_for`` bands a sample count and never calls it confidence,
+    so the question this pins is only whether the count is honest: a blocked task
+    with no history is one observation, and a task that has been moved nine times
+    and is blocked is ten.
+    """
+    blocked = task_risk(blocked=True)
+    moved = task_risk(reschedules=TASK_RESCHEDULE_THRESHOLD)
+    both = task_risk(blocked=True, reschedules=9)
+
+    assert blocked.evidence_strength is EvidenceStrength.LOW
+    assert moved.evidence_strength is EvidenceStrength.LOW
+    assert both.evidence_strength is EvidenceStrength.MEDIUM
+
+
+def test_every_task_score_agrees_with_the_ladder_applied_to_it():
+    """Severity stays derived for the new detector, grid and all.
+
+    The same invariant the other six are held to, over the whole input space the
+    detector can be given rather than the four points the section above pins.
+    """
+    results = [
+        task_risk(blocked=blocked, reschedules=reschedules)
+        for blocked in (False, True)
+        for reschedules in (0, 1, 2, 3, 5, 40)
+    ]
+
+    assert {result.score for result in results} == {0, 40, 60, 100}
+    for result in results:
+        assert result.available is True
+        assert 0 <= result.score <= 100
+        assert result.severity is risk_severity_for(result.score), result.metadata
+        assert sum(line.contribution for line in result.evidence) == pytest.approx(
+            result.score, abs=0.5
+        ), result.metadata

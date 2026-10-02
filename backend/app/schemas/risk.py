@@ -136,8 +136,10 @@ class RiskEvidenceRead(BaseModel):
     )
     contribution: float = Field(
         description="Points of the risk's 0-100 score this line accounts for. The "
-        "lines sum to the score, so the arithmetic is checkable; lines that "
-        "describe the input without moving the number carry 0.0."
+        "moving lines account for the score to within rounding — the score is a "
+        "whole number and each share is carried at two decimals, so they need not "
+        "sum to it exactly. Lines that describe an input without moving the "
+        "number carry 0.0."
     )
 
 

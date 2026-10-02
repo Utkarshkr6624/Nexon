@@ -53,12 +53,15 @@ import {
   formatShortDate,
 } from '@/features/analytics/format'
 import { useActivity, useTasks } from '@/features/work/hooks'
+import { SeverityBadge } from '@/features/risk/components/severity-badge'
+import { useRiskSummary, useRisks } from '@/features/risk/hooks'
 import { selectDisplayName, useAuthStore } from '@/stores/auth-store'
 import { toApiError } from '@/services/errors'
 import { cn } from '@/lib/utils'
 import { formatRangeLabel } from '@/types/analytics'
 import { WORK_EVENT_META } from '@/types/work'
 import type { ComparisonTotal, DailyMetricRead } from '@/types/analytics'
+import type { RiskSummaryRead } from '@/types/risk'
 
 /**
  * The dashboard is an intelligence surface, not a launchpad.
@@ -80,6 +83,13 @@ import type { ComparisonTotal, DailyMetricRead } from '@/types/analytics'
  * three endpoints `/overview` does not fold in — the time distribution, the
  * per-project rollups and the work feed — which are fetched for the panels that
  * read them.
+ *
+ * **The detection engine gets one strip, not a grid.** `RiskSignals` answers
+ * "does anything need me?" in a sentence and three rows, and sits below the
+ * panels rather than among them. It reads its own endpoint rather than
+ * `/overview`, because a finding is not a metric over the selected window: it is
+ * a conclusion about the current plan, and it would be wrong to rescale it every
+ * time the date picker moves.
  */
 export default function DashboardPage() {
   const user = useAuthStore((state) => state.user)
@@ -251,6 +261,8 @@ export default function DashboardPage() {
           </div>
         </>
       )}
+
+      <RiskSignals />
 
       <HealthCard
         data={health.data}
@@ -602,6 +614,166 @@ function RecentActivity({ query, className }: { query: ReturnType<typeof useActi
         )}
       </CardContent>
     </Card>
+  )
+}
+
+/* ------------------------------------------------------------------- risks */
+
+/** How many findings the strip shows. Three is the most that can be read as a
+ *  list; the rest of the answer belongs on the Risk Center, which is one click
+ *  away and can show all of them. */
+const RISK_STRIP_LIMIT = 3
+
+/**
+ * The detection engine, in one line.
+ *
+ * **The brief asks the dashboard not to be overwhelmed, and that is the whole
+ * design constraint.** There is no second grid of tiles and no chart: a single
+ * sentence saying how many items need attention, at most three findings beneath
+ * it, and a link to the Risk Center for the rest. A dashboard that repeats the
+ * whole Risk Center above the fold would be louder than the page it sits on, and
+ * the panels below would be the thing being pushed down.
+ *
+ * **The count comes from the server's own `needs_attention` bit** rather than
+ * from a threshold recomputed here, because the Risk Center's header reads the
+ * same field and two implementations of "what counts as urgent" is how a widget
+ * and a page start disagree. Medium and low are counted but do not raise it:
+ * a widget that alarms over an amber band teaches people to ignore it.
+ *
+ * **Nothing is rendered when nothing was found.** The strip states that no
+ * significant risk was detected, which is a result — the engine ran, read six
+ * detectors and found no condition worth reporting — and it does not do it with
+ * four zeroes, which read as a measurement.
+ *
+ * **The heading sits at `h3`.** The panels above own the `h2`s of this page, and
+ * this strip is subordinate to them: it is the answer to one of the questions
+ * they raise, not a section of its own. Promoting it would present three rows of
+ * text as a peer of the activity chart.
+ *
+ * **A failed read says so and stops.** There is no retry control here, because
+ * this page already carries the header's Refresh and a second one would compete
+ * with the health card's own recovery; and no error card either, which on a page
+ * this size would be the loudest thing on screen for a secondary widget. One
+ * muted sentence, and the Risk Center link beside it, is the honest report.
+ */
+function RiskSignals() {
+  const summary = useRiskSummary()
+  // Ordered severity-descending by the server, so the first three rows are the
+  // three most severe without this component ranking anything.
+  const top = useRisks({ limit: RISK_STRIP_LIMIT, status: 'active' })
+
+  const rows = top.data?.items ?? []
+  const counts = summary.data
+
+  return (
+    <Card className="min-w-0">
+      <CardHeader className="flex-row items-start justify-between space-y-0 pb-3">
+        <div className="min-w-0 space-y-1">
+          <CardTitle level="h3">Risk signals</CardTitle>
+          <CardDescription>
+            Conditions the detection engine has found in your recorded work.
+          </CardDescription>
+        </div>
+        <Button type="button" variant="ghost" size="sm" asChild className="shrink-0">
+          <Link to="/risks">
+            Open Risk Center
+            <ArrowUpRight aria-hidden="true" />
+          </Link>
+        </Button>
+      </CardHeader>
+
+      <CardContent className="space-y-3">
+        {summary.isPending && !counts ? (
+          <div role="status" className="space-y-2">
+            <span className="sr-only">Loading the risk summary</span>
+            <Skeleton className="h-4 w-56" />
+            <Skeleton className="h-3 w-72" />
+          </div>
+        ) : counts === undefined ? (
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            The risk summary could not be loaded. The Risk Center will say why.
+          </p>
+        ) : (
+          <>
+            <p className="text-sm leading-relaxed text-foreground">
+              {attentionSentence(counts)}
+            </p>
+            {counts.total > 0 && <BandTally counts={counts} />}
+
+            {/* Nothing is drawn for a band the page found no rows in. An empty
+                list under a count sentence reads as a broken read rather than as
+                an answer, and the sentence above already said what there is. */}
+            {top.isPending && !top.data ? (
+              <div role="status" className="space-y-2">
+                <span className="sr-only">Loading the most severe findings</span>
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-4/5" />
+              </div>
+            ) : rows.length > 0 ? (
+              <ul className="space-y-1.5">
+                {rows.map((risk) => (
+                  <li key={risk.id} className="flex items-center gap-2">
+                    <SeverityBadge severity={risk.severity} size="sm" />
+                    {/* Each row opens the Risk Center already narrowed to its own
+                        band, so the click answers the question the row raised. */}
+                    <Link
+                      to={`/risks?severity=${risk.severity}`}
+                      className="min-w-0 truncate text-sm text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      {risk.title}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+/**
+ * The one sentence the strip leads with.
+ *
+ * Three cases, and they are three different claims rather than one sentence with
+ * a number swapped in: something needs an answer, something is recorded but
+ * nothing is severe, or the engine ran and found nothing. The middle case says
+ * so in plain words rather than printing "0 critical · 0 high", which would read
+ * as a measurement taken rather than a pass completed.
+ */
+function attentionSentence(counts: RiskSummaryRead): string {
+  if (counts.needs_attention) {
+    const urgent = counts.critical + counts.high
+    return `${urgent} item${urgent === 1 ? '' : 's'} need${urgent === 1 ? 's' : ''} attention.`
+  }
+  if (counts.total === 0) return 'No significant risk detected yet.'
+  return 'Nothing is high or critical at the moment.'
+}
+
+/**
+ * The live band counts, with the empty bands left out.
+ *
+ * "0 medium · 0 low" is noise on a summary line: an absent count is not a
+ * finding, and printing four numbers to convey two is the wall-of-zeroes habit
+ * this surface is written against. Each count is written as a word beside its
+ * band, never as a tinted chip, for the reason the badges exist.
+ */
+function BandTally({ counts }: { counts: RiskSummaryRead }) {
+  const bands = ([
+    ['Critical', counts.critical],
+    ['High', counts.high],
+    ['Medium', counts.medium],
+    ['Low', counts.low],
+  ] as const).filter(([, count]) => count > 0)
+
+  if (bands.length === 0) return null
+
+  return (
+    <p className="text-xs text-muted-foreground">
+      Live findings by band:{' '}
+      {bands.map(([label, count]) => `${count} ${label.toLowerCase()}`).join(' · ')}.
+    </p>
   )
 }
 

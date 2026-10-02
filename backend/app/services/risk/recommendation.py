@@ -181,7 +181,12 @@ _MEDIUM_FLOOR: int = next(
 #: so once instead of in eight signatures.
 _Rule = Callable[..., Awaitable["RecommendationDraft | None"]]
 
-_RECOMMENDATION_NOT_FOUND = "Recommendation not found."
+#: Shared with ``app.api.v1.recommendations`` on purpose. The two surfaces
+#: answer the same condition — an id that is not the caller's, and an id
+#: that was never issued — so they must not answer it in two different
+#: sentences. Neither wording leaks which case it was; both simply read
+#: better than a generic 404 body.
+_RECOMMENDATION_NOT_FOUND = "That recommendation does not exist."
 
 
 @dataclass(frozen=True, slots=True)
@@ -1041,6 +1046,19 @@ class RecommendationService:
         if before is None:
             raise NotFoundError(_RECOMMENDATION_NOT_FOUND)
 
+        # Captured as a string, deliberately, before the transition below.
+        #
+        # `before` is the same identity-mapped instance the repository's
+        # `UPDATE ... RETURNING` will refresh (`populate_existing=True`), so
+        # reading `before.status` *after* the transition returns the **target**
+        # status — every lifecycle event then recorded `from_status` equal to
+        # the status it was moving to. That silently flattened the exact
+        # distinction this event exists to preserve: "accepted from viewed" and
+        # "accepted without being read" are different rows in a future training
+        # set, and a `from_status` that always equals the target cannot tell
+        # them apart.
+        from_status = before.status
+
         row = await self.risks.transition_recommendation(
             owner.id, recommendation_id, status=status.value
         )
@@ -1048,7 +1066,7 @@ class RecommendationService:
             await self._raise_unreachable(
                 owner=owner, recommendation_id=recommendation_id, target=status
             )
-        await self._record_event(event, owner=owner, row=row, from_status=before.status)
+        await self._record_event(event, owner=owner, row=row, from_status=from_status)
         return row
 
     async def _raise_unreachable(

@@ -97,7 +97,9 @@ export function RecommendationCard({
             <CardTitle level={titleLevel} className="text-base leading-snug">
               {recommendation.title}
             </CardTitle>
-            <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">
+            <p
+              className="text-[11px] font-semibold uppercase tracking-[0.1em] text-muted-foreground"
+            >
               {recommendation.recommendation_type.replace(/_/g, ' ')}
             </p>
           </div>
@@ -127,7 +129,9 @@ export function RecommendationCard({
           >
             Suggested action
           </h4>
-          <p className="text-sm leading-relaxed text-muted-foreground">{recommendation.description}</p>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            {recommendation.description}
+          </p>
         </section>
 
         <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -148,7 +152,11 @@ export function RecommendationCard({
             (href ? (
               <Link
                 to={href}
-                className="inline-flex items-center gap-1 font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className={cn(
+                  'inline-flex items-center gap-1 font-medium text-foreground',
+                  'underline-offset-2 hover:underline focus-visible:outline-none',
+                  'focus-visible:ring-2 focus-visible:ring-ring',
+                )}
               >
                 View the finding
                 <ExternalLink aria-hidden="true" className="size-3" />
@@ -176,10 +184,11 @@ export function RecommendationCard({
               type="button"
               size="sm"
               variant="outline"
+              aria-busy={isActing}
               disabled={isActing}
               onClick={() => onAccept(recommendation)}
             >
-              {isActing ? <Spinner size="sm" /> : <Check aria-hidden="true" />}
+              {isActing ? <Spinner size="sm" label="" /> : <Check aria-hidden="true" />}
               Accept
             </Button>
           )}
@@ -188,10 +197,11 @@ export function RecommendationCard({
               type="button"
               size="sm"
               variant="outline"
+              aria-busy={isActing}
               disabled={isActing}
               onClick={() => onComplete(recommendation)}
             >
-              {isActing ? <Spinner size="sm" /> : <BadgeCheck aria-hidden="true" />}
+              {isActing ? <Spinner size="sm" label="" /> : <BadgeCheck aria-hidden="true" />}
               Mark completed
             </Button>
           )}
@@ -200,10 +210,11 @@ export function RecommendationCard({
               type="button"
               size="sm"
               variant="ghost"
+              aria-busy={isActing}
               disabled={isActing}
               onClick={() => onReject(recommendation)}
             >
-              {isActing ? <Spinner size="sm" /> : <X aria-hidden="true" />}
+              {isActing ? <Spinner size="sm" label="" /> : <X aria-hidden="true" />}
               Not for me
             </Button>
           )}
@@ -219,8 +230,10 @@ export function RecommendationCard({
           <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <CircleSlash aria-hidden="true" className="size-3.5" />
             {status === 'rejected'
-              ? 'Declined. The underlying condition may still be true, and the suggestion can be raised again if it still applies.'
-              : 'No longer open. It stays on the record as something that was answered or made moot.'}
+              ? 'Declined. The underlying condition may still be true, and the ' +
+                'suggestion can be raised again if it still applies.'
+              : 'No longer open. It stays on the record as something that was answered ' +
+                'or made moot.'}
           </p>
         </CardFooter>
       )}

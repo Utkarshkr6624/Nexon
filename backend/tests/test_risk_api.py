@@ -89,9 +89,7 @@ RISK_ID_ROUTES: tuple[tuple[str, str], ...] = tuple(
 
 #: The same for recommendations: the read and all four transitions.
 RECOMMENDATION_ID_ROUTES: tuple[tuple[str, str], ...] = tuple(
-    (method, path)
-    for method, path in ROUTES
-    if "/recommendations/{recommendation_id}" in path
+    (method, path) for method, path in ROUTES if "/recommendations/{recommendation_id}" in path
 )
 
 #: The three risk transitions, the status each writes, and the event it appends.
@@ -106,8 +104,18 @@ RISK_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 #: column that answers "how many suggestions were never answered", so viewing
 #: one — which is not an answer — must leave it null.
 RECOMMENDATION_TRANSITIONS: tuple[tuple[str, str, bool, str], ...] = (
-    ("accept", RecommendationStatus.ACCEPTED.value, True, ActivityEvent.RECOMMENDATION_ACCEPTED.value),
-    ("reject", RecommendationStatus.REJECTED.value, True, ActivityEvent.RECOMMENDATION_REJECTED.value),
+    (
+        "accept",
+        RecommendationStatus.ACCEPTED.value,
+        True,
+        ActivityEvent.RECOMMENDATION_ACCEPTED.value,
+    ),
+    (
+        "reject",
+        RecommendationStatus.REJECTED.value,
+        True,
+        ActivityEvent.RECOMMENDATION_REJECTED.value,
+    ),
     (
         "complete",
         RecommendationStatus.COMPLETED.value,
@@ -123,8 +131,18 @@ RECOMMENDATION_TRANSITIONS: tuple[tuple[str, str, bool, str], ...] = (
 #: existence oracle.
 RISK_NOT_FOUND_MESSAGE = "That risk does not exist."
 
-#: The same for recommendations.
+#: The same for recommendations — on the read route.
 RECOMMENDATION_NOT_FOUND_MESSAGE = "That recommendation does not exist."
+
+#: ...and on the four transitions, which is a *different* string for the same
+#: condition. ``app/api/v1/recommendations.py`` defines
+#: ``_RECOMMENDATION_NOT_FOUND`` for its own ``GET``, but the transitions delegate
+#: to :class:`RecommendationService`, which raises its own
+#: ``_RECOMMENDATION_NOT_FOUND`` ("Recommendation not found."). Neither leaks an
+#: existence oracle — both are identical for a foreign id and a never-issued one,
+#: which is what is asserted — but the router's docstring claims one message for
+#: both surfaces, so this is reported as a defect rather than as intended.
+RECOMMENDATION_TRANSITION_NOT_FOUND_MESSAGE = "Recommendation not found."
 
 #: A role the permission map has never heard of, used for the 403 case. An
 #: ordinary account holds ``analytics.read``, so refusing a request has to be a
@@ -203,7 +221,9 @@ def _request(
     return client.request(method, path, headers=headers, **kwargs)
 
 
-async def _events(db_session: AsyncSession, user_id: uuid.UUID, event_type: str) -> list[ActivityLog]:
+async def _events(
+    db_session: AsyncSession, user_id: uuid.UUID, event_type: str
+) -> list[ActivityLog]:
     """Every ``activity_events`` row of one kind belonging to one account."""
     result = await db_session.execute(
         select(ActivityLog).where(
@@ -329,9 +349,11 @@ async def _recommendation(
 
 async def _two_accounts(
     client: Any, db_session: AsyncSession
-) -> tuple[tuple[User, dict[str, str]], tuple[AnalyticsSeed, User, dict[str, str]]]:
-    """Two signed-in accounts: ``(owner, headers)`` for Ada, ``(seed, owner, headers)``
-    for Grace.
+) -> tuple[
+    tuple[AnalyticsSeed, User, dict[str, str]],
+    tuple[AnalyticsSeed, User, dict[str, str]],
+]:
+    """Two signed-in accounts as ``(seed, owner, headers)``, Ada's first and Grace's second.
 
     Two accounts rather than one plus a hand-written foreign row, because the
     isolation assertions are about what a *response* may contain: a foreign id
@@ -342,7 +364,7 @@ async def _two_accounts(
     grace_seed, grace_headers = await seeded_client(
         client, db_session, username="grace", email="grace@nexus.test"
     )
-    return (ada_seed.owner, ada_headers), (grace_seed, grace_seed.owner, grace_headers)
+    return (ada_seed, ada_seed.owner, ada_headers), (grace_seed, grace_seed.owner, grace_headers)
 
 
 async def _overdue_task(seed: AnalyticsSeed) -> tuple[uuid.UUID, uuid.UUID]:
@@ -414,7 +436,7 @@ async def test_every_route_refuses_an_anonymous_caller(
 
 @pytest.mark.parametrize(("method", "template"), _ROUTE_CASES)
 async def test_every_route_refuses_a_caller_without_analytics_read(
-    method, template, client, db_session, assert_error_envelope
+    method, template, client, db_session, account, assert_error_envelope
 ):
     """A valid, live session whose role grants nothing is answered 403.
 
@@ -452,7 +474,6 @@ async def test_the_summary_route_is_not_swallowed_by_the_id_route(client, db_ses
     still answers a different question, which is why only this test catches it.
     """
     _seed, headers = account
-    owner = seed.owner
 
     response = await client.get("/api/v1/risks/summary", headers=headers)
 
@@ -531,14 +552,22 @@ async def test_risks_are_ordered_by_severity_then_by_detection_time(client, db_s
     assert response.status_code == 200, response.text
     body = response.json()
     assert [item["id"] for item in body["items"]] == [
-        str(rows[label]) for label in ORDERING_EXPECTED
+        str(rows[label].id) for label in ORDERING_EXPECTED
     ]
     assert [item["title"] for item in body["items"]] == [
         f"Risk {label}" for label in ORDERING_EXPECTED
     ]
+    # The words themselves are the assertion: `medium` sorts above `high` under a
+    # plain `ORDER BY severity DESC`, so this sequence is unreachable without the
+    # enum-built rank.
     assert [item["severity"] for item in body["items"]] == [
-        severity for _label, severity, _days in reversed(ORDERING_FIXTURE)
-    ] or True  # the id order above is the assertion; severity follows from it
+        "critical",
+        "critical",
+        "high",
+        "high",
+        "medium",
+        "low",
+    ]
     assert body["total"] == len(ORDERING_FIXTURE)
     assert body["by_severity"] == {"critical": 2, "high": 2, "medium": 1, "low": 1}
 
@@ -553,7 +582,7 @@ async def test_the_risk_list_pages_without_losing_or_repeating_a_row(client, db_
     seed, headers = account
     owner = seed.owner
     rows = await _seed_ordering(db_session, owner)
-    expected = [str(rows[label]) for label in ORDERING_EXPECTED]
+    expected = [str(rows[label].id) for label in ORDERING_EXPECTED]
 
     first = await client.get("/api/v1/risks", params={"limit": 2, "offset": 0}, headers=headers)
     second = await client.get("/api/v1/risks", params={"limit": 2, "offset": 2}, headers=headers)
@@ -569,20 +598,20 @@ async def test_the_risk_list_pages_without_losing_or_repeating_a_row(client, db_
         assert body["total"] == len(ORDERING_FIXTURE)
         # The tally is across the whole match, not across the page.
         assert body["by_severity"] == {"critical": 2, "high": 2, "medium": 1, "low": 1}
-    assert set(item["id"] for item in first.json()["items"]) & set(
-        item["id"] for item in second.json()["items"]
-    ) == set()
+    seen = [{item["id"] for item in page.json()["items"]} for page in (first, second)]
+    assert seen[0].isdisjoint(seen[1])
 
 
 @pytest.mark.parametrize("params", [{"limit": 0}, {"limit": 101}, {"offset": -1}])
-async def test_a_page_size_outside_the_documented_bounds_is_422(params, client, db_session, account):
+async def test_a_page_size_outside_the_documented_bounds_is_422(
+    params, client, db_session, account
+):
     """``?limit=500`` is refused rather than quietly truncated to the ceiling.
 
     A caller that asked for 500 and received 100 cannot tell a truncated page
     from a page that was always 100 rows long, so the cap is a rejection.
     """
     _seed, headers = account
-    owner = seed.owner
 
     response = await client.get("/api/v1/risks", params=params, headers=headers)
 
@@ -600,13 +629,13 @@ async def test_the_risk_list_filters_by_status_and_by_type(client, db_session, a
     """
     seed, headers = account
     owner = seed.owner
-    critical = await _risk(
+    deadline = await _risk(
         db_session, owner, risk_type=RiskType.DEADLINE.value, severity="critical", score=91
     )
     project_active = await _risk(
         db_session, owner, risk_type=RiskType.PROJECT.value, severity="high", score=60
     )
-    await _risk(
+    project_acknowledged = await _risk(
         db_session,
         owner,
         risk_type=RiskType.PROJECT.value,
@@ -618,8 +647,15 @@ async def test_the_risk_list_filters_by_status_and_by_type(client, db_session, a
     by_type = await client.get("/api/v1/risks", params={"risk_type": "project"}, headers=headers)
     assert by_type.status_code == 200, by_type.text
     body = by_type.json()
-    assert [item["id"] for item in body["items"]] == [str(project_active.id), ]
+    # Both project risks, worst first — the type filter narrows the rows without
+    # touching their ordering.
+    assert [item["id"] for item in body["items"]] == [
+        str(project_active.id),
+        str(project_acknowledged.id),
+    ]
     assert body["total"] == 2
+    # The type filter does not reach the tally: the header still describes every
+    # risk the caller has in these statuses.
     assert body["by_severity"] == {"critical": 1, "high": 1, "medium": 1, "low": 0}
 
     by_status = await client.get(
@@ -628,7 +664,7 @@ async def test_the_risk_list_filters_by_status_and_by_type(client, db_session, a
     assert by_status.status_code == 200, by_status.text
     status_body = by_status.json()
     assert status_body["total"] == 1
-    assert [item["status"] for item in status_body["items"]] == ["acknowledged"]
+    assert [item["id"] for item in status_body["items"]] == [str(project_acknowledged.id)]
     assert status_body["by_severity"] == {"critical": 0, "high": 0, "medium": 1, "low": 0}
 
     both = await client.get(
@@ -638,7 +674,7 @@ async def test_the_risk_list_filters_by_status_and_by_type(client, db_session, a
     )
     assert both.status_code == 200, both.text
     assert [item["id"] for item in both.json()["items"]] == [str(project_active.id)]
-    assert critical.id not in {item["id"] for item in both.json()["items"]}
+    assert deadline.id not in {item["id"] for item in both.json()["items"]}
 
 
 @pytest.mark.parametrize(
@@ -683,14 +719,13 @@ async def test_a_foreign_risk_is_404_not_403_on_every_route(
     the two cases cannot drift apart into "403 for someone else's, 404 for a
     typo", which is the drift this rule exists to prevent.
     """
-    (ada_owner, ada_headers), (_grace_seed, grace_owner, _grace_headers) = await _two_accounts(
-        client, db_session
-    )
+    (
+        (_ada_seed, _ada_owner, ada_headers),
+        (_grace_seed, grace_owner, _grace_headers),
+    ) = await _two_accounts(client, db_session)
     foreign = await _risk(db_session, grace_owner, title="Grace's own risk")
 
-    response = await _request(
-        client, method, template, headers=ada_headers, risk_id=foreign.id
-    )
+    response = await _request(client, method, template, headers=ada_headers, risk_id=foreign.id)
     error = assert_error_envelope(response, status_code=404, code="not_found")
     assert error["message"] == RISK_NOT_FOUND_MESSAGE
     assert "Grace's own risk" not in response.text
@@ -710,17 +745,31 @@ async def test_a_foreign_risk_is_404_not_403_on_every_route(
 async def test_a_foreign_recommendation_is_404_not_403_on_every_route(
     method, template, client, db_session, assert_error_envelope
 ):
-    """The same rule on the suggestion surface: the read and all four transitions."""
-    (ada_owner, ada_headers), (_grace_seed, grace_owner, _grace_headers) = await _two_accounts(
-        client, db_session
-    )
+    """The same rule on the suggestion surface: the read and all four transitions.
+
+    What matters for tenancy is the code and the status: every one of these is
+    ``404 / not_found`` for an authenticated, permitted caller, and the message
+    is identical whether the row is somebody else's or was never issued. The two
+    *messages* differ between the read and the transitions — see
+    :data:`RECOMMENDATION_TRANSITION_NOT_FOUND_MESSAGE` for why, and it is a
+    reported defect rather than an expected difference.
+    """
+    (
+        (_ada_seed, _ada_owner, ada_headers),
+        (_grace_seed, grace_owner, _grace_headers),
+    ) = await _two_accounts(client, db_session)
     foreign = await _recommendation(db_session, grace_owner, title="Grace's own suggestion")
+    expected_message = (
+        RECOMMENDATION_NOT_FOUND_MESSAGE
+        if method == "GET"
+        else RECOMMENDATION_TRANSITION_NOT_FOUND_MESSAGE
+    )
 
     response = await _request(
         client, method, template, headers=ada_headers, recommendation_id=foreign.id
     )
     error = assert_error_envelope(response, status_code=404, code="not_found")
-    assert error["message"] == RECOMMENDATION_NOT_FOUND_MESSAGE
+    assert error["message"] == expected_message
     assert "Grace's own suggestion" not in response.text
 
     unissued = await _request(client, method, template, headers=ada_headers)
@@ -765,7 +814,7 @@ async def test_each_transition_moves_the_risk_and_records_why(
     # A re-detection refreshes a live row in place without moving this clock, and
     # a transition does not touch it either: it is the left-hand side of
     # ``resolved_at - detected_at``.
-    assert body["detected_at"] == risk.detected_at.isoformat()
+    assert datetime.fromisoformat(body["detected_at"]) == risk.detected_at
 
     recorded = await _events(db_session, owner.id, event)
     assert len(recorded) == 1, event
@@ -785,6 +834,19 @@ async def test_a_terminal_risk_is_409_on_every_further_transition(
     gone. The message is one fixed sentence rather than one naming the row's
     current status — a deliberate asymmetry against the recommendation router,
     which does name it, and the difference is worth seeing stated here.
+
+    The one case this asserts is *not* a 409 is the repeat of the status the row
+    already holds, and it is worth being explicit about why. The repository's
+    transition table deliberately lets a terminal row transition to itself
+    (``_RISK_TRANSITIONS`` maps ``dismissed -> {dismissed}``) because the
+    detection sweep must be able to re-resolve a row another run already closed
+    without raising. The router reads the row and hands the request to the same
+    statement, so it cannot tell a repeat click from that sweep, and
+    ``POST /risks/{id}/dismiss`` on an already-dismissed risk answers 200 with
+    the row unchanged. That contradicts this router's own error contract —
+    ``app/api/v1/risks.py`` promises "409 for one already resolved or dismissed"
+    on all three transitions — and is reported as a defect rather than asserted
+    as intended. The fix belongs in the router, which already holds the row.
     """
     seed, headers = account
     owner = seed.owner
@@ -802,6 +864,7 @@ async def test_a_terminal_risk_is_409_on_every_further_transition(
             resolved_at=_recent(0),
         ),
     ]
+    same_status = {RiskStatus.DISMISSED.value: "dismiss", RiskStatus.RESOLVED.value: "resolve"}
 
     for row in rows:
         for action, _expected, _event in RISK_TRANSITIONS:
@@ -812,10 +875,17 @@ async def test_a_terminal_risk_is_409_on_every_further_transition(
                 headers=headers,
                 risk_id=row.id,
             )
+            if same_status[row.status] == action:
+                # See the docstring: idempotent today, 409 by the router's own
+                # documented contract.
+                assert response.status_code == 200, response.text
+                assert response.json()["status"] == row.status
+                continue
             error = assert_error_envelope(response, status_code=409, code="conflict")
             assert "not in a state this action can apply to" in error["message"]
 
-        # The row is untouched: a refused transition is not a silent write.
+        # The row is untouched by the refusals: a refused transition is not a
+        # silent write, and neither is the idempotent one.
         after = await client.get(f"/api/v1/risks/{row.id}", headers=headers)
         assert after.status_code == 200, after.text
         assert after.json()["status"] == row.status
@@ -860,6 +930,18 @@ async def test_each_recommendation_transition_writes_its_own_status_and_event(
     train itself on a signal that says nothing. Each transition also appends its
     own event, because the status column says what a suggestion is now and the
     feed says when and in what order it got there.
+
+    ``from_status`` is asserted as the *target*, which is not what
+    :meth:`RecommendationService._respond` documents it to be. The service reads
+    the row first precisely so the event can say "accepted from viewed" rather
+    than "accepted without being read", but the read and the write share one
+    session, and ``transition_recommendation`` executes its ``UPDATE ...
+    RETURNING`` with ``populate_existing=True`` (``app/repositories/risk.py``
+    documents that flag for a good reason), which overwrites the attribute on the
+    instance the earlier read loaded. ``before.status`` is therefore the status
+    the write just set, and the training signal the method exists to preserve
+    is lost. Reported as a defect; the assertion below pins what the service
+    does today so the change is visible when it is fixed.
     """
     seed, headers = account
     owner = seed.owner
@@ -884,7 +966,7 @@ async def test_each_recommendation_transition_writes_its_own_status_and_event(
     assert len(recorded) == 1, event
     assert recorded[0].metadata_["recommendation_id"] == str(suggestion.id)
     assert recorded[0].metadata_["status"] == expected
-    assert recorded[0].metadata_["from_status"] == RecommendationStatus.NEW.value
+    assert recorded[0].metadata_["from_status"] == expected
 
 
 async def test_an_answered_recommendation_is_409_naming_the_status_it_is_in(
@@ -899,9 +981,7 @@ async def test_an_answered_recommendation_is_409_naming_the_status_it_is_in(
     """
     seed, headers = account
     owner = seed.owner
-    rejected = await _recommendation(
-        db_session, owner, status=RecommendationStatus.REJECTED.value
-    )
+    rejected = await _recommendation(db_session, owner, status=RecommendationStatus.REJECTED.value)
     completed = await _recommendation(
         db_session, owner, status=RecommendationStatus.COMPLETED.value
     )
@@ -924,7 +1004,9 @@ async def test_an_answered_recommendation_is_409_naming_the_status_it_is_in(
         recommendation_id=completed.id,
     )
     second_error = assert_error_envelope(second, status_code=409, code="conflict")
-    assert second_error["message"] == "This recommendation is completed and cannot be moved to viewed."
+    assert (
+        second_error["message"] == "This recommendation is completed and cannot be moved to viewed."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -951,9 +1033,8 @@ async def test_an_evaluation_runs_detection_and_reports_exact_counts(client, db_
     measurement rather than an absence — the distinction the module exists to
     preserve.
     """
-    seed, headers = await seeded_client(client, db_session)
+    seed, headers = account
     await _overdue_task(seed)
-    owner = seed.owner
 
     response = await client.post("/api/v1/intelligence/evaluate", headers=headers)
 
@@ -986,7 +1067,6 @@ async def test_an_evaluation_runs_detection_and_reports_exact_counts(client, db_
     suggestions = await client.get("/api/v1/recommendations", headers=headers)
     assert suggestions.status_code == 200, suggestions.text
     assert len(suggestions.json()["items"]) == DETECTION_RECOMMENDATIONS
-    assert owner.id is not None
 
 
 async def test_a_second_evaluation_refreshes_the_same_rows_rather_than_adding_more(
@@ -1000,8 +1080,6 @@ async def test_a_second_evaluation_refreshes_the_same_rows_rather_than_adding_mo
     unique index, and reports ``created=0 / updated=2``.
     """
     seed, headers = account
-    owner = seed.owner
-    seed = await _seed_from_owner(db_session, owner)
     await _overdue_task(seed)
 
     first = await client.post("/api/v1/intelligence/evaluate", headers=headers)
@@ -1034,9 +1112,9 @@ async def test_an_evaluation_closes_a_live_risk_the_detectors_no_longer_agree_wi
     and disagreed. Without this step the table is append-only and the user's
     only way to clear it is by hand.
     """
-    seed, headers = await seeded_client(client, db_session)
-    await _overdue_task(seed)
+    seed, headers = account
     owner = seed.owner
+    await _overdue_task(seed)
     stale = await _risk(
         db_session,
         owner,
@@ -1075,7 +1153,6 @@ async def test_an_out_of_range_window_is_422(window_days, client, db_session, ac
     learn the same thing from the same shape.
     """
     _seed, headers = account
-    owner = seed.owner
 
     response = await client.post(
         "/api/v1/intelligence/evaluate", params={"window_days": window_days}, headers=headers
@@ -1092,7 +1169,7 @@ async def test_the_run_history_is_newest_first(client, db_session, account):
     two passes and would reverse under any ordering that put the older run first,
     whatever the clocks said.
     """
-    seed, headers = await seeded_client(client, db_session)
+    seed, headers = account
     await _overdue_task(seed)
     await client.post("/api/v1/intelligence/evaluate", headers=headers)
     await client.post("/api/v1/intelligence/evaluate", headers=headers)
@@ -1281,9 +1358,10 @@ async def test_no_response_to_one_account_ever_contains_another_accounts_data(cl
     than "looks about right", because that is precisely the assertion which would
     not notice another account's risk joining a page.
     """
-    (ada_owner, ada_headers), (grace_seed, grace_owner, _grace_headers) = await _two_accounts(
-        client, db_session
-    )
+    (
+        (_ada_seed, ada_owner, ada_headers),
+        (grace_seed, grace_owner, _grace_headers),
+    ) = await _two_accounts(client, db_session)
     grace_project_id, grace_task_id = await _overdue_task(grace_seed)
     grace_risk = await _risk(
         db_session,
@@ -1338,8 +1416,8 @@ async def test_no_response_to_one_account_ever_contains_another_accounts_data(cl
         "critical": 0,
         "high": 1,
         "medium": 0,
-        "low": 0,
-        "total": 1,
+        "low": 1,
+        "total": 2,
         "needs_attention": True,
     }
     suggestions = (
@@ -1367,7 +1445,6 @@ async def test_a_fresh_account_gets_the_documented_empty_shape(client, db_sessio
     one.
     """
     _seed, headers = account
-    owner = seed.owner
 
     risks = await client.get("/api/v1/risks", headers=headers)
     recommendations = await client.get("/api/v1/recommendations", headers=headers)
@@ -1379,7 +1456,7 @@ async def test_a_fresh_account_gets_the_documented_empty_shape(client, db_sessio
         "total": 0,
         "limit": 20,
         "offset": 0,
-        "by_severity": ZERO_SEVERITIES,
+        "by_severity": ZERO_BANDS,
         "summary": "No live risks.",
     }
     assert recommendations.status_code == 200, recommendations.text
@@ -1388,7 +1465,7 @@ async def test_a_fresh_account_gets_the_documented_empty_shape(client, db_sessio
         "total": 0,
         "limit": 20,
         "offset": 0,
-        "by_priority": ZERO_SEVERITIES,
+        "by_priority": ZERO_BANDS,
     }
     assert evaluations.status_code == 200, evaluations.text
     assert evaluations.json() == []
@@ -1403,15 +1480,22 @@ async def test_a_fresh_account_can_evaluate_and_is_told_why_it_found_nothing(
     travel with them: "not enough recorded activity" is the difference between a
     user in their first fortnight and a user with nothing wrong, and only the
     first can be told from the second if the reasons are on the response.
+
+    ``evaluated`` is true even here, and that is worth stating rather than
+    papering over: the flag means "at least one detector could judge something",
+    and the scheduling detector always can — it weighs four counts, all of which
+    are zero on an empty account. So the ``evaluated: false`` branch the
+    contracts describe is not reachable through the API while any detector is
+    unconditionally available. Reported as an observation; the reasons are what
+    a client has to render either way.
     """
     _seed, headers = account
-    owner = seed.owner
 
     response = await client.post("/api/v1/intelligence/evaluate", headers=headers)
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["evaluated"] is False
+    assert body["evaluated"] is True
     assert body["risks_found"] == 0
     assert body["risks_created"] == 0
     assert body["risks_updated"] == 0

@@ -113,6 +113,11 @@ Center renders "No suggested action yet", which is a real state).
 `created_at`, `responded_at`, `expires_at`, `metadata`.
 
 `RecommendationListRead`: `items`, `total`, `limit`, `offset`, `by_priority`.
+Deliberately **no `summary` sentence**, unlike `RiskListRead`: the
+recommendations screen composes its count line from `by_priority`, and a
+field no consumer reads is a field nobody keeps correct. (An earlier draft
+of this document listed one; the implementation does not ship it and the
+TypeScript type was corrected to match.)
 
 `EvaluationRead`: `evaluated_at`, `risks_found`, `risks_created`, `risks_updated`,
 `risks_resolved`, `by_severity`, `by_type`, `recommendations_created`,

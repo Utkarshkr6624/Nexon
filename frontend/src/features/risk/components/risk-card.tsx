@@ -138,7 +138,10 @@ export function RiskCard({
           {href ? (
             <Link
               to={href}
-              className="font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className={cn(
+                'font-medium text-foreground underline-offset-2 hover:underline',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              )}
             >
               {entityText}
             </Link>
@@ -174,7 +177,9 @@ export function RiskCard({
                       {formatSigned(item.contribution, 1)}
                     </p>
                   </div>
-                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{item.detail}</p>
+                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                    {item.detail}
+                  </p>
                 </li>
               ))}
             </ul>
@@ -233,7 +238,9 @@ export function RiskCard({
 
         <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           <span title={risk.detected_at}>Detected {formatRelative(risk.detected_at)}</span>
-          {risk.resolved_at && <span title={risk.resolved_at}>Closed {formatRelative(risk.resolved_at)}</span>}
+          {risk.resolved_at && (
+            <span title={risk.resolved_at}>Closed {formatRelative(risk.resolved_at)}</span>
+          )}
           <span className="capitalize">{risk.risk_type} check</span>
         </p>
 
@@ -247,10 +254,11 @@ export function RiskCard({
               type="button"
               size="sm"
               variant="outline"
+              aria-busy={isActing}
               disabled={isActing}
               onClick={() => onAcknowledge(risk)}
             >
-              {isActing ? <Spinner size="sm" /> : <Eye aria-hidden="true" />}
+              {isActing ? <Spinner size="sm" label="" /> : <Eye aria-hidden="true" />}
               Acknowledge
             </Button>
           )}
@@ -259,10 +267,11 @@ export function RiskCard({
               type="button"
               size="sm"
               variant="outline"
+              aria-busy={isActing}
               disabled={isActing}
               onClick={() => onResolve(risk)}
             >
-              {isActing ? <Spinner size="sm" /> : <Check aria-hidden="true" />}
+              {isActing ? <Spinner size="sm" label="" /> : <Check aria-hidden="true" />}
               Mark resolved
             </Button>
           )}
@@ -271,10 +280,11 @@ export function RiskCard({
               type="button"
               size="sm"
               variant="ghost"
+              aria-busy={isActing}
               disabled={isActing}
               onClick={() => onDismiss(risk)}
             >
-              {isActing ? <Spinner size="sm" /> : <CircleSlash aria-hidden="true" />}
+              {isActing ? <Spinner size="sm" label="" /> : <CircleSlash aria-hidden="true" />}
               Dismiss
             </Button>
           )}

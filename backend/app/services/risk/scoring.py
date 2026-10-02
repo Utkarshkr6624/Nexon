@@ -53,6 +53,8 @@ from app.models.enums import EvidenceStrength, RiskSeverity, RiskType
 __all__ = [
     "DEFAULT_SEVERITY_THRESHOLDS",
     "NOT_ENOUGH_DATA",
+    "TASK_RESCHEDULE_THRESHOLD",
+    "TASK_WEIGHTS",
     "RiskEvidence",
     "RiskResult",
     "consistency_risk",
@@ -62,6 +64,7 @@ __all__ = [
     "project_risk",
     "risk_severity_for",
     "scheduling_risk",
+    "task_risk",
     "workload_risk",
 ]
 
@@ -156,7 +159,10 @@ class RiskEvidence:
 
     label: str
     detail: str
-    #: Points of the 0-100 score this line accounts for. Sums to ``score``.
+    #: Points of the 0-100 score this line accounts for. The lines that move
+    #: the number account for ``score`` to within rounding — the score is a whole
+    #: number, each share is carried as an unrounded float until serialisation, so
+    #: an estimation risk scoring 83 can carry a leading line of 83.33.
     contribution: float
 
 
@@ -216,8 +222,23 @@ def _result(
     so the score is rounded, clamped and paired with its evidence strength in one
     place — a detector that rounded its own score differently from another is how
     two risks with the same inputs get different bands.
+
+    **A score that rounds to zero is zero, not one.** The value that reached
+    here was ``0.10 * 0.05 * 100`` — one unfinished task in a project, weighted
+    at 0.10 and scaled by ``1 / 20`` — which is exactly 0.5, and binary floating
+    point renders it as ``0.5000000000000001``. ``round`` sends that to 1, so a
+    project with a single open task always produced a stored score-1 ``low``
+    risk and the detection service's "a measured zero writes nothing" rule
+    could not discard it.
+
+    Snapping to six decimals before rounding to an integer removes the
+    representation noise without discarding a real distinction: the nearest
+    genuine score to 0.5 that any of these weights can produce differs from it
+    by far more than 1e-6, and the sub-1e-6 remainder is exactly the part that
+    is not a measurement. Python's banker's rounding then sends an exact 0.5 to
+    0, which is the honest answer for "a tenth of a point".
     """
-    bounded = max(0, min(100, round(score)))
+    bounded = max(0, min(100, round(round(score, 6))))
     return RiskResult(
         risk_type=risk_type,
         score=bounded,
@@ -1033,5 +1054,151 @@ def scheduling_risk(
         score=score,
         evidence=evidence,
         samples=overlapping_sessions + outside_availability_sessions + sessions_after_deadline,
+        metadata=meta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task risk
+# ---------------------------------------------------------------------------
+
+#: The two task-level sub-signals and what each contributes to the 0-100 score.
+#: Named, weighted and summed here rather than split across the two rules that
+#: read them, for the same reason :data:`PROJECT_WEIGHTS` is one table: "why is
+#: this task at HIGH" has to have one answerable location.
+#:
+#: Blocked carries more because it is the more durable condition. A reschedule is
+#: a move the user made for a reason the data does not record — a meeting, a
+#: re-estimate, a changed priority — and a task moved once for any of those is
+#: not yet a pattern. Blocked work, by contrast, has an unbounded remaining
+#: duration and stalls whatever depends on it, which is why the project detector
+#: ranks the same signal second among its five.
+TASK_WEIGHTS: dict[str, float] = {
+    "blocked": 0.60,
+    "rescheduled": 0.40,
+}
+
+#: Recorded reschedules of one task before the reschedule sub-signal is a signal
+#: rather than a fact about a calendar. Three is the number the Phase 7 contracts
+#: name, and it is the number
+#: :data:`app.services.risk.recommendation.MIN_RESCHEDULES` gates the
+#: break-it-down suggestion on: the detector and the rule that reads it have to
+#: agree about what "repeatedly rescheduled" means, or a risk can be raised for a
+#: condition no suggestion will ever speak to.
+TASK_RESCHEDULE_THRESHOLD = 3
+
+
+def task_risk(*, blocked: bool = False, reschedules: int = 0, title: str = "") -> RiskResult:
+    """Is this one task blocked, or moved too often to find a place for.
+
+    A weighted sum of two binary signals::
+
+        blocked     = 1.0 if the task is in the blocked status else 0.0
+        rescheduled = 1.0 if reschedules >= 3 else 0.0
+
+        score = round(100 * (0.60*blocked + 0.40*rescheduled))
+
+    So one blocked task scores **60 — HIGH**, three recorded reschedules score
+    **40 — MEDIUM**, and a task carrying both reaches **100 — CRITICAL**.
+
+    **Both signals are binary, deliberately.** A blocked task has no count to
+    divide by — its remaining duration is unbounded rather than large, so one is
+    exactly as blocking as five and scaling by a number of blocked tasks would
+    only be scaling by how much of the plan the user has already noticed. Reschedules
+    are binary for the opposite reason: the available action is identical at four
+    as at nine, and a ramp would let a task moved nine times outrank one that
+    cannot be worked on at all, which is the wrong order for the same list.
+
+    This is the only detector scoped to a single row, and that is the point of
+    it. The others answer questions about a window or a plan; blocked work
+    and repeated rescheduling are properties of *one task*, and the project
+    detector cannot express them — it can only count how many of a project's
+    tasks are blocked, which says something about the project and nothing about
+    the one task the suggestion has to name.
+
+    The wording is about the record. A task that has been moved four times is
+    described as having been moved four times, and the evidence line stops there:
+    whether it is too large, badly specified, or simply repeatedly interrupted
+    is a judgement the rows do not carry, and the suggestion that follows offers
+    one action rather than a diagnosis.
+
+    Args:
+        blocked: Whether the task is in the blocked status **now**. A task
+            unblocked since the previous pass reads as not blocked, so the
+            condition has to be re-measured rather than remembered.
+        reschedules: ``TASK_RESCHEDULED`` events recorded against this task. A
+            reschedule is a due-date edit with no column of its own, so the event
+            feed is the only place the fact exists — and it is a count over the
+            task's whole history rather than over a window, because a condition
+            that aged out of a window would make a risk appear and then vanish
+            without anything about the task changing.
+        title: The task's title, echoed into the metadata so a caller can build a
+            risk row without a second lookup.
+
+    Returns:
+        A scored result. Always available: every input is a status and a count, so
+        a zero score means "neither condition is present", which is a measurement
+        a caller can act on — the run summary records it and no row is written.
+    """
+    meta: dict[str, Any] = {
+        "blocked": bool(blocked),
+        "reschedules": int(reschedules),
+        "reschedule_threshold": TASK_RESCHEDULE_THRESHOLD,
+    }
+    if title:
+        meta["title"] = title
+
+    signals: dict[str, float] = {}
+    evidence: list[RiskEvidence] = []
+
+    if blocked:
+        signals["blocked"] = 1.0
+        evidence.append(
+            RiskEvidence(
+                label="Task is blocked",
+                detail="recorded in the blocked status, so its remaining work cannot be placed",
+                contribution=100 * TASK_WEIGHTS["blocked"],
+            )
+        )
+
+    if reschedules >= TASK_RESCHEDULE_THRESHOLD:
+        signals["rescheduled"] = 1.0
+        evidence.append(
+            RiskEvidence(
+                label="Repeatedly rescheduled",
+                detail=(
+                    f"{reschedules} reschedules recorded against this task, against a "
+                    f"threshold of {TASK_RESCHEDULE_THRESHOLD}"
+                ),
+                contribution=100 * TASK_WEIGHTS["rescheduled"],
+            )
+        )
+
+    score = sum(TASK_WEIGHTS[key] * value for key, value in signals.items()) * 100
+    meta["signals"] = {key: round(value, 4) for key, value in signals.items()}
+
+    if not evidence:
+        evidence.append(
+            RiskEvidence(
+                label="No task-level condition recorded",
+                detail=(
+                    "not blocked, and "
+                    f"{reschedules} reschedule(s) against a threshold of "
+                    f"{TASK_RESCHEDULE_THRESHOLD}"
+                ),
+                contribution=0.0,
+            )
+        )
+
+    return _result(
+        RiskType.TASK,
+        score=score,
+        evidence=evidence,
+        # The blocked status is one authoritative row and each reschedule is one
+        # observed event, so the sample count is the number of facts behind the
+        # score. It stays `LOW` for the ordinary cases — a lone blocked task is
+        # drawn from a single row — and only reaches `MEDIUM` for a task that has
+        # both a blocked status and a history of nine moves behind it.
+        samples=(1 if blocked else 0) + max(0, int(reschedules)),
         metadata=meta,
     )

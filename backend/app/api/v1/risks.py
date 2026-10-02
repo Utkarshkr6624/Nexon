@@ -135,6 +135,11 @@ _RISK_NOT_TRANSITIONABLE = (
     "been resolved or dismissed cannot be acknowledged, dismissed or resolved again."
 )
 
+#: The statuses from which no further move is possible. Read by the transition
+#: helper to answer a repeat of a risk's *own* terminal status with a 409, which
+#: the repository's ladder deliberately permits for the detection sweep.
+_TERMINAL_RISK_STATUSES = frozenset({RiskStatus.RESOLVED.value, RiskStatus.DISMISSED.value})
+
 
 async def _recommendations_by_risk(
     session: AsyncSession,
@@ -262,6 +267,15 @@ async def _transition(
     row = await risks.get_risk(current_user.id, risk_id)
     if row is None:
         raise NotFoundError(_RISK_NOT_FOUND)
+    # The repository's ladder permits a self-transition on a terminal row
+    # (`resolved -> resolved`), because the detection sweep needs to re-resolve a
+    # row another run already closed without failing. That is right for the
+    # sweep and wrong for this endpoint: a user who clicks "dismiss" on a risk
+    # that is already dismissed should be told so, not handed a cheerful 200
+    # and a second dismissal event. Answered here rather than in the repository
+    # because the two callers genuinely want different answers.
+    if row.status == target.value and row.status in _TERMINAL_RISK_STATUSES:
+        raise ConflictError(_RISK_NOT_TRANSITIONABLE)
     updated = await risks.transition_risk(
         current_user.id, risk_id, status=target.value, responded=True
     )

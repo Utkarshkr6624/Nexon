@@ -2,7 +2,7 @@
 
 The shape of a pass
 -------------------
-:meth:`RiskDetectionService.evaluate` is one read, six detectors, and one
+:meth:`RiskDetectionService.evaluate` is one read, seven detectors, and one
 reconciliation. The detectors themselves live in :mod:`app.services.risk.scoring`
 as pure functions; everything this module adds is the part that needs a database
 — the reads, the bookkeeping, and the decision about what to persist.
@@ -56,6 +56,30 @@ only its mean; and the per-row task and project detail, because every Phase 6
 project and task roll-up is an aggregate and an aggregate cannot answer a
 question about one row.
 
+A third read is assembled here rather than taken from a collaborator: the
+per-task reschedule counts behind the task-level detector. A reschedule is a
+due-date edit and has no column of its own anywhere in the schema, so the event
+feed is the only place the fact exists — and the count has to be grouped *by
+task*, which is the one shape
+:meth:`~app.repositories.analytics.AnalyticsRepository.task_event_count` does not
+return. Asking for it once per candidate task instead would put an N+1 in the
+middle of a pass that is otherwise a fixed number of round trips.
+
+Why a seventh detector
+----------------------
+Six detectors describe a window or a plan: a deadline, a load, a habit, a project,
+a calendar. Blocked work and repeated rescheduling are properties of **one task**,
+and the brief names both — "IF task repeatedly rescheduled THEN recommend breaking
+task into subtasks" is its own worked example. Neither can be expressed by the
+project detector, which can only *count* a project's blocked tasks: that is a fact
+about the project and says nothing about the task a suggestion would have to name.
+:class:`~app.models.enums.RiskType` has carried a ``task`` member from the start and
+:data:`app.services.risk.recommendation.recommendation_rules` maps two rules onto
+it, so before this detector existed those two rules were unreachable and the brief's
+example had no path to the screen. They now share one identity — a risk of type
+``task`` pointing at the task row — which is also what lets the two rules agree
+with the detector about what "repeatedly rescheduled" means.
+
 One gap, resolved in this module's favour
 -----------------------------------------
 ``risk_evaluations`` has no column for "detectors that declined to judge", and the
@@ -71,7 +95,7 @@ Every title and description in this module is **neutral and factual**: it
 describes what the recorded rows say, and never what that implies about the
 person who recorded them. The brief is explicit about this, and the same rule
 bans inferring fatigue from a run of sessions, motivation from a quiet week and
-health from a backlog. All of the wording is built by the six ``_wording``
+health from a backlog. All of the wording is built by the seven ``_wording``
 functions grouped at the end of the module, so the complete vocabulary of things
 a user can be told is reviewable in one screen.
 """
@@ -89,7 +113,9 @@ from sqlalchemy import func, select
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ValidationError
+from app.models.activity import ActivityLog
 from app.models.enums import ActivityEvent, RiskSeverity, RiskStatus, RiskType, TaskStatus
+from app.models.task import Task
 from app.repositories.analytics import AnalyticsRepository
 from app.repositories.project import ProjectRepository
 from app.repositories.task import TaskRepository
@@ -105,18 +131,19 @@ from app.services.activity_service import ActivityService
 from app.services.analytics.service import AnalyticsService
 from app.services.risk.scoring import (
     NOT_ENOUGH_DATA,
+    TASK_RESCHEDULE_THRESHOLD,
     RiskResult,
     consistency_risk,
     deadline_risk,
     estimation_risk,
     project_risk,
     scheduling_risk,
+    task_risk,
     workload_risk,
 )
 
 if TYPE_CHECKING:
     from app.models.risk import Risk
-    from app.models.task import Task
     from app.models.user import User
     from app.repositories.risk import RiskRepository
     from app.services.risk.recommendation import Recommendation, RecommendationService
@@ -130,6 +157,8 @@ __all__ = [
     "MAX_DEADLINE_TASKS",
     "MAX_PROJECT_RISKS",
     "MAX_RECOMMENDATION_RISKS",
+    "MAX_TASK_RISKS",
+    "RESCHEDULE_SCAN_LIMIT",
     "RESOLVE_SWEEP_LIMIT",
     "RiskDetectionService",
 ]
@@ -162,8 +191,18 @@ MAX_RECOMMENDATION_RISKS = 25
 #: Upper bound on the blocked-task scan, and on the project target-date scan.
 #: Both are a floor rather than a total when the cap bites, and a floor
 #: understates a risk rather than inventing one — see
-#: :meth:`RiskDetectionService._blocked_by_project`.
+#: :meth:`RiskDetectionService._blocked_tasks`.
 BLOCKED_SCAN_LIMIT = 500
+#: Upper bound on the reschedule read, ordered so the tasks with the most moves
+#: are the ones inside the cap. A floor again, and the same direction of error as
+#: the blocked scan: fewer candidates measured rather than more risks raised.
+RESCHEDULE_SCAN_LIMIT = 500
+#: How many task risks one pass will write, keeping the highest scores, exactly
+#: as :data:`MAX_PROJECT_RISKS` caps the project detector. An account with more
+#: blocked tasks than that has one task to unblock at a time, and the ones
+#: beyond the cap stay in the account for the next pass rather than filling the
+#: list with work nobody is going to look at this morning.
+MAX_TASK_RISKS = 25
 #: Upper bound on the resolution sweep. A user returning after a long absence may
 #: have more stale risks than one transaction should close, and closing them in
 #: bounded batches means the history of each is written rather than the whole
@@ -216,6 +255,24 @@ class _Finding:
         against a value no row can ever equal.
         """
         return (self.result.risk_type.value, self.entity_type, self.entity_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskCandidate:
+    """One open task the task-level detector measured, and what it measured.
+
+    The union of the two scans that can find a candidate: the blocked-task read
+    and the reschedule read. They are merged rather than scored separately
+    because the two conditions are not exclusive — a task that is blocked *and*
+    has been moved three times is one task with two conditions, and scoring it
+    twice would give the Risk Center two rows to dismiss where the engine has
+    two facts about one problem.
+    """
+
+    task: Task
+    #: All-time ``TASK_RESCHEDULED`` events for this task, from the merged read.
+    #: Zero when only the blocked scan found it.
+    reschedules: int
 
 
 class RiskDetectionService:
@@ -419,7 +476,7 @@ class RiskDetectionService:
         previous_end: date,
         horizon_end: date,
     ) -> _Context:
-        """Read everything the six detectors consume, once.
+        """Read everything the seven detectors consume, once.
 
         Every analytics read shares the one window and each is asked for exactly
         once. ``overview``, ``focus`` and ``time_distribution`` are deliberately
@@ -427,7 +484,7 @@ class RiskDetectionService:
         daily series, and neither the recomputation nor the series is an input to
         any detector, so calling it would double the pass's round trips to obtain
         nothing; ``focus`` and ``time_distribution`` describe sessions that were
-        run, which is not what any of the six detectors asks about.
+        run, which is not what any of the seven detectors asks about.
 
         Args:
             owner: The account being evaluated.
@@ -464,13 +521,17 @@ class RiskDetectionService:
 
         # The account roll-up answers "is there anything to scan for?" first, so
         # a pass over an account with no blocked work does not pay for the scan.
-        blocked, blocked_unseen = await self._blocked_by_project(
+        blocked_rows, blocked_unseen = await self._blocked_tasks(
             owner.id, wanted=bool(task_analytics.blocked_tasks)
         )
         open_due, unestimated = await self._open_due_tasks(
             owner.id, horizon_end, wanted=bool(task_analytics.open_tasks)
         )
         targets = await self._project_targets(owner.id)
+        task_candidates = _merge_task_candidates(
+            blocked_rows,
+            await self._rescheduled_tasks(owner.id, wanted=bool(task_analytics.open_tasks)),
+        )
 
         return _Context(
             owner_id=owner.id,
@@ -485,11 +546,12 @@ class RiskDetectionService:
             consistency=consistency,
             previous_consistency=previous,
             projects=projects,
-            blocked_by_project=blocked,
+            blocked_by_project=_blocked_counts_by_project(blocked_rows),
             blocked_unseen=blocked_unseen,
             open_due=open_due,
             unestimated_open_due=unestimated,
             project_targets=targets,
+            task_candidates=task_candidates,
             session_rows=session_rows,
             availability=availability,
         )
@@ -557,10 +619,12 @@ class RiskDetectionService:
             assessable.append(task)
         return assessable, unestimated
 
-    async def _blocked_by_project(
-        self, owner_id: uuid.UUID, *, wanted: bool
-    ) -> tuple[dict[uuid.UUID, int], int]:
-        """Blocked task counts per project, and how many were not counted.
+    async def _blocked_tasks(self, owner_id: uuid.UUID, *, wanted: bool) -> tuple[list[Task], int]:
+        """Every open task in the blocked status, and how many were not read.
+
+        Read once and used twice: the rows are the project detector's blocked
+        counts *and* the task detector's candidates, and reading them separately
+        would be two queries whose answers could disagree by one row.
 
         The second value is the number of blocked tasks outside the scanned page,
         and it is reported rather than hidden because a floor that a reader cannot
@@ -569,15 +633,53 @@ class RiskDetectionService:
         far above any plausible blocked backlog for that to bite.
         """
         if not wanted:
-            return {}, 0
+            return [], 0
         rows, total = await self.tasks.list_for_user(
             owner_id, limit=BLOCKED_SCAN_LIMIT, offset=0, status=TaskStatus.BLOCKED.value
         )
-        counts: dict[uuid.UUID, int] = {}
-        for task in rows:
-            if task.project_id is not None:
-                counts[task.project_id] = counts.get(task.project_id, 0) + 1
-        return counts, max(0, total - len(rows))
+        return list(rows), max(0, total - len(rows))
+
+    async def _rescheduled_tasks(
+        self, owner_id: uuid.UUID, *, wanted: bool
+    ) -> list[tuple[Task, int]]:
+        """Open tasks with at least three recorded reschedules, most first.
+
+        The one read this module assembles rather than delegates, and the reason
+        is the shape of the answer: a reschedule is a due-date edit with no column
+        anywhere in the schema, so
+        :meth:`~app.repositories.analytics.AnalyticsRepository.task_event_count` is
+        the only reader of the fact and it takes one task at a time. Asking it per
+        candidate task would make the pass's cost depend on how many open tasks the
+        user has, which is precisely the cost the other detectors avoid by asking
+        one question per shape of data.
+
+        Both halves of the predicate are in the query rather than in Python. The
+        owner is one because ownership is a predicate in every statement this
+        module writes, and the open status is one because a task completed a
+        month ago is not at risk of anything today — its four reschedules are
+        history, not a condition, and counting them would raise a risk against a
+        finished row. The ``HAVING`` does the same job for the threshold: a task
+        with two moves never becomes a candidate, so nothing downstream has to
+        decide whether it is interesting.
+        """
+        if not wanted:
+            return []
+        result = await self.metrics.session.execute(
+            select(Task, func.count())
+            .select_from(ActivityLog)
+            .join(Task, Task.id == ActivityLog.task_id)
+            .where(
+                ActivityLog.user_id == owner_id,
+                ActivityLog.event_type == ActivityEvent.TASK_RESCHEDULED.value,
+                Task.owner_id == owner_id,
+                Task.status.in_(_OPEN_TASK_STATUSES),
+            )
+            .group_by(Task.id)
+            .having(func.count() >= TASK_RESCHEDULE_THRESHOLD)
+            .order_by(func.count().desc(), Task.id.asc())
+            .limit(RESCHEDULE_SCAN_LIMIT)
+        )
+        return [(task, int(count)) for task, count in result.all()]
 
     async def _project_targets(self, owner_id: uuid.UUID) -> dict[uuid.UUID, date]:
         """``project_id -> target_date`` for projects that declare one.
@@ -596,7 +698,7 @@ class RiskDetectionService:
     async def _detect(
         self, *, context: _Context, today: date, now: datetime
     ) -> tuple[list[_Finding], list[tuple[str, str]]]:
-        """Run the six detectors over one gathered context.
+        """Run the seven detectors over one gathered context.
 
         Every detector runs whether or not its answer is likely to be useful.
         Running the two that can decline — workload with no declared capacity,
@@ -622,6 +724,7 @@ class RiskDetectionService:
         findings.append(self._detect_consistency(context))
         findings.extend(self._detect_projects(context=context, today=today))
         findings.append(self._detect_scheduling(context))
+        findings.extend(self._detect_tasks(context))
         return findings, self._coverage_notes(context)
 
     def _coverage_notes(self, context: _Context) -> list[tuple[str, str]]:
@@ -642,6 +745,14 @@ class RiskDetectionService:
                     "window but no estimate, and were not assessed"
                 )
             notes.append(("Deadline", f"Not assessed: {detail}."))
+        if not context.task_candidates:
+            notes.append(
+                (
+                    "Task",
+                    "Not assessed: no open task is recorded as blocked or has "
+                    f"{TASK_RESCHEDULE_THRESHOLD} or more reschedules in its history.",
+                )
+            )
         if context.blocked_unseen:
             notes.append(
                 (
@@ -666,7 +777,18 @@ class RiskDetectionService:
         had nothing to decide.
         """
         booked = _booked_minutes_by_task(context.session_rows)
-        adherence = context.deadlines.adherence_rate if context.deadlines.available else None
+        # Divided by 100 here, and the reason is worth stating because getting it
+        # wrong is invisible: `DeadlineAdherenceRead.adherence_rate` is a
+        # **percentage** (Phase 6 documents it as "on_time / (on_time + late),
+        # as a percentage"), while `deadline_risk` expects a 0-1 fraction and
+        # clamps to that range. Handing it the percentage directly meant every
+        # adherence at or above 50% clamped to exactly 1.0, so an account that
+        # finishes 100% on time and one that finishes 55% got the identical
+        # multiplier — the completion-rate input silently did nothing over the
+        # entire range where it would have mattered most.
+        adherence = (
+            context.deadlines.adherence_rate / 100.0 if context.deadlines.available else None
+        )
         findings: list[_Finding] = []
         for task in context.open_due[:MAX_DEADLINE_TASKS]:
             if task.due_date is None:  # pragma: no cover - filtered in _open_due_tasks
@@ -824,6 +946,43 @@ class RiskDetectionService:
             entity_type=ENTITY_ACCOUNT,
             entity_id=None,
         )
+
+    def _detect_tasks(self, context: _Context) -> list[_Finding]:
+        """One task risk per task that is blocked, moved repeatedly, or both.
+
+        The only detector scoped to a single row, and the reason it exists
+        separately from the project detector is that the project roll-up answers
+        a different question with the same words. "This project has three blocked
+        tasks" is a fact about the project; "this task is blocked" is the fact a
+        suggestion can act on, and the row it needs is the one to attach to.
+
+        A candidate always scores above zero, and that is why the reschedule read
+        filters on the threshold rather than passing every moved task through:
+        the candidates are exactly the tasks with a condition to report, and the
+        accounts that have none say so through the coverage note rather than
+        through a column of measured zeros.
+        """
+        findings: list[_Finding] = []
+        for candidate in context.task_candidates:
+            task = candidate.task
+            findings.append(
+                _Finding(
+                    result=task_risk(
+                        blocked=task.status == TaskStatus.BLOCKED.value,
+                        reschedules=candidate.reschedules,
+                        title=task.title,
+                    ),
+                    entity_type=ENTITY_TASK,
+                    entity_id=task.id,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                )
+            )
+        # Highest first, so the cap keeps the tasks a user would act on, and by
+        # id within a score so two passes over the same data produce the same
+        # twenty-five rows in the same order.
+        findings.sort(key=lambda finding: (-(finding.result.score or 0), str(finding.entity_id)))
+        return findings[:MAX_TASK_RISKS]
 
     # -- Judging what to persist --------------------------------------------
 
@@ -1038,6 +1197,9 @@ class _Context:
     open_due: list[Task]
     unestimated_open_due: int
     project_targets: dict[uuid.UUID, date]
+    #: Open tasks the task-level detector has something to say about: the union
+    #: of the blocked scan and the reschedule scan.
+    task_candidates: list[_TaskCandidate]
     session_rows: list[tuple[Any, ...]]
     availability: list[tuple[int, time, time]]
 
@@ -1056,6 +1218,37 @@ def _previous_window(start: date, end: date) -> tuple[date, date]:
     """
     days = (end - start).days + 1
     return start - timedelta(days=days), start - timedelta(days=1)
+
+
+def _blocked_counts_by_project(tasks: list[Task]) -> dict[uuid.UUID, int]:
+    """``project_id -> blocked task count`` from an already-read page of rows.
+
+    Kept here as a separate step so the blocked scan happens once. The project
+    roll-up and the task detector both need the same rows, and two scans of the
+    same table in one pass are two answers that can disagree by one row.
+    """
+    counts: dict[uuid.UUID, int] = {}
+    for task in tasks:
+        if task.project_id is not None:
+            counts[task.project_id] = counts.get(task.project_id, 0) + 1
+    return counts
+
+
+def _merge_task_candidates(
+    blocked: list[Task], rescheduled: list[tuple[Task, int]]
+) -> list[_TaskCandidate]:
+    """The union of the two task scans, one entry per task.
+
+    Rescheduled first because that read is already ordered by how often the task
+    has been moved, which is the order a reader would want; blocked-only tasks
+    follow in the order the repository returned them. A task found by both scans
+    appears once, carrying its count — it is one task with two conditions, and
+    the two conditions are one score rather than two rows.
+    """
+    counts = {task.id: count for task, count in rescheduled}
+    ordered = [task for task, _count in rescheduled]
+    ordered.extend(task for task in blocked if task.id not in counts)
+    return [_TaskCandidate(task=task, reschedules=counts.get(task.id, 0)) for task in ordered]
 
 
 def _session_minutes(row: tuple[Any, ...]) -> int:
@@ -1504,6 +1697,43 @@ def _scheduling_wording(result: RiskResult) -> tuple[str, str]:
     return "Conflicts in the scheduled plan", f"The recorded plan has {_clause(parts)}"
 
 
+def _task_wording(result: RiskResult) -> tuple[str, str]:
+    """Title and description for a condition on one task.
+
+    Names the condition and the count behind it, and stops there. A task moved
+    four times is described as having been moved four times; whether it is too
+    large, badly specified or repeatedly interrupted is a reading the rows do not
+    carry, and the recommendation attached to this risk is where the engine offers
+    one action instead of a diagnosis.
+
+    Both conditions are named separately when both are present rather than blended
+    into one sentence, so a reader can see which of the two is carrying the score.
+    """
+    meta = result.metadata
+    name = _clip(str(meta.get("title") or "A task"), 120)
+    blocked = bool(meta.get("blocked"))
+    reschedules = int(meta.get("reschedules") or 0)
+    threshold = int(meta.get("reschedule_threshold") or 0)
+
+    if blocked and reschedules >= threshold:
+        return (
+            f"{name} is blocked and has been rescheduled {reschedules} times",
+            f"The task is recorded in the blocked status and has been rescheduled "
+            f"{reschedules} times in its recorded history.",
+        )
+    if blocked:
+        return (
+            f"{name} is blocked",
+            "The task is recorded in the blocked status, so the work remaining on it "
+            "cannot be placed until the block is cleared.",
+        )
+    return (
+        f"{name} has been rescheduled {reschedules} times",
+        f"{reschedules} reschedules are recorded against this task in its history, "
+        f"and nothing else is recorded as blocking it.",
+    )
+
+
 #: Every risk type has a wording builder, and this table is what makes that
 #: checkable: a new member of :class:`RiskType` without an entry here raises at
 #: the point of use rather than producing an empty title in a stored row.
@@ -1514,6 +1744,7 @@ _WORDING: dict[RiskType, Callable[[RiskResult], tuple[str, str]]] = {
     RiskType.CONSISTENCY: _consistency_wording,
     RiskType.PROJECT: _project_wording,
     RiskType.SCHEDULING: _scheduling_wording,
+    RiskType.TASK: _task_wording,
 }
 
 

@@ -361,10 +361,6 @@ export interface RecommendationListRead {
    * Filled with all four priority words, zeroed where nothing was found, so the
    * shape does not change as the last critical recommendation is closed. */
   by_priority: Record<string, number>
-  /** One factual sentence describing the counts, composed by the backend from
-   * the same helper the risk list uses — so the two headers cannot drift apart
-   * in tone. */
-  summary: string
 }
 
 /**

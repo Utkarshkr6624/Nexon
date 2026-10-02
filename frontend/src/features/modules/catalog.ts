@@ -8,9 +8,11 @@ import {
   FolderKanban,
   GraduationCap,
   LayoutDashboard,
+  Lightbulb,
   ListTodo,
   Search,
   Settings,
+  ShieldAlert,
   Sparkles,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
@@ -302,6 +304,72 @@ export const MODULES: ModuleDefinition[] = [
     ],
   },
   {
+    to: '/risks',
+    label: 'Risk Center',
+    summary:
+      'Conditions the detection engine has found in your recorded work — deadlines without booked time, planned load beyond the hours available — each with the evidence it was scored from.',
+    vision:
+      'The Risk Center is the surface where a pattern becomes a question you can answer. Six detectors run over the analytics Phase 6 already computes and over the planner signals the workload needs, and each one that finds a gap writes a single finding rather than a stream of them: the same condition re-detected is refreshed in place, a condition that has disappeared is closed, and a detector with too little history to judge produces no row at all and says so. Every finding carries its score, its band, the inputs that produced the score and the sample they came from, because a number a person cannot check is a number they have to take on trust. The three answers — acknowledge, resolve, dismiss — are deliberately not graded, because none of them is destructive and a layout that made "Dismiss" look dangerous would push people towards the wrong one.',
+    phase: 7,
+    icon: ShieldAlert,
+    keywords: ['risk', 'detection', 'signals', 'pressure', 'deadlines', 'workload', 'warnings'],
+    capabilities: [
+      {
+        title: 'Findings with their evidence',
+        description:
+          'Every row states the score, the band, and each input that moved it, so the finding can be argued with.',
+      },
+      {
+        title: 'Band and type filters',
+        description:
+          'Narrow by severity, lifecycle status or which of the six detectors raised it; the view lives in the URL.',
+      },
+      {
+        title: 'Three honest answers',
+        description:
+          'Acknowledge keeps it live but quiet, resolve closes it, dismiss says it does not apply. None is destructive.',
+      },
+    ],
+    metrics: [
+      { label: 'Live risks', hint: 'Active and acknowledged findings' },
+      { label: 'High or critical', hint: 'Raised above the severity threshold' },
+      { label: 'Resolved this week', hint: 'Requires the detection run history' },
+    ],
+  },
+  {
+    to: '/recommendations',
+    label: 'Recommendations',
+    summary:
+      'Actions the risks have raised, each with the reason it was proposed and the choice to accept it, complete it or set it aside.',
+    vision:
+      'Recommendations are the half of Phase 7 a person acts on. One rule per risk type, one suggestion per entity, and each one has to carry what, why, and what would be done — an imperative with nothing behind it is not a recommendation, so the reason is enforced in the schema rather than left to the next rule that forgets it. The engine proposes and never performs: accepting a suggestion records that the user said they would, and it is the user who reschedules the task or blocks the time. Every answer is kept, including a decline, because a risk worth surfacing is a risk worth acting on by declining it — and a suggestion declined once may legitimately be raised again if the condition still holds.',
+    phase: 7,
+    icon: Lightbulb,
+    keywords: ['suggestions', 'actions', 'next steps', 'advice', 'proposals'],
+    capabilities: [
+      {
+        title: 'WHAT / WHY / ACTION',
+        description:
+          'Every suggestion states the ask, the reason with its numbers, and the action being proposed.',
+      },
+      {
+        title: 'Grouped by priority',
+        description:
+          'Priority is derived from the risk severity server-side, so the ordering cannot disagree with the finding behind it.',
+      },
+      {
+        title: 'Answers are recorded',
+        description:
+          'Accept, complete and set-aside each store a different fact, and the suggestion closes when its risk does.',
+      },
+    ],
+    metrics: [
+      { label: 'Awaiting an answer', hint: 'Open suggestions by priority' },
+      { label: 'Accepted', hint: 'Taken on as work to do' },
+      { label: 'Completed', hint: 'Acted on and closed' },
+    ],
+  },
+  {
     to: '/learning',
     label: 'Learning',
     summary:
@@ -482,7 +550,17 @@ export const NAV_GROUPS: NavGroupDefinition[] = [
   {
     id: 'intelligence',
     label: 'Intelligence',
-    items: [getModule('/knowledge'), getModule('/analytics'), getModule('/search')],
+    // The Risk Center sits with Analytics rather than with Work because it reads
+    // from the analytics the engine already computes: the findings are a
+    // conclusion drawn from measured work, and putting the two apart would split
+    // a single question across two sidebar groups.
+    items: [
+      getModule('/knowledge'),
+      getModule('/analytics'),
+      getModule('/risks'),
+      getModule('/recommendations'),
+      getModule('/search'),
+    ],
   },
   {
     id: 'growth',

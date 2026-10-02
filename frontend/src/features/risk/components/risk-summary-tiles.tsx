@@ -99,7 +99,9 @@ export function RiskSummaryTiles({
               to={hrefFor(severity)}
               aria-current={active ? 'true' : undefined}
               className={cn(
-                'min-w-0 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+                'min-w-0 rounded-lg focus-visible:outline-none focus-visible:ring-2',
+                'focus-visible:ring-ring focus-visible:ring-offset-2',
+                'focus-visible:ring-offset-background',
                 active && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
               )}
             >

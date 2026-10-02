@@ -111,7 +111,12 @@ export function RiskStatusBadge({
   className,
 }: VocabularyBadgeProps & { status: RiskStatus }) {
   return (
-    <VocabularyBadge meta={RISK_STATUS_META[status]} raw={String(status)} size={size} className={className} />
+    <VocabularyBadge
+      meta={RISK_STATUS_META[status]}
+      raw={String(status)}
+      size={size}
+      className={className}
+    />
   )
 }
 

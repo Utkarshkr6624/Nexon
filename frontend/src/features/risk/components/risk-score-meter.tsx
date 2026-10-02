@@ -82,7 +82,9 @@ export function RiskScoreMeter({
           )}
         >
           {text}
-          {measurable && <span className="ml-1 text-xs font-normal text-muted-foreground">/ 100</span>}
+          {measurable && (
+            <span className="ml-1 text-xs font-normal text-muted-foreground">/ 100</span>
+          )}
         </p>
       </div>
 
@@ -99,7 +101,11 @@ export function RiskScoreMeter({
             <button
               type="button"
               aria-label={`More about the ${label.toLowerCase()} scale`}
-              className="flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className={cn(
+                'flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground',
+                'transition-colors hover:text-foreground focus-visible:outline-none',
+                'focus-visible:ring-2 focus-visible:ring-ring',
+              )}
             >
               <Info className="size-3.5" aria-hidden="true" />
             </button>
