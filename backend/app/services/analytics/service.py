@@ -254,6 +254,33 @@ def _cell(value: int | None) -> int | str:
     return "" if value is None else value
 
 
+#: Characters that make a spreadsheet treat a cell as a formula rather than as
+#: text. Excel, LibreOffice and Sheets all evaluate a cell whose first character
+#: is one of these.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: str | None) -> str:
+    """Neutralise a leading formula character in user-authored text.
+
+    An export is the one analytics surface that leaves the database as a file the
+    user then double-clicks. A task titled ``=1+1`` or ``@SUM(A1:A9)`` is written
+    verbatim into the cell, and when the file is opened those cells are evaluated
+    by the spreadsheet — turning a row of someone's task titles into live
+    formulas in the user's session. Prefixing with an apostrophe forces text and
+    leaves the visible value unchanged, which is the conventional mitigation.
+
+    Only *leading* characters are affected. A task legitimately named ``C++`` or
+    ``A-B testing`` is untouched, and a title that merely contains ``=`` in the
+    middle is not a formula to any spreadsheet and is not rewritten.
+    """
+    if not value:
+        return ""
+    if value.startswith(_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
 def _components(components: Sequence[Any]) -> list[ScoreComponentRead]:
     """Map scoring's frozen dataclasses onto the wire schema.
 
@@ -742,7 +769,9 @@ class AnalyticsService:
             if by_project
             else f"{NOT_ENOUGH_ACTIVITY}: no completed work sessions were recorded in this range.",
             unassigned_minutes=by_project.get(None, 0) if None in by_project else 0,
-            project_id=project_id,
+            # Stringified for the wire — see `TimeDistributionRead.project_id`,
+            # which is a report field rather than a lookup key.
+            project_id=str(project_id) if project_id else None,
             by_project=[
                 TimeBucketRead(
                     key=str(key) if key is not None else "unassigned",
@@ -974,12 +1003,50 @@ class AnalyticsService:
 
         This is the endpoint the UI opens, so it carries the aggregate counters,
         their comparison and the headline scores together rather than making the
-        client make four requests and reconcile them. ``stale`` is here so a window
-        that has only been partially rebuilt says so instead of quietly rendering
-        half a dashboard as if it were a whole one.
+        client make four requests and reconcile them.
+
+        **The window is completed before it is read.** Any day the aggregates do
+        not already cover is rebuilt first, so the totals and the daily series
+        describe the whole requested window rather than whatever fraction of it
+        some earlier request happened to compute.
+
+        ``stale`` reports whether that fill was necessary: ``true`` means the
+        figures below were rebuilt on this request rather than served from an
+        existing aggregate, and ``false`` means they were already current. A
+        never-aggregated window is therefore ``stale: true`` with complete,
+        correct numbers — fresh because they were just computed.
+
+        ``aggregates_through`` says how far the stored aggregates reach, which is
+        what a client renders as "updated N minutes ago". Note that a window
+        whose days are all covered but whose underlying rows have since changed
+        reads as ``stale: false`` while its figures are one edit out of date;
+        the answer to that is ``POST /analytics/rebuild``, not a flag that would
+        be wrong more often than right.
         """
         self._check_range(start, end)
         previous_start, previous_end = _previous_window(start, end)
+        # Coverage is sampled *before* the gap is filled, and that ordering is the
+        # whole point of the flag. Read after, `covered` would always be the full
+        # set — the fill happens either way — so `stale` would be a field that
+        # could only ever say `false`, which is worse than not having it: a client
+        # would reasonably trust it.
+        #
+        # Sampled before, it answers the question a client actually has: "were
+        # these figures already computed, or did the server just compute them for
+        # me?" A `true` means the numbers below are fresh because they were
+        # rebuilt on this request, which pairs with `aggregates_through` to let a
+        # UI say "updated just now".
+        covered_before = await self.metrics.covered_dates(owner.id, start=start, end=end)
+        # Fill, then read. The fill below lives in `_totals`, which `productivity`
+        # calls — so reading `list_range` before it meant the first `/overview`
+        # over a window nobody had ever aggregated returned `totals` of all zeros
+        # and `daily: []`, having just written the rows that would have answered
+        # it. The window it reported was a window it had not measured, which is
+        # the precise failure the brief's "do not silently show stale numbers"
+        # rule exists to prevent. One explicit call up front makes the ordering a
+        # property of this method rather than an accident of where the sub-scores
+        # happen to sit.
+        await self._totals(owner, start=start, end=end)
         rows = await self.metrics.list_range(owner.id, start=start, end=end)
         previous_rows = await self.metrics.list_range(
             owner.id, start=previous_start, end=previous_end
@@ -996,8 +1063,12 @@ class AnalyticsService:
             )
             for column in TRENDABLE_METRICS
         ]
-        covered = await self.metrics.covered_dates(owner.id, start=start, end=end)
-        stale = bool(covered) and covered != set(_days(start, end))
+        covered = covered_before
+        # A window with no aggregate row at all is the case this flag exists for:
+        # it is maximally incomplete, so `stale` is true, not false. The old
+        # `bool(covered) and covered != ...` guard read "nothing computed yet" as
+        # "nothing to be stale about", which is exactly backwards.
+        stale = covered != set(_days(start, end))
         active = any(point.current for point in totals)
         return OverviewRead(
             range=self._metric_range(start, end),
@@ -1054,12 +1125,33 @@ class AnalyticsService:
 
         current = _bucket_series(rows, metric, granularity)
         earlier = _bucket_series(previous_rows, metric, granularity)
+        # Paired by **position over the emitted points**, not by date key. The two
+        # windows are the same length and cut the same way, but their *dates* are a
+        # full window apart, so keying the earlier series by its own bucket dates
+        # meant no current bucket ever matched a previous one: `previous`,
+        # `absolute_change` and `percent_change` were null on every point at every
+        # granularity, which is the comparison the brief asks for and the reason
+        # the request was made.
+        #
+        # Empty buckets are skipped on **both** sides before pairing. A rebuild
+        # writes a row of zeroes for every day in the window, so the earlier
+        # series is full of legitimate zeros; pairing positionally over those
+        # would compare this week's first active day against last week's *first
+        # day of the calendar* and read a real decline that never happened. Both
+        # series omit empties, so pairing the points a client actually sees is the
+        # only alignment that means anything.
+        #
+        # If the earlier window runs out of points the tail is left unpaired and
+        # reports `previous: null`, rather than being compared against a bucket
+        # from an unrelated week.
+        earlier_ordered = [earlier[key] for key in sorted(earlier) if earlier[key]]
+        earlier_by_position = iter(earlier_ordered)
         points: list[TrendPoint] = []
         for bucket_start in sorted(current):
             value = current[bucket_start]
             if not value:
                 continue
-            before = earlier.get(bucket_start)
+            before = next(earlier_by_position, None)
             points.append(
                 TrendPoint(
                     bucket=bucket_start,
@@ -1131,8 +1223,12 @@ class AnalyticsService:
                 writer.writerow(
                     [
                         str(task_id),
-                        project_name or "",
-                        title,
+                        # The two free-text columns the user typed. Both go
+                        # through `_csv_safe`; every other cell below is either an
+                        # ISO instant, an int or a closed enum the user cannot
+                        # make a spreadsheet evaluate.
+                        _csv_safe(project_name),
+                        _csv_safe(title),
                         str(status),
                         str(priority),
                         _cell(estimated),
@@ -1510,6 +1606,14 @@ class AnalyticsService:
         return DailyMetricRead(
             metric_date=row.metric_date,
             **{column: int(getattr(row, column, 0) or 0) for column in TRENDABLE_METRICS},
+            # Carried separately from `TRENDABLE_METRICS` because it is not a
+            # trendable counter — it is the freshness stamp the client reads to
+            # say "updated 5 minutes ago". Leaving it unset serialises as null on
+            # every row, and the staleness banner renders null as "never
+            # updated", which is the one thing the brief forbids: a dashboard
+            # claiming it has no idea when its numbers were computed when in fact
+            # the database knows precisely.
+            updated_at=row.updated_at,
         )
 
 

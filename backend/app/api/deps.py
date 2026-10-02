@@ -61,6 +61,7 @@ from app.repositories.planner import (
     WorkSessionRepository,
 )
 from app.repositories.project import ProjectRepository
+from app.repositories.risk import RiskRepository
 from app.repositories.session import SessionRepository
 from app.repositories.tag import TagRepository
 from app.repositories.task import TaskRepository
@@ -72,6 +73,8 @@ from app.services.auth_service import AuthService
 from app.services.knowledge_service import KnowledgeService
 from app.services.planner_service import PlannerService
 from app.services.project_service import ProjectService
+from app.services.risk.detection import RiskDetectionService
+from app.services.risk.recommendation import RecommendationService
 from app.services.scheduling_service import SchedulingService
 from app.services.session_service import SessionService
 from app.services.tag_service import TagService
@@ -152,6 +155,19 @@ def get_availability_rule_repository(session: DbSession) -> AvailabilityRuleRepo
     return AvailabilityRuleRepository(session)
 
 
+def get_risk_repository(session: DbSession) -> RiskRepository:
+    """Provide a request-scoped risk repository.
+
+    A provider of its own rather than being reachable only through
+    :func:`get_risk_service`, because the Risk Center's **reads** are not the
+    detection pass: listing risks, reading one, and moving one along its
+    lifecycle are all bounded queries the repository answers, and burying them
+    inside the detection service would make a request that only wants to show a
+    list of risks construct the whole analytics graph behind it first.
+    """
+    return RiskRepository(session)
+
+
 def get_note_repository(session: DbSession) -> NoteRepository:
     """Provide a request-scoped note repository."""
     return NoteRepository(session)
@@ -211,6 +227,7 @@ KnowledgeLinkRepositoryDep = Annotated[
     KnowledgeLinkRepository, Depends(get_knowledge_link_repository)
 ]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
+RiskRepositoryDep = Annotated[RiskRepository, Depends(get_risk_repository)]
 
 
 def get_session_service(
@@ -594,6 +611,108 @@ def get_analytics_service(
 AnalyticsServiceDep = Annotated[AnalyticsService, Depends(get_analytics_service)]
 
 
+def get_recommendation_service(
+    risks: RiskRepositoryDep,
+    tasks: TaskRepositoryDep,
+    projects: ProjectRepositoryDep,
+    activity: ActivityServiceDep,
+) -> RecommendationService:
+    """Provide a request-scoped recommendation service.
+
+    **Three repositories, and the reason is what the rules have to look at
+    before they can raise anything.** A suggestion is only worth raising if it
+    names something the user can act on, so every rule reads the row it is about:
+    ``tasks`` for the deadline, estimate and reschedule-history rules, and
+    ``projects`` for the blocked-work and project-signal rules. ``risks`` is the
+    write side, and it carries the deduplicating upsert — the thing that decides
+    whether this suggestion is new or one the user has already been shown, which
+    is what stops a rule re-raising the same advice on every evaluation.
+
+    Reconstructing any of those from inside the service would make the rules
+    depend on repositories the API layer never wires, and would leave the
+    ownership predicate the repository exists to own duplicated in the service.
+
+    ``activity`` is wired rather than left as the service's ``None`` mode, on the
+    reasoning this module's docstring gives in full. A suggestion that was
+    accepted, rejected, completed or opened is a fact about the user's work, and
+    the accepted/rejected pair is the training label Phase 10 is described as
+    wanting — an unrecorded answer is an answer nobody can learn from.
+    """
+    return RecommendationService(
+        risks,
+        tasks,
+        projects,
+        activity=activity,
+    )
+
+
+RecommendationServiceDep = Annotated[RecommendationService, Depends(get_recommendation_service)]
+
+
+def get_risk_service(
+    metrics: AnalyticsRepositoryDep,
+    analytics: AnalyticsServiceDep,
+    tasks: TaskRepositoryDep,
+    projects: ProjectRepositoryDep,
+    risks: RiskRepositoryDep,
+    activity: ActivityServiceDep,
+    recommendations: RecommendationServiceDep,
+    settings: SettingsDep,
+) -> RiskDetectionService:
+    """Provide a request-scoped risk detection service.
+
+    **``analytics`` is injected as a service, not as its repositories, and that is
+    the load-bearing decision here.** Every figure the six detectors consume was
+    already computed and published by Phase 6, and
+    :class:`~app.services.analytics.service.AnalyticsService` already carries the
+    ``available`` flag and the stated reason for the figures it cannot compute.
+    Holding the repositories instead would let the pass re-derive anything it
+    liked, and the two answers would eventually disagree by a rounding step — so
+    the detector is given the only door onto those numbers.
+
+    ``metrics`` is the one repository that *does* have to come in alongside it,
+    and only for the two things Phase 6 computes but does not publish on a read:
+    the raw ``(estimated, actual)`` pairs behind the estimation mean, and the
+    flat session rows behind the planning signals. A published aggregate is
+    never read around the service; an unpublished one has to be read somewhere.
+
+    ``tasks`` and ``projects`` supply the per-row detail an aggregate cannot
+    answer: an aggregate describes a group, and the deadline rule needs to name
+    *which* task is exposed.
+
+    ``risks`` carries the deduplicating upsert and the stale sweep. Both are
+    storage invariants rather than detection rules — the partial unique index and
+    the owner-scoped update — so they belong in the repository the service calls.
+
+    ``activity`` records ``RISK_DETECTED``/``RISK_UPDATED``/``RISK_RESOLVED``
+    beside every reconciliation step, wired rather than left optional for the
+    reason the rest of this file gives.
+
+    ``recommendations`` is passed so one pass ends with both halves of the same
+    answer: risks that were written, and the actions raised on the back of them.
+    Wired as the real generator rather than left ``None`` because a Risk Center
+    whose risks have no suggestions is a risk engine that found the problem and
+    then said nothing about what to do about it.
+
+    Settings are injected rather than left to the service's own ``get_settings()``
+    fallback, so the analytics range ceiling a window is checked against is the
+    one resolved for this request.
+    """
+    return RiskDetectionService(
+        metrics,
+        analytics,
+        tasks,
+        projects,
+        risks,
+        activity=activity,
+        recommendations=recommendations,
+        settings=settings,
+    )
+
+
+RiskServiceDep = Annotated[RiskDetectionService, Depends(get_risk_service)]
+
+
 def get_client_context(request: Request) -> tuple[str | None, str | None]:
     """Return ``(ip_address, user_agent)`` for the calling request.
 
@@ -771,8 +890,14 @@ __all__ = [
     "ProjectRepositoryDep",
     "ProjectService",
     "ProjectServiceDep",
+    "RecommendationService",
+    "RecommendationServiceDep",
     "ResourceRepository",
     "ResourceRepositoryDep",
+    "RiskDetectionService",
+    "RiskRepository",
+    "RiskRepositoryDep",
+    "RiskServiceDep",
     "SchedulingService",
     "SchedulingServiceDep",
     "SessionRepository",
@@ -822,7 +947,10 @@ __all__ = [
     "get_planner_service",
     "get_project_repository",
     "get_project_service",
+    "get_recommendation_service",
     "get_resource_repository",
+    "get_risk_repository",
+    "get_risk_service",
     "get_scheduling_service",
     "get_session_repository",
     "get_session_service",

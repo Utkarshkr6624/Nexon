@@ -9,12 +9,16 @@ fixed in one direction or the other, never left ambiguous.
 
 | Spec | Phase | Module | Status |
 | --- | --- | --- | --- |
-| [`phase-3-projects-tasks.md`](./phase-3-projects-tasks.md) | 3 | Projects, Tasks & Work Management | 🟡 Backend complete · frontend not started |
-| [`phase-4-planner.md`](./phase-4-planner.md) | 4 | Intelligent Planner, Calendar & Scheduling Engine | 🔴 Not started |
-| [`phase-5-knowledge.md`](./phase-5-knowledge.md) | 5 | Knowledge Base, Notes, Resources & Knowledge Graph | 🔴 Not started |
-| [`phase-6-analytics.md`](./phase-6-analytics.md) | 6 | Analytics & Intelligence Data Engine | 🔴 Not started |
+| [`phase-3-projects-tasks.md`](./phase-3-projects-tasks.md) | 3 | Projects, Tasks & Work Management | ✅ Complete |
+| [`phase-4-planner.md`](./phase-4-planner.md) | 4 | Intelligent Planner, Calendar & Scheduling Engine | ✅ Complete |
+| [`phase-5-knowledge.md`](./phase-5-knowledge.md) | 5 | Knowledge Base, Notes, Resources & Knowledge Graph | ✅ Complete |
+| [`phase-6-analytics.md`](./phase-6-analytics.md) | 6 | Analytics & Intelligence Data Engine | ✅ Complete — [report](./phase-6-report.md) |
 | [`phase-7-risk-recommendations.md`](./phase-7-risk-recommendations.md) | 7 | Risk Detection & Recommendation Engine | 🔴 Not started |
 | [`phase-8-9-developer-learning-career.md`](phase-8-9-developer-learning-career.md) | 8 + 9 | Developer Intelligence + Learning & Career Intelligence | 🔴 Not started |
+
+A phase is marked complete when its brief is implemented, the full suite is green, and the
+mandatory regression check in that brief has been run. Each completed phase has a report
+documenting what was built, what was wrong, and what was actually executed.
 
 ## Why these are stored rather than kept in chat
 

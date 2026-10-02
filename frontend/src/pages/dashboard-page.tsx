@@ -173,12 +173,7 @@ export default function DashboardPage() {
         would compete with the health card's own recovery.
       */}
       {apiError && !overview.data && (
-        <ErrorState
-          error={apiError}
-          title="Analytics could not load"
-          onRetry={undefined}
-          className="py-4"
-        />
+        <ErrorState error={apiError} title="Analytics could not load" className="py-4" />
       )}
 
       {overview.isPending && !overview.data && <HeadlineSkeleton />}
@@ -596,7 +591,9 @@ function RecentActivity({ query, className }: { query: ReturnType<typeof useActi
                     </span>
                   </span>
                   <span className="shrink-0 text-xs text-muted-foreground">
-                    {formatRelative(Date.parse(event.created_at))}
+                    {Number.isNaN(Date.parse(event.created_at))
+                      ? null
+                      : formatRelative(Date.parse(event.created_at))}
                   </span>
                 </li>
               )

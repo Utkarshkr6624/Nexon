@@ -14,12 +14,19 @@ from app.models.audit import AuditEvent, AuditLog
 from app.models.enums import (
     ActivityEvent,
     CalendarEventType,
+    EvidenceStrength,
     KnowledgeEntityType,
     KnowledgeLinkType,
     NoteStatus,
     ProjectPriority,
     ProjectStatus,
+    RecommendationPriority,
+    RecommendationStatus,
+    RecommendationType,
     ResourceType,
+    RiskSeverity,
+    RiskStatus,
+    RiskType,
     TaskPriority,
     TaskStatus,
 )
@@ -49,6 +56,15 @@ from app.models.planner import (
     WorkSessionStatus,
 )
 from app.models.project import DEFAULT_PROJECT_PRIORITY, DEFAULT_PROJECT_STATUS, Project
+from app.models.risk import (
+    DEFAULT_RECOMMENDATION_PRIORITY,
+    DEFAULT_RECOMMENDATION_STATUS,
+    DEFAULT_RISK_SEVERITY,
+    DEFAULT_RISK_STATUS,
+    Recommendation,
+    Risk,
+    RiskEvaluation,
+)
 from app.models.session import Session
 from app.models.tag import Tag, project_tags, task_tags
 from app.models.task import (
@@ -65,7 +81,11 @@ __all__ = [
     "DEFAULT_NOTE_STATUS",
     "DEFAULT_PROJECT_PRIORITY",
     "DEFAULT_PROJECT_STATUS",
+    "DEFAULT_RECOMMENDATION_PRIORITY",
+    "DEFAULT_RECOMMENDATION_STATUS",
     "DEFAULT_RESOURCE_TYPE",
+    "DEFAULT_RISK_SEVERITY",
+    "DEFAULT_RISK_STATUS",
     "DEFAULT_ROLE",
     "DEFAULT_TASK_PRIORITY",
     "DEFAULT_TASK_STATUS",
@@ -84,6 +104,7 @@ __all__ = [
     "Concept",
     "DailyMetric",
     "Document",
+    "EvidenceStrength",
     "KnowledgeEntityType",
     "KnowledgeLink",
     "KnowledgeLinkType",
@@ -94,8 +115,17 @@ __all__ = [
     "Project",
     "ProjectPriority",
     "ProjectStatus",
+    "Recommendation",
+    "RecommendationPriority",
+    "RecommendationStatus",
+    "RecommendationType",
     "Resource",
     "ResourceType",
+    "Risk",
+    "RiskEvaluation",
+    "RiskSeverity",
+    "RiskStatus",
+    "RiskType",
     "Session",
     "Tag",
     "Task",

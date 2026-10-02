@@ -76,28 +76,33 @@ export function AnalyticsBarChart({
         margin={{ top: 4, right: 8, bottom: 0, left: horizontal ? 8 : -12 }}
       >
         <CartesianGrid stroke="hsl(var(--border))" vertical={horizontal} horizontal={!horizontal} />
-        {horizontal ? (
-          <>
-            <XAxis type="number" {...CHART_AXIS_PROPS} />
-            <YAxis
-              type="category"
-              dataKey={xKey}
-              width={120}
-              interval={0}
-              {...CHART_AXIS_PROPS}
-            />
-          </>
-        ) : (
-          <>
-            <XAxis
-              dataKey={xKey}
-              interval="preserveStartEnd"
-              minTickGap={16}
-              {...CHART_AXIS_PROPS}
-            />
-            <YAxis width={44} allowDecimals={false} {...CHART_AXIS_PROPS} />
-          </>
-        )}
+        {/* An array, not a fragment: Recharts enumerates a chart's direct
+            children to register its axes, and a Fragment is opaque to that walk
+            — so wrapping the pair in `<>…</>` registered neither and the chart
+            rendered with no axis and no category labels at all. Keys are
+            required for the array form. */}
+        {horizontal
+          ? [
+              <XAxis key="x" type="number" {...CHART_AXIS_PROPS} />,
+              <YAxis
+                key="y"
+                type="category"
+                dataKey={xKey}
+                width={120}
+                interval={0}
+                {...CHART_AXIS_PROPS}
+              />,
+            ]
+          : [
+              <XAxis
+                key="x"
+                dataKey={xKey}
+                interval="preserveStartEnd"
+                minTickGap={16}
+                {...CHART_AXIS_PROPS}
+              />,
+              <YAxis key="y" width={44} allowDecimals={false} {...CHART_AXIS_PROPS} />,
+            ]}
         <Tooltip
           cursor={{ fill: 'hsl(var(--muted))' }}
           content={(props) => (

@@ -1,7 +1,21 @@
 # Phase 6 — Analytics & Intelligence Data Engine
 
-> **Status: 🔴 Not started.** Requires Phase 4 (work sessions, actual durations) and Phase 5
-> (knowledge interactions) to have real data to aggregate.
+> **Status: ✅ Implemented and tested.** Phases 4 (work sessions) and 5 (knowledge
+> interactions) were complete before this phase began, so the engine aggregates real
+> recorded activity rather than reconstructing it.
+>
+> The pre-phase regression check **passed** — the suite was green before any Phase 6
+> code was written. Phase 6 shipped: 18 analytics endpoints, one `daily_metrics`
+> aggregate tier, a documented scoring module, CSV export, ML feature snapshots, a
+> rebuilt dashboard and a dedicated analytics page.
+>
+> **Verified:** 884 backend tests and 361 frontend tests pass, `tsc`, `eslint`,
+> `ruff` and `vite build` are clean, and no `xfail` or `skip` markers remain. The
+> phase's own suite found and fixed **nine production defects**, listed in the report.
+>
+> **See [`phase-6-report.md`](./phase-6-report.md) for the architecture, the metric
+> formulas, the bugs found, the exact commands to run, and the recommended starting
+> point for Phase 7.**
 
 ---
 

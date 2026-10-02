@@ -126,7 +126,9 @@ export function ScoreCard({ score, facts, className, compact = false }: ScoreCar
  * would have to remember to set.
  */
 function metricFor(score: ScoredRead): 'productivity' | 'consistency' | 'focus' {
-  const label = score.label.toLowerCase()
+  // A payload missing its label must not blank the page: this runs on the
+  // unavailable path, which is exactly the path a partial response takes.
+  const label = String(score.label ?? '').toLowerCase()
   if (label.includes('consistency')) return 'consistency'
   if (label.includes('focus')) return 'focus'
   return 'productivity'

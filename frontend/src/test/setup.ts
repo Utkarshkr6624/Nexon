@@ -39,6 +39,21 @@ function installEnvironmentShims(): void {
     Element.prototype.scrollIntoView = () => undefined
   }
 
+  // Recharts' `ResponsiveContainer` subscribes to `ResizeObserver` in an effect,
+  // and jsdom implements neither layout nor the observer. Without this, rendering
+  // any chart throws `ResizeObserver is not defined` and takes the tree with it,
+  // so the analytics surfaces could not be rendered in a test at all.
+  if (typeof globalThis.ResizeObserver !== 'function') {
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe(): void {}
+        unobserve(): void {}
+        disconnect(): void {}
+      },
+    )
+  }
+
   if (typeof window.matchMedia !== 'function') {
     Object.defineProperty(window, 'matchMedia', {
       configurable: true,

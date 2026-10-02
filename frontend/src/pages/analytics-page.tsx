@@ -51,6 +51,7 @@ import {
   useRebuildAnalytics,
   useTaskAnalytics,
   useTimeDistribution,
+  useTrends,
 } from '@/features/analytics/hooks'
 import {
   NO_VALUE,
@@ -71,6 +72,7 @@ import type {
   DailyMetricRead,
   Granularity,
   OverviewRead,
+  TrendPoint,
 } from '@/types/analytics'
 
 /**
@@ -140,6 +142,7 @@ export default function AnalyticsPage() {
   )
 
   const overview = useOverview(params, { enabled: is('overview') })
+  const completedTrend = useTrends({ ...params, metric: 'tasks_completed' }, { enabled: is('overview') })
   const productivity = useProductivity(params, { enabled: is('productivity') })
   const consistency = useConsistency(params, { enabled: is('productivity') })
   const focus = useFocus(params, { enabled: is('productivity') })
@@ -215,6 +218,7 @@ export default function AnalyticsPage() {
           {is('overview') && (
             <OverviewTab
               query={overview}
+              completedTrend={completedTrend}
               rangeLabel={rangeLabel}
               start={window.range.start_date}
               end={window.range.end_date}
@@ -339,12 +343,14 @@ function latestUpdatedAt(daily: readonly DailyMetricRead[]): string | null {
 
 function OverviewTab({
   query,
+  completedTrend,
   rangeLabel,
   start,
   end,
   granularity,
 }: {
   query: QueryLike<OverviewRead>
+  completedTrend: QueryLike<TrendPoint[]> & object
   rangeLabel: string
   start: string
   end: string
@@ -370,6 +376,25 @@ function OverviewTab({
               emptyMetric="overview"
             />
             <TrendChart
+              title="Tasks completed against the previous period"
+              subtitle={rangeLabel}
+              kind="line"
+              isLoading={completedTrend.isPending}
+              data={(completedTrend.data ?? []).map((point) => ({
+                label: point.bucket ? formatMetricDate(point.bucket) : point.label,
+                completed: point.value,
+                previous: point.previous,
+              }))}
+              series={[
+                { key: 'completed', label: 'This period' },
+                { key: 'previous', label: 'Previous period', colorIndex: 4 },
+              ]}
+              emptyMetric="trend"
+            />
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <TrendChart
               title="Recorded time"
               subtitle={`${rangeLabel} · actual minutes against planned`}
               data={dailyPair(
@@ -385,15 +410,13 @@ function OverviewTab({
               isEmpty={overview.daily.length === 0}
               emptyMetric="overview"
             />
-          </div>
 
-          <div className="grid gap-4 lg:grid-cols-2">
             <Heatmap
               title="Active days"
               subtitle={rangeLabel}
               start={start}
               end={end}
-              valueName="recorded events"
+              valueName="events"
               days={overview.daily.map((row) => ({
                 date: row.metric_date,
                 value:
@@ -548,7 +571,10 @@ function TotalsTable({
             const meta = totalLabel(entry.label)
             const value = meta.unit === 'minutes' ? formatMinutes(entry.current) : formatNumber(entry.current)
             const delta = formatDelta(entry.absolute_change, entry.percent_change, {
-              unit: meta.unit === 'minutes' ? 'minutes' : undefined,
+              // `format` already renders the unit ("45m"), and `formatDelta`
+              // appends `unit` after it — passing both produced "up 45m minutes".
+              // Only one of them carries the unit, so minutes rows pass the
+              // formatter alone.
               higherIsBetter: meta.higherIsBetter,
               ...(meta.unit === 'minutes' ? { format: (n: number) => formatMinutes(n) } : {}),
             })
@@ -787,7 +813,6 @@ function ProjectsTab({
               subtitle={rangeLabel}
               orientation="horizontal"
               colorByCategory
-              isLoading={query.isPending}
               data={projects.map((project) => ({
                 label: project.name,
                 rate: project.completion_rate,

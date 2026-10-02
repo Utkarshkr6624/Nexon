@@ -44,12 +44,19 @@ from enum import StrEnum
 __all__ = [
     "ActivityEvent",
     "CalendarEventType",
+    "EvidenceStrength",
     "KnowledgeEntityType",
     "KnowledgeLinkType",
     "NoteStatus",
     "ProjectPriority",
     "ProjectStatus",
+    "RecommendationPriority",
+    "RecommendationStatus",
+    "RecommendationType",
     "ResourceType",
+    "RiskSeverity",
+    "RiskStatus",
+    "RiskType",
     "TaskPriority",
     "TaskStatus",
     "WorkSessionStatus",
@@ -60,7 +67,11 @@ __all__ = [
     "validate_note_status",
     "validate_project_priority",
     "validate_project_status",
+    "validate_recommendation_status",
+    "validate_recommendation_type",
     "validate_resource_type",
+    "validate_risk_status",
+    "validate_risk_type",
     "validate_task_priority",
     "validate_task_status",
     "validate_work_session_status",
@@ -341,6 +352,24 @@ class ActivityEvent(StrEnum):
     KNOWLEDGE_LINK_CREATED = "knowledge_link_created"
     KNOWLEDGE_LINK_REMOVED = "knowledge_link_removed"
 
+    # Phase 7. The risk lifecycle and the recommendation feedback loop are
+    # recorded here for the same reason the task lifecycle is: a closed set,
+    # spelled once, that the columns and the API both validate against. These
+    # ten are the training labels Phase 10 will want, so writing them to
+    # `activity_events` rather than only to a status column is what preserves
+    # *when* and *in what order* a user responded -- the two things a status
+    # column cannot express and a classifier would need.
+    RISK_DETECTED = "risk_detected"
+    RISK_UPDATED = "risk_updated"
+    RISK_RESOLVED = "risk_resolved"
+    RISK_ACKNOWLEDGED = "risk_acknowledged"
+    RISK_DISMISSED = "risk_dismissed"
+    RECOMMENDATION_CREATED = "recommendation_created"
+    RECOMMENDATION_VIEWED = "recommendation_viewed"
+    RECOMMENDATION_ACCEPTED = "recommendation_accepted"
+    RECOMMENDATION_REJECTED = "recommendation_rejected"
+    RECOMMENDATION_COMPLETED = "recommendation_completed"
+
 
 def validate_project_status(value: ProjectStatus | str) -> ProjectStatus:
     """Coerce a stored or user-supplied value into a :class:`ProjectStatus`.
@@ -520,3 +549,213 @@ def validate_resource_type(value: ResourceType | str) -> ResourceType:
         return ResourceType(value)
     except ValueError:
         raise ValueError(f"Unknown resource type: {value!r}") from None
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — the intelligence vocabulary
+# ---------------------------------------------------------------------------
+
+
+class RiskType(StrEnum):
+    """What kind of condition a risk describes.
+
+    A closed set on purpose. The brief lists these seven and the risk engine
+    ships exactly these detectors, so a risk row can only ever name a condition
+    some detector knows how to re-derive — which is what makes "the condition
+    disappeared, so resolve the risk" a decidable question rather than a guess.
+    An eighth type would have no detector behind it and so could never be
+    evaluated or resolved.
+
+    ``DEADLINE`` and ``TASK`` are distinct on purpose even though both point at
+    a task: a deadline risk is about *time running out*, a task risk is about
+    the task itself (blocked, repeatedly rescheduled, effort far exceeding its
+    estimate). Splitting them means each carries its own formula and its own
+    thresholds rather than one averaged number that explains nothing.
+    """
+
+    DEADLINE = "deadline"
+    WORKLOAD = "workload"
+    PROJECT = "project"
+    TASK = "task"
+    SCHEDULING = "scheduling"
+    ESTIMATION = "estimation"
+    CONSISTENCY = "consistency"
+
+
+class RiskSeverity(StrEnum):
+    """How loudly a risk speaks.
+
+    Derived from the score, never set by hand. :func:`risk_severity_for` in
+    ``app.services.risk.scoring`` is the only thing that decides which band a
+    score falls in, so a score and its severity cannot disagree.
+
+    Ordered most-severe first. That is what lets a UI sort by severity with a
+    plain string comparison and get the right answer, and it is why the
+    persisted strings are words and not numbers — the ordering would be invisible
+    to a reader of a row six months later.
+    """
+
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class RiskStatus(StrEnum):
+    """Where a risk sits in its lifecycle.
+
+    ``ACTIVE`` and ``ACKNOWLEDGED`` are the two states a risk can be
+    *re-detected into* without creating a second row — that pair is what the
+    partial unique index on ``(user_id, risk_type, entity_type, entity_id)``
+    keys on, and it is the mechanism behind the brief's "avoid creating
+    duplicate risk records every time the detection engine runs".
+
+    ``ACKNOWLEDGED`` is not ``RESOLVED``: acknowledging says "I have seen this
+    and I accept it is still true", which is the state a risk the user intends
+    to live with should rest in so it stops competing for attention.
+    """
+
+    ACTIVE = "active"
+    ACKNOWLEDGED = "acknowledged"
+    RESOLVED = "resolved"
+    DISMISSED = "dismissed"
+
+
+class RecommendationType(StrEnum):
+    """What kind of action a recommendation proposes.
+
+    Every member names an action a *person* takes. None of them is an
+    operation NEXUS performs: the brief is explicit that the engine must not
+    reschedule anything without confirmation, and encoding that as a type list
+    containing no "do it now" member makes the constraint structural rather
+    than a rule somebody has to remember at each call site.
+    """
+
+    RESCHEDULE_TASK = "reschedule_task"
+    BREAK_DOWN_TASK = "break_down_task"
+    REDUCE_WORKLOAD = "reduce_workload"
+    START_TASK = "start_task"
+    PRIORITIZE_TASK = "prioritize_task"
+    REVIEW_DEADLINE = "review_deadline"
+    UPDATE_ESTIMATE = "update_estimate"
+    BLOCK_TIME = "block_time"
+    COMPLETE_BLOCKED_TASK = "complete_blocked_task"
+    REVIEW_PROJECT = "review_project"
+
+
+class RecommendationStatus(StrEnum):
+    """What has happened to a recommendation since it was raised.
+
+    The terminal states (``ACCEPTED``, ``REJECTED``, ``COMPLETED``, ``EXPIRED``)
+    are the training signal Phase 10 will want, and they are why every
+    transition is written to ``activity_events`` as well as to this column: the
+    column says what it is now, the event says when and in what order.
+
+    ``EXPIRED`` is set by the service when the risk that produced the
+    recommendation is resolved, rather than by a clock. A recommendation is not
+    merely old, it is moot — which is a different and more useful distinction.
+    """
+
+    NEW = "new"
+    VIEWED = "viewed"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+    EXPIRED = "expired"
+
+
+class RecommendationPriority(StrEnum):
+    """How soon a recommendation wants an answer.
+
+    Same ordering reasoning as :class:`RiskSeverity`, and derived the same way —
+    from the score of the risk that raised it — so priority and severity are two
+    views of one number rather than two opinions.
+    """
+
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class EvidenceStrength(StrEnum):
+    """How much data a risk or recommendation was derived from.
+
+    **This is deliberately not called confidence.** The brief forbids presenting
+    a deterministic rule as though it were a model's posterior, and the name is
+    where that misrepresentation would start. It says only what is true and
+    checkable: how many observations the rule had to work with.
+
+    This is the cold-start mechanism. A user with two completed tasks can have an
+    estimation risk, but it is reported at ``LOW`` evidence strength, which the
+    UI shows, so a thin sample never masquerades as a firm conclusion.
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+def validate_risk_type(value: RiskType | str) -> RiskType:
+    """Coerce a value into a :class:`RiskType`.
+
+    Raises:
+        ValueError: If the value is not a known type. ``risk_type`` is a third
+            of the risks table's deduplication index, so an unrecognised value
+            does not merely render badly — it defeats the constraint that stops
+            the same risk being inserted twice.
+    """
+    if isinstance(value, RiskType):
+        return value
+    try:
+        return RiskType(value)
+    except ValueError:
+        raise ValueError(f"Unknown risk type: {value!r}") from None
+
+
+def validate_risk_status(value: RiskStatus | str) -> RiskStatus:
+    """Coerce a value into a :class:`RiskStatus`.
+
+    Raises:
+        ValueError: If not a known status. The lifecycle transitions read this
+            column, so a value none of them recognise would strand the row in a
+            state no detector can ever resolve or re-detect.
+    """
+    if isinstance(value, RiskStatus):
+        return value
+    try:
+        return RiskStatus(value)
+    except ValueError:
+        raise ValueError(f"Unknown risk status: {value!r}") from None
+
+
+def validate_recommendation_type(value: RecommendationType | str) -> RecommendationType:
+    """Coerce a value into a :class:`RecommendationType`.
+
+    Raises:
+        ValueError: If not a known type, for the same reason as
+            :func:`validate_risk_type`.
+    """
+    if isinstance(value, RecommendationType):
+        return value
+    try:
+        return RecommendationType(value)
+    except ValueError:
+        raise ValueError(f"Unknown recommendation type: {value!r}") from None
+
+
+def validate_recommendation_status(value: RecommendationStatus | str) -> RecommendationStatus:
+    """Coerce a value into a :class:`RecommendationStatus`.
+
+    Raises:
+        ValueError: If not a known status. ``status`` is what the feedback
+            queries filter on, so an unrecognised value would be invisible to
+            every one of them — the row would exist and nothing would ever find
+            it again.
+    """
+    if isinstance(value, RecommendationStatus):
+        return value
+    try:
+        return RecommendationStatus(value)
+    except ValueError:
+        raise ValueError(f"Unknown recommendation status: {value!r}") from None

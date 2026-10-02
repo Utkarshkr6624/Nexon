@@ -295,7 +295,21 @@ class AnalyticsRepository:
             .values(**payload)
             .on_conflict_do_update(
                 index_elements=[DailyMetric.user_id, DailyMetric.metric_date],
-                set_={key: payload[key] for key in values},
+                set_={
+                    **{key: payload[key] for key in values},
+                    # `updated_at` is written by the statement rather than left to
+                    # the model. `TimestampMixin.updated_at` carries an `onupdate`
+                    # of `now()`, but that is a Core construct SQLAlchemy applies
+                    # to UPDATE statements it generates itself; a Core
+                    # `insert().on_conflict_do_update()` bypasses it entirely, so
+                    # without this the column would keep the timestamp of the
+                    # *first* rebuild forever. That timestamp is the only signal
+                    # the analytics API has for "these numbers are stale" and the
+                    # one the staleness banner renders, so a rebuild that did not
+                    # move it would leave the dashboard claiming to be current
+                    # while serving figures from hours or days ago.
+                    "updated_at": func.now(),
+                },
             )
             # `xmax = 0` distinguishes the two outcomes of the upsert: a tuple
             # inserted into a fresh slot carries the zero system version, while one
@@ -344,7 +358,13 @@ class AnalyticsRepository:
         statement = pg_insert(DailyMetric).values(payload)
         statement = statement.on_conflict_do_update(
             index_elements=[DailyMetric.user_id, DailyMetric.metric_date],
-            set_={column: getattr(statement.excluded, column) for column in _DAILY_METRIC_FIELDS},
+            set_={
+                **{column: getattr(statement.excluded, column) for column in _DAILY_METRIC_FIELDS},
+                # See `upsert_daily`: the batch form needs the same explicit write
+                # for the same reason, or a recompute leaves the row looking
+                # untouched to every freshness check that reads `updated_at`.
+                "updated_at": func.now(),
+            },
         )
         await self.session.execute(statement)
         await self.session.commit()
@@ -547,6 +567,23 @@ class AnalyticsRepository:
         so a task completed at 09:00 on its due date is on time. The comparison
         casts the instant to a date in UTC, consistently with every other day
         boundary in this module.
+
+        **A cancelled task is not counted**, and that is the same rule
+        :meth:`overdue_count_as_of` applies rather than a second opinion about
+        what overdue means. Dropping a task says "I decided not to do this", not
+        "I failed to do this in time", so a cancelled task is not an overdue
+        commitment — on the day it was due or any other. Leaving it out here
+        while :meth:`overdue_count_as_of` excluded it made the same task overdue
+        in the daily series and not overdue in the workload figure, which is
+        worse than either answer on its own.
+
+        Note what the exclusion is **not**: this count is not restricted to
+        currently-open statuses. A task completed *after* its due date was
+        genuinely overdue on that due date, and removing it from history would
+        rewrite the past to flatter the present — the very thing a daily series
+        exists to record. So only ``CANCELLED`` is filtered out; a completed task
+        still counts on the day it was late, which is what the completion
+        comparison elsewhere reports as a late completion.
         """
         day = Task.due_date
         completed_day = cast(Task.completed_at, Date)
@@ -554,6 +591,7 @@ class AnalyticsRepository:
             select(day, func.count())
             .where(
                 Task.owner_id == owner_id,
+                Task.status != TaskStatus.CANCELLED.value,
                 Task.due_date >= start,
                 Task.due_date <= end,
                 (Task.completed_at.is_(None)) | (completed_day > Task.due_date),

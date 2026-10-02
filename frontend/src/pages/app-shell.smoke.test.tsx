@@ -134,10 +134,16 @@ describe('application shell', () => {
     await user.type(screen.getByLabelText('Password'), 'correct-horse-battery')
     await user.click(screen.getByRole('button', { name: 'Sign in' }))
 
-    expect(await screen.findByRole('heading', dashboardHeading())).toBeInTheDocument()
+    // `/dashboard` is lazily loaded (`src/routes/lazy-pages.ts`), and the chunk
+    // now pulls in the analytics surface with it, so the heading can land well
+    // after the default 1s `findByRole` budget. The siblings below that also
+    // wait on a lazy route pass an explicit timeout for the same reason.
+    expect(
+      await screen.findByRole('heading', dashboardHeading(), { timeout: 20_000 }),
+    ).toBeInTheDocument()
     expect(useAuthStore.getState().status).toBe('authenticated')
     expect(useAuthStore.getState().accessToken).toBe('access-token')
-  })
+  }, 30_000)
 
   it('renders the shell, the sidebar groups and the live health card', async () => {
     renderApp()

@@ -45,13 +45,19 @@ MIGRATION_MODULES = (
     "migrations.versions.0004_phase4_planner",
     "migrations.versions.0005_phase5_knowledge",
     "migrations.versions.0006_phase6_analytics",
+    "migrations.versions.0007_phase7_intelligence",
 )
 
 PG = postgresql.dialect()
 
 _CONSTRAINT_LINE = re.compile(r"^(PRIMARY KEY|FOREIGN KEY|UNIQUE|CHECK|CONSTRAINT|EXCLUDE)\b")
 _CREATE_TABLE = re.compile(r"CREATE TABLE (\w+) \((.*?)\n\)[;]?", re.S)
-_CREATE_INDEX = re.compile(r"CREATE (UNIQUE )?INDEX (\w+) ON (\w+) \(([^)]*)\);")
+# The optional ``WHERE`` tail is what makes this match *partial* indexes.
+# Phase 7 introduced them — they are the whole deduplication mechanism — and
+# a regex that stopped at the closing paren would silently exclude every one
+# of them from the comparison, which is the failure mode this module exists
+# to prevent: an index that is never checked is an index that can drift.
+_CREATE_INDEX = re.compile(r"CREATE (UNIQUE )?INDEX (\w+) ON (\w+) \(([^)]*)\)(?: WHERE (.+?))?;")
 _ADD_COLUMN = re.compile(r"ALTER TABLE (\w+) ADD COLUMN (\w+) ([^;]+);")
 _RENAME_COLUMN = re.compile(r"ALTER TABLE (\w+) RENAME (\w+) TO (\w+);")
 _SET_NOT_NULL = re.compile(r"ALTER TABLE (\w+) ALTER COLUMN (\w+) SET NOT NULL;")
@@ -169,7 +175,15 @@ def _foreign_keys(ddl: str) -> set[tuple[str, str, str, str | None]]:
 
 @pytest.fixture(scope="module")
 def created_indexes(ddl: str) -> dict[str, tuple[str, tuple[str, ...], bool]]:
-    """``{index_name: (table, columns, unique)}``."""
+    """``{index_name: (table, columns, unique)}``.
+
+    The predicate of a partial index is deliberately *not* part of the value:
+    the comparison below is about which columns an index covers, and holding
+    the two sides to the exact text of a ``WHERE`` clause would make this
+    module fail on quoting differences rather than on schema drift. What
+    matters for a partial index is that it exists, covers the deduplication
+    key, and is unique — all three of which are asserted here.
+    """
     return {
         match.group(2): (
             match.group(3),
@@ -221,8 +235,9 @@ def test_the_migration_chain_is_linear_with_a_single_head():
     """
     script = ScriptDirectory.from_config(_alembic_config("postgresql+psycopg://unused"))
 
-    assert script.get_heads() == ["0006"]
+    assert script.get_heads() == ["0007"]
     assert [revision.revision for revision in script.walk_revisions()] == [
+        "0007",
         "0006",
         "0005",
         "0004",
@@ -231,6 +246,7 @@ def test_the_migration_chain_is_linear_with_a_single_head():
         "0001",
     ]
     assert {revision.revision: revision.down_revision for revision in script.walk_revisions()} == {
+        "0007": "0006",
         "0006": "0005",
         "0005": "0004",
         "0004": "0003",
@@ -577,6 +593,14 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
         # whose rows it summarises, so it cascades like every other per-user
         # table in the schema.
         "daily_metrics": 1,
+        # Phase 7. `recommendations` is the only table in the schema with two:
+        # the owning user, plus the risk it came from. That second one is SET
+        # NULL rather than CASCADE on purpose, so deleting a risk keeps the
+        # record of the user having acted on it — which is the training label,
+        # and the only reason to keep the link at all.
+        "risks": 1,
+        "recommendations": 2,
+        "risk_evaluations": 1,
     }
 
 
@@ -621,6 +645,49 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
         ("ix_activity_events_project_id", "activity_events", ("project_id",), False),
         ("ix_activity_events_task_id", "activity_events", ("task_id",), False),
         ("ix_activity_events_event_type", "activity_events", ("event_type",), False),
+        # Phase 7. The two partial unique indexes are the deduplication
+        # mechanism, so they are listed here like any other index — which is
+        # only possible because `_CREATE_INDEX` was taught to match a WHERE
+        # tail. Before that they were invisible to this comparison entirely.
+        (
+            "uq_risks_live_identity",
+            "risks",
+            ("user_id", "risk_type", "entity_type", "entity_id"),
+            True,
+        ),
+        ("ix_risks_user_id", "risks", ("user_id",), False),
+        ("ix_risks_detected_at", "risks", ("detected_at",), False),
+        (
+            "ix_risks_owner_status_severity",
+            "risks",
+            ("user_id", "status", "severity"),
+            False,
+        ),
+        (
+            "uq_recommendations_open_identity",
+            "recommendations",
+            ("user_id", "recommendation_type", "entity_type", "entity_id"),
+            True,
+        ),
+        ("ix_recommendations_user_id", "recommendations", ("user_id",), False),
+        (
+            "ix_recommendations_owner_status_priority",
+            "recommendations",
+            ("user_id", "status", "priority"),
+            False,
+        ),
+        (
+            "ix_risk_evaluations_user_id",
+            "risk_evaluations",
+            ("user_id",),
+            False,
+        ),
+        (
+            "ix_risk_evaluations_owner_evaluated",
+            "risk_evaluations",
+            ("user_id", "evaluated_at"),
+            False,
+        ),
     ],
 )
 def test_a_migrated_index_matches_the_model(index_name, table, columns, unique, created_indexes):

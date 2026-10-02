@@ -479,6 +479,12 @@ class TimeDistributionRead(BaseModel):
     available: bool
     reason_if_unavailable: str | None = None
     unassigned_minutes: int = 0
+    #: Echoes the ``project_id`` filter the response was computed under, as a
+    #: string. Declared ``str`` rather than ``UUID`` because this is a field of
+    #: report, not a lookup: the value is echoed so a client can confirm which
+    #: slice it is looking at, and a service that passes the raw ``UUID`` it
+    #: filtered on would raise a validation error on a field it populated
+    #: correctly.
     project_id: str | None = None
     by_project: list[TimeBucketRead] = Field(default_factory=list)
     by_task: list[TimeBucketRead] = Field(default_factory=list)
