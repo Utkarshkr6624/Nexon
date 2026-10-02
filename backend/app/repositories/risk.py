@@ -294,6 +294,28 @@ def _evidence_rows(evidence: Iterable[Mapping[str, Any] | Any]) -> list[dict[str
     return rows
 
 
+#: Column name -> ORM attribute name, for the columns where the two differ.
+#:
+#: ``metadata`` is reserved on a declarative class (``Base.metadata`` is the
+#: registry), so both risk models declare the column ``metadata`` under the
+#: attribute ``metadata_``. The Core insert path can use the column name
+#: directly; the ORM path — ``Risk(**values)`` and ``setattr`` — cannot, and
+#: using the column name there sets a stray instance attribute that SQLAlchemy
+#: never writes. The symptom was silent and total: every account-level risk
+#: (workload, consistency and estimation — three of the six detectors, and every
+#: risk whose ``entity_id`` is null) stored ``{}`` while its sibling going
+#: through the indexed path stored correctly.
+#:
+#: Translating once at the boundary is the fix. Renaming either side then needs
+#: changing in one place rather than in four scattered ORM writes.
+_ORM_ATTRIBUTE_OVERRIDES: dict[str, str] = {"metadata": "metadata_"}
+
+
+def _to_orm_attributes(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Rewrite column names to ORM attribute names for an ORM write."""
+    return {_ORM_ATTRIBUTE_OVERRIDES.get(key, key): value for key, value in values.items()}
+
+
 class RiskRepository:
     """Risk, recommendation, and evaluation persistence for one session.
 
@@ -643,8 +665,8 @@ class RiskRepository:
             entity_id=entity_id,
         )
         if existing is not None:
-            for column, value in values.items():
-                setattr(existing, column, value)
+            for attribute, value in _to_orm_attributes(values).items():
+                setattr(existing, attribute, value)
             # `updated_at` is a `TimestampMixin` column and this is an ORM write,
             # so the model's `onupdate` applies here; it is set explicitly nowhere
             # because the ORM already owns it on this path.
@@ -659,7 +681,7 @@ class RiskRepository:
             risk_type=risk_type,
             entity_type=entity_type,
             entity_id=entity_id,
-            **values,
+            **_to_orm_attributes(values),
         )
         self.session.add(row)
         await self.session.commit()
@@ -1162,8 +1184,8 @@ class RiskRepository:
             entity_id=entity_id,
         )
         if existing is not None:
-            for column, value in values.items():
-                setattr(existing, column, value)
+            for attribute, value in _to_orm_attributes(values).items():
+                setattr(existing, attribute, value)
             self.session.add(existing)
             await self.session.commit()
             await self.session.refresh(existing)
@@ -1175,7 +1197,7 @@ class RiskRepository:
             recommendation_type=recommendation_type,
             entity_type=entity_type,
             entity_id=entity_id,
-            **values,
+            **_to_orm_attributes(values),
         )
         self.session.add(row)
         await self.session.commit()

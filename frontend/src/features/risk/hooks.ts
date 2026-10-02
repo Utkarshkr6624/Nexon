@@ -178,9 +178,9 @@ function applyBand(page: RiskListRead, severity: RiskSeverity | undefined): Risk
  *
  * `placeholderData` keeps the previous page while a new filter or page is
  * fetched, so changing a filter or paging does not blank the list for a frame.
- * The rows on screen during that frame are the previous answer and are labelled
- * as such by the query's own `isPlaceholderData` flag, which the page can use
- * to dim the list rather than presenting stale rows as current.
+ * The rows on screen during that frame are the previous answer, and the page can
+ * read the query's `isPlaceholderData` flag and say so, rather than presenting
+ * them as the current answer for a filter that has not loaded yet.
  */
 export function useRisks(
   params: RiskQuery = {},

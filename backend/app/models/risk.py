@@ -118,9 +118,17 @@ DEFAULT_RECOMMENDATION_STATUS = "new"
 #: words; anything longer belongs in ``description``.
 _MAX_RISK_TITLE_LENGTH = 200
 _MAX_RECOMMENDATION_TITLE_LENGTH = 200
-#: Sized for a short vocabulary word. The longest member any column here stores
-#: is ``acknowledged`` (12).
+#: Sized for a short vocabulary word. The longest *risk* member any column here
+#: stores is ``acknowledged`` (12), so 16 has room.
 _MAX_RISK_ENUM_LENGTH = 16
+#: Sized for a recommendation member instead, and it needs more than the risk
+#: constant: ``complete_blocked_task`` is 21 characters. Sizing both columns
+#: from one "longest enum member" number produced a ``String(16)`` that
+#: truncated the single longest value on insert — the blocked-task rule fired
+#: correctly and then died in the database. The two widths are now named
+#: separately so adding a longer recommendation type does not silently
+#: require widening the risk columns too.
+_MAX_RECOMMENDATION_TYPE_LENGTH = 32
 #: Sized for an entity type like ``project`` or ``task``.
 _MAX_ENTITY_TYPE_LENGTH = 32
 
@@ -288,7 +296,9 @@ class Recommendation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
         nullable=False,
     )
-    recommendation_type: Mapped[str] = mapped_column(String(_MAX_RISK_ENUM_LENGTH), nullable=False)
+    recommendation_type: Mapped[str] = mapped_column(
+        String(_MAX_RECOMMENDATION_TYPE_LENGTH), nullable=False
+    )
     priority: Mapped[str] = mapped_column(
         String(_MAX_RISK_ENUM_LENGTH),
         server_default=DEFAULT_RECOMMENDATION_PRIORITY,

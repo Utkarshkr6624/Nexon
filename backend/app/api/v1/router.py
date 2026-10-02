@@ -11,9 +11,12 @@ from app.api.v1 import (
     availability,
     calendar,
     health,
+    intelligence,
     knowledge,
     planner,
     projects,
+    recommendations,
+    risks,
     tags,
     tasks,
     users,
@@ -34,5 +37,8 @@ api_v1_router.include_router(planner.router)
 api_v1_router.include_router(availability.router)
 api_v1_router.include_router(knowledge.router)
 api_v1_router.include_router(analytics.router)
+api_v1_router.include_router(risks.router)
+api_v1_router.include_router(recommendations.router)
+api_v1_router.include_router(intelligence.router)
 
 __all__ = ["api_v1_router"]

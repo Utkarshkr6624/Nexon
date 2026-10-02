@@ -216,3 +216,39 @@ export type {
   WorkEventType,
   WorkTag,
 } from './work'
+
+// Phase 7. Re-exported like every other feature's types so consumers reach them
+// from the barrel rather than importing `@/types/risk` directly — the risk
+// vocabulary is a set of frozen arrays as well as derived types, so the
+// constants are re-exported by value and the rest as types.
+export {
+  EVIDENCE_STRENGTHS,
+  OPEN_RECOMMENDATION_STATUSES,
+  RECOMMENDATION_PRIORITIES,
+  RECOMMENDATION_STATUSES,
+  RECOMMENDATION_TYPES,
+  RISK_SEVERITIES,
+  RISK_STATUSES,
+  RISK_TYPES,
+} from './risk'
+export type {
+  EvaluationListParams,
+  EvaluationParams,
+  EvaluationRead,
+  EvidenceStrength,
+  RecommendationListParams,
+  RecommendationListRead,
+  RecommendationPriority,
+  RecommendationRead,
+  RecommendationStatus,
+  RecommendationSummaryRead,
+  RecommendationType,
+  RiskEvidenceRead,
+  RiskListParams,
+  RiskListRead,
+  RiskRead,
+  RiskSeverity,
+  RiskStatus,
+  RiskSummaryRead,
+  RiskType,
+} from './risk'

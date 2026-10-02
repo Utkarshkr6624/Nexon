@@ -184,7 +184,7 @@ class RecommendationRead(BaseModel):
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        validation_alias=AliasChoices("metadata", "metadata_"),
+        validation_alias=AliasChoices("metadata_", "metadata"),
         description="The raw inputs behind the recommendation. Same role as "
         "`Risk.metadata`: what makes a stored suggestion auditable after the "
         "aggregates it was computed from have been rebuilt.",

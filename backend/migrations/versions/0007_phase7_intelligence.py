@@ -173,7 +173,11 @@ def upgrade() -> None:
         "recommendations",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("recommendation_type", sa.String(length=16), nullable=False),
+        # 32, not 16: `complete_blocked_task` is 21 characters. The risk
+        # columns are 16 because their longest member is `acknowledged` (12);
+        # sharing one width across both vocabularies truncated the longest
+        # recommendation type at insert time.
+        sa.Column("recommendation_type", sa.String(length=32), nullable=False),
         sa.Column("priority", sa.String(length=16), server_default="medium", nullable=False),
         sa.Column("title", sa.String(length=200), nullable=False),
         sa.Column("description", sa.Text(), nullable=False),

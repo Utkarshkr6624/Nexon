@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 
 import { MetricCard } from '@/features/analytics/components/metric-card'
 import { RiskEmptyState } from '@/features/risk/components/risk-empty-state'
-import { SEVERITY_META } from '@/features/risk/components/severity-badge'
+import { SEVERITY_META } from '@/features/risk/components/risk-vocabulary'
 import { cn } from '@/lib/utils'
 import { RISK_SEVERITIES, type RiskSeverity, type RiskSummaryRead } from '@/types/risk'
 
@@ -107,8 +107,10 @@ export function RiskSummaryTiles({
                 label={meta.label}
                 value={counts[severity]}
                 icon={meta.icon}
+                // The band threshold is the hint, not a tooltip: the header row
+                // is the first thing read on the page and a band definition
+                // hidden behind hover is a definition nobody opens.
                 hint={meta.description}
-                explanation={meta.description}
               />
             </Link>
           )

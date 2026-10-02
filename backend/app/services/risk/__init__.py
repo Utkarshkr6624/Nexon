@@ -14,7 +14,8 @@ database, and the orchestration that reads the database can be asserted against
 a seeded fixture. Neither test needs the other.
 """
 
-from app.services.risk.recommendation import RecommendationService
+from app.services.risk.detection import RiskDetectionService
+from app.services.risk.recommendation import RecommendationService, recommendation_rules
 from app.services.risk.scoring import (
     NOT_ENOUGH_DATA,
     RiskEvidence,
@@ -32,6 +33,7 @@ from app.services.risk.scoring import (
 __all__ = [
     "NOT_ENOUGH_DATA",
     "RecommendationService",
+    "RiskDetectionService",
     "RiskEvidence",
     "RiskResult",
     "consistency_risk",

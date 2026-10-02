@@ -292,7 +292,7 @@ def deadline_risk(
     *,
     remaining_minutes: int,
     available_minutes: int,
-    deadline_in_hours: float,
+    deadline_in_hours: float | None,
     priority: str = "medium",
     historical_completion_rate: float | None = None,
     title: str = "",
@@ -444,7 +444,7 @@ def deadline_risk(
 # ---------------------------------------------------------------------------
 
 #: How far past 100% the load must run before the score reaches 100. At 127%
-#: — the brief's worked example — the score is 54, which bands HIGH. Chosen so
+#: — the brief's worked example — the score is 53, which bands HIGH. Chosen so
 #: that "half again your capacity" is the worst case rather than "any
 #: overcommitment at all", because a 5% overcommitment on a month-long horizon is
 #: noise and should not shout.
@@ -462,8 +462,10 @@ def workload_risk(
         score = round(100 * max(0, ratio - 1) / 0.5)
 
     Linear above the line and identically zero at or below it. The brief's
-    example — 30 hours available, 38 scheduled, 127% — gives ``0.27 / 0.5``,
-    so **54 — HIGH**.
+    example — 30 hours available, 38 scheduled, 127% — gives
+    ``round(100 x 0.2667 / 0.5)``, so **53 — HIGH**. (The figure is 53 rather
+    than a round 54 because 38/30 is a repeating decimal; the rounding is the
+    formula's, not the example's, and ``tests/test_risk_scoring.py`` pins it.)
 
     ``available_minutes=None`` is *unconfigured availability*, which is not the
     same as zero available time and does not score 100. There is no capacity to

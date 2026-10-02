@@ -298,31 +298,3 @@ export function RiskCard({
     </Card>
   )
 }
-
-export interface RiskEntityLinkProps {
-  risk: RiskRead
-  href: string
-  className?: string
-}
-
-/**
- * The affected entity as a link, for a page that already knows the route shape.
- *
- * Kept separate from the card so a list row and a detail header can place it
- * differently while sharing one label, and so the card itself never has to know
- * a route.
- */
-export function RiskEntityLink({ risk, href, className }: RiskEntityLinkProps) {
-  if (!risk.entity_type) return null
-  return (
-    <Link
-      to={href}
-      className={cn(
-        'text-xs font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-        className,
-      )}
-    >
-      {entityLabel(risk.entity_type)}
-    </Link>
-  )
-}

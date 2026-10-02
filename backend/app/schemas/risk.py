@@ -222,7 +222,7 @@ class RiskRead(BaseModel):
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        validation_alias=AliasChoices("metadata", "metadata_"),
+        validation_alias=AliasChoices("metadata_", "metadata"),
         description="The raw inputs the score was computed from. Kept beside the "
         "evidence so a stored risk stays auditable after the analytics it was "
         "built from have been rebuilt. Empty when a detector recorded nothing "
