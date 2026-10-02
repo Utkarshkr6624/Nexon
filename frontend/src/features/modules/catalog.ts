@@ -503,5 +503,13 @@ export const ALL_NAV_ITEMS: ModuleDefinition[] = [
 ]
 
 export function findModule(path: string): ModuleDefinition | undefined {
-  return ALL_NAV_ITEMS.find((module) => module.to === path)
+  const exact = ALL_NAV_ITEMS.find((module) => module.to === path)
+  if (exact) return exact
+  // Nested routes carry an id: `/projects/:id`, `/knowledge/notes/:noteId`.
+  // Resolving to the longest registered prefix keeps the breadcrumb and the
+  // active-nav highlight correct on a detail page instead of falling through to
+  // "Not found". The separator check stops `/projects` matching `/projectsfoo`.
+  return ALL_NAV_ITEMS.filter(
+    (module) => path.startsWith(`${module.to}/`),
+  ).sort((a, b) => b.to.length - a.to.length)[0]
 }

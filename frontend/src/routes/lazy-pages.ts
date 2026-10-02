@@ -5,9 +5,13 @@ import { lazy } from 'react'
 
 export const DashboardPage = lazy(() => import('@/pages/dashboard-page'))
 export const ProjectsPage = lazy(() => import('@/pages/projects-page'))
+export const ProjectDetailPage = lazy(() => import('@/pages/project-detail-page'))
 export const TasksPage = lazy(() => import('@/pages/tasks-page'))
 export const PlannerPage = lazy(() => import('@/pages/planner-page'))
+export const MonthPage = lazy(() => import('@/pages/month-page'))
 export const KnowledgePage = lazy(() => import('@/pages/knowledge-page'))
+export const NoteDetailPage = lazy(() => import('@/pages/note-detail-page'))
+export const ConceptDetailPage = lazy(() => import('@/pages/concept-detail-page'))
 export const SearchPage = lazy(() => import('@/pages/search-page'))
 export const AnalyticsPage = lazy(() => import('@/pages/analytics-page'))
 export const DeveloperPage = lazy(() => import('@/pages/developer-page'))

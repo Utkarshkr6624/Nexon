@@ -50,6 +50,10 @@ NEVER_APPLIED_TWO = "Never-Applied-Two-22"
 
 USER_PERMISSIONS = [
     "analytics.read",
+    "calendar.read",
+    "calendar.write",
+    "knowledge.read",
+    "knowledge.write",
     "projects.read",
     "projects.write",
     "tasks.read",

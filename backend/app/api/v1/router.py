@@ -4,7 +4,21 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1 import activity, auth, health, projects, tags, tasks, users
+from app.api.v1 import (
+    activity,
+    analytics,
+    auth,
+    availability,
+    calendar,
+    health,
+    knowledge,
+    planner,
+    projects,
+    tags,
+    tasks,
+    users,
+    work_sessions,
+)
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(health.router)
@@ -14,5 +28,11 @@ api_v1_router.include_router(projects.router)
 api_v1_router.include_router(tasks.router)
 api_v1_router.include_router(tags.router)
 api_v1_router.include_router(activity.router)
+api_v1_router.include_router(calendar.router)
+api_v1_router.include_router(work_sessions.router)
+api_v1_router.include_router(planner.router)
+api_v1_router.include_router(availability.router)
+api_v1_router.include_router(knowledge.router)
+api_v1_router.include_router(analytics.router)
 
 __all__ = ["api_v1_router"]

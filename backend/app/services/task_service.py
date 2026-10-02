@@ -626,6 +626,30 @@ class TaskService:
         )
         return updated
 
+    async def start(self, *, task: Task, owner: User) -> Task:
+        """Move a task into ``IN_PROGRESS``.
+
+        This transition is load-bearing rather than cosmetic. The state machine
+        in :data:`_LEGAL_TRANSITIONS` only permits ``COMPLETED`` from
+        ``IN_PROGRESS`` or ``BLOCKED``, so without a way to *reach*
+        ``IN_PROGRESS`` a task can never be completed over HTTP at all: the
+        board's In Progress column stays empty, ``TASK_STARTED`` never fires,
+        and every completion metric in the analytics phase reads zero for a
+        reason that has nothing to do with the user's behaviour.
+
+        Args:
+            task: The task, already resolved for this owner.
+            owner: The authenticated caller.
+
+        Returns:
+            The task in ``IN_PROGRESS``.
+
+        Raises:
+            NotFoundError: If the row does not belong to the caller.
+            ValidationError: If the current status may not start.
+        """
+        return await self.set_status(task=task, status=TaskStatus.IN_PROGRESS, owner=owner)
+
     async def complete(self, *, task: Task, owner: User) -> Task:
         """Complete a task, refusing while anything it waits on is unfinished.
 
@@ -783,6 +807,100 @@ class TaskService:
             task_id=None,
             metadata={"task_id": str(task_id), "title": title, "status": status},
         )
+
+    # -- Scheduling (Phase 4) ----------------------------------------------
+
+    async def schedule(
+        self,
+        *,
+        task: Task,
+        owner: User,
+        start_date: date,
+        due_date: date | None = None,
+    ) -> Task:
+        """Put a date on a task, recording the moment it was given one.
+
+        **PHASE 4 ADDITION — this is the only change this module makes for the
+        planner.** Everything above it is Phase 3 and is untouched. The planner
+        needs one thing from the task service and this is it: a single, ruled
+        door onto "this task is now planned for these dates", which
+        :meth:`update` deliberately is not, because a blanket PATCH able to write
+        ``start_date`` would record no moment for the event the activity feed
+        exists to capture.
+
+        Two events, not one, because they answer different questions.
+        ``TASK_SCHEDULED`` is "I put a date on this"; ``TASK_RESCHEDULED`` is
+        "that date moved". A report on replanning collapses the two into an
+        indistinguishable "task updated" line, and the question the feed is
+        actually asked — "when did this slip?" — becomes unanswerable.
+
+        Args:
+            task: The task, already resolved for this owner.
+            owner: The authenticated caller.
+            start_date: The first day of the planned window.
+            due_date: A new deadline, or ``None`` to leave the stored one alone.
+                An explicit ``None`` cannot mean "clear it": that is a question
+                about the stored value, and clearing a deadline is what
+                :meth:`unschedule` is for.
+
+        Returns:
+            The updated task.
+
+        Raises:
+            NotFoundError: If the row is not the caller's.
+            ValidationError: If the resulting window ends before it starts.
+        """
+        self._owned(task, owner)
+        effective_due = due_date if due_date is not None else task.due_date
+        if effective_due is not None and effective_due < start_date:
+            raise ValidationError("due_date must not be earlier than start_date.")
+        was_scheduled = task.start_date is not None
+        updated = await self.repository.update_fields(
+            task, start_date=start_date, due_date=effective_due
+        )
+        await self._record(
+            ActivityEvent.TASK_RESCHEDULED if was_scheduled else ActivityEvent.TASK_SCHEDULED,
+            owner=owner,
+            task=updated,
+            metadata={
+                "start_date": start_date.isoformat(),
+                "due_date": effective_due.isoformat() if effective_due else None,
+                "rescheduled": was_scheduled,
+            },
+        )
+        return updated
+
+    async def unschedule(self, *, task: Task, owner: User) -> Task:
+        """Take the planned window off a task.
+
+        A task that was never scheduled is returned unchanged, so a retried
+        unschedule is idempotent rather than an error.
+
+        ``ActivityEvent`` has no ``TASK_UNSCHEDULED`` member, and inventing one
+        here would put a value in a shared vocabulary on the say-so of the one
+        service that wanted it. The clearing therefore rides on ``TASK_UPDATED``
+        with the removal named in the metadata, which a reader can filter on;
+        adding the member belongs to whoever owns ``app.models.enums``. Flagged
+        for review.
+
+        Raises:
+            NotFoundError: If the row is not the caller's.
+        """
+        self._owned(task, owner)
+        if task.start_date is None:
+            return task
+        # Read before the write: ``update_fields`` mutates this very instance, so
+        # comparing against ``task.start_date`` afterwards would always find it
+        # already cleared.
+        previous = task.start_date
+        updated = await self.repository.update_fields(task, start_date=None)
+        await self._record(
+            ActivityEvent.TASK_UPDATED,
+            owner=owner,
+            task=updated,
+            metadata={"unscheduled": True, "previous_start_date": previous.isoformat()},
+        )
+        return updated
 
     # -- Tags ----------------------------------------------------------------
 

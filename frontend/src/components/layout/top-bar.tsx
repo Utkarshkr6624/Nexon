@@ -21,8 +21,10 @@ export interface TopBarProps {
 function useBreadcrumb() {
   const { pathname } = useLocation()
   const module = findModule(pathname)
+  // Resolved through `findModule` so a detail route (`/projects/:id`) inherits
+  // its parent's group instead of falling back to "Platform".
   const group = NAV_GROUPS.find((candidate) =>
-    candidate.items.some((item) => item.to === pathname),
+    candidate.items.some((item) => findModule(pathname)?.to === item.to),
   )
   return { title: module?.label ?? 'Not found', group: group?.label ?? 'Platform' }
 }

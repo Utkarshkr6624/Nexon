@@ -61,6 +61,20 @@ class Permission(StrEnum):
     TASKS_READ = "tasks.read"
     TASKS_WRITE = "tasks.write"
     ANALYTICS_READ = "analytics.read"
+    # The calendar is the one Phase 4 surface with its own pair rather than
+    # reusing `tasks.*`. It is separate because a calendar row is not a task row:
+    # a meeting has no task, a deadline does have one, and conflating them would
+    # make "who may book time" and "who may edit the work" the same question.
+    CALENDAR_READ = "calendar.read"
+    CALENDAR_WRITE = "calendar.write"
+    # Phase 5 knowledge has its own pair rather than reusing `projects.*`. Every
+    # one of those tables is per-user and filtered by `owner_id` in the query, so
+    # the permission is not what stops a cross-user read — it is a separate,
+    # separately-revocable capability for the knowledge surface, which is the
+    # one part of NEXUS a user might reasonably want to be able to turn off
+    # without losing their planner.
+    KNOWLEDGE_READ = "knowledge.read"
+    KNOWLEDGE_WRITE = "knowledge.write"
 
 
 def validate_permission(value: Permission | str) -> Permission:
@@ -92,6 +106,30 @@ def validate_permission(value: Permission | str) -> Permission:
 #: anyway, and the one thing the map is for (a readable answer to "what may an
 #: ordinary user do?") would become "everything except the thing they most
 #: obviously need".
+#:
+#: Phase 4 grants ``user`` BOTH calendar permissions. The alternative — a
+#: read-only calendar for ordinary users — was considered and rejected on the
+#: same grounds as ``users.write`` above: a personal planner whose owner cannot
+#: book a meeting is not a planner, and the planner is the feature. Withholding
+#: the grant would not be safer, only broken, because the calendar is *per user*
+#: and every write is ownership-scoped in the query rather than in this map: a
+#: ``calendar.write`` holder can only ever touch rows carrying the caller's own
+#: ``owner_id``. The permission that would matter here is trust in that filter,
+#: which every other write in the system already extends.
+#:
+#: Phase 5 grants ``user`` BOTH knowledge permissions for exactly the same
+#: reason. Notes, concepts, resources, bookmarks, documents, categories and
+#: knowledge links are all per-user, and every read in
+#: :mod:`app.services.knowledge_service` carries ``owner_id`` in its ``WHERE``
+#: clause — including the polymorphic link endpoints, which have no foreign key
+#: and are therefore resolved through an owner-scoped lookup *before* an edge is
+#: written. The grant is a statement about the feature existing, not a statement
+#: that this map enforces the isolation.
+#:
+#: **``tests/test_permissions.py`` asserts both the full member set and the full
+#: ``user`` grant as literal sets, so it must be extended with these two
+#: members or it will fail.** Flagged here because a red test is otherwise easy
+#: to misread as a regression in this file.
 ROLE_PERMISSIONS: Mapping[str, frozenset[Permission]] = {
     USER_ROLE: frozenset(
         {
@@ -102,8 +140,14 @@ ROLE_PERMISSIONS: Mapping[str, frozenset[Permission]] = {
             Permission.TASKS_READ,
             Permission.TASKS_WRITE,
             Permission.ANALYTICS_READ,
+            Permission.CALENDAR_READ,
+            Permission.CALENDAR_WRITE,
+            Permission.KNOWLEDGE_READ,
+            Permission.KNOWLEDGE_WRITE,
         }
     ),
+    # ADMIN_ROLE is `frozenset(Permission)`, so both new members are granted to
+    # admin automatically — adding a permission can never silently omit it.
     ADMIN_ROLE: frozenset(Permission),
 }
 

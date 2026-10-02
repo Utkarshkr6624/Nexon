@@ -43,17 +43,36 @@ from app.core.exceptions import UnauthorizedError
 from app.core.security import TokenType, decode_token
 from app.models.user import User
 from app.repositories.activity import ActivityRepository
+from app.repositories.analytics import AnalyticsRepository
 from app.repositories.audit import AuditRepository
+from app.repositories.knowledge import (
+    BookmarkRepository,
+    CategoryRepository,
+    ConceptRepository,
+    DocumentRepository,
+    KnowledgeLinkRepository,
+    NoteRepository,
+    ResourceRepository,
+)
 from app.repositories.password_reset import PasswordResetRepository
+from app.repositories.planner import (
+    AvailabilityRuleRepository,
+    CalendarEventRepository,
+    WorkSessionRepository,
+)
 from app.repositories.project import ProjectRepository
 from app.repositories.session import SessionRepository
 from app.repositories.tag import TagRepository
 from app.repositories.task import TaskRepository
 from app.repositories.user import UserRepository
 from app.services.activity_service import ActivityService
+from app.services.analytics import AnalyticsService
 from app.services.audit_service import AuditService
 from app.services.auth_service import AuthService
+from app.services.knowledge_service import KnowledgeService
+from app.services.planner_service import PlannerService
 from app.services.project_service import ProjectService
+from app.services.scheduling_service import SchedulingService
 from app.services.session_service import SessionService
 from app.services.tag_service import TagService
 from app.services.task_service import TaskService
@@ -107,12 +126,90 @@ def get_activity_repository(session: DbSession) -> ActivityRepository:
     return ActivityRepository(session)
 
 
+def get_analytics_repository(session: DbSession) -> AnalyticsRepository:
+    """Provide a request-scoped daily-aggregate repository.
+
+    The one Phase 6 table, and the only reason a separate provider exists rather
+    than the service taking a session: the upsert's conflict target is the
+    ``UNIQUE (user_id, metric_date)`` constraint declared by the model, so the
+    storage detail belongs in the storage layer.
+    """
+    return AnalyticsRepository(session)
+
+
+def get_calendar_event_repository(session: DbSession) -> CalendarEventRepository:
+    """Provide a request-scoped calendar-event repository."""
+    return CalendarEventRepository(session)
+
+
+def get_work_session_repository(session: DbSession) -> WorkSessionRepository:
+    """Provide a request-scoped work-session repository."""
+    return WorkSessionRepository(session)
+
+
+def get_availability_rule_repository(session: DbSession) -> AvailabilityRuleRepository:
+    """Provide a request-scoped availability-rule repository."""
+    return AvailabilityRuleRepository(session)
+
+
+def get_note_repository(session: DbSession) -> NoteRepository:
+    """Provide a request-scoped note repository."""
+    return NoteRepository(session)
+
+
+def get_concept_repository(session: DbSession) -> ConceptRepository:
+    """Provide a request-scoped concept repository."""
+    return ConceptRepository(session)
+
+
+def get_resource_repository(session: DbSession) -> ResourceRepository:
+    """Provide a request-scoped resource repository."""
+    return ResourceRepository(session)
+
+
+def get_bookmark_repository(session: DbSession) -> BookmarkRepository:
+    """Provide a request-scoped bookmark repository."""
+    return BookmarkRepository(session)
+
+
+def get_document_repository(session: DbSession) -> DocumentRepository:
+    """Provide a request-scoped document repository."""
+    return DocumentRepository(session)
+
+
+def get_category_repository(session: DbSession) -> CategoryRepository:
+    """Provide a request-scoped category repository."""
+    return CategoryRepository(session)
+
+
+def get_knowledge_link_repository(session: DbSession) -> KnowledgeLinkRepository:
+    """Provide a request-scoped knowledge-link repository."""
+    return KnowledgeLinkRepository(session)
+
+
 SessionRepositoryDep = Annotated[SessionRepository, Depends(get_session_repository)]
 AuditRepositoryDep = Annotated[AuditRepository, Depends(get_audit_repository)]
 PasswordResetRepositoryDep = Annotated[
     PasswordResetRepository, Depends(get_password_reset_repository)
 ]
 ActivityRepositoryDep = Annotated[ActivityRepository, Depends(get_activity_repository)]
+AnalyticsRepositoryDep = Annotated[AnalyticsRepository, Depends(get_analytics_repository)]
+CalendarEventRepositoryDep = Annotated[
+    CalendarEventRepository, Depends(get_calendar_event_repository)
+]
+WorkSessionRepositoryDep = Annotated[WorkSessionRepository, Depends(get_work_session_repository)]
+AvailabilityRuleRepositoryDep = Annotated[
+    AvailabilityRuleRepository, Depends(get_availability_rule_repository)
+]
+NoteRepositoryDep = Annotated[NoteRepository, Depends(get_note_repository)]
+ConceptRepositoryDep = Annotated[ConceptRepository, Depends(get_concept_repository)]
+ResourceRepositoryDep = Annotated[ResourceRepository, Depends(get_resource_repository)]
+BookmarkRepositoryDep = Annotated[BookmarkRepository, Depends(get_bookmark_repository)]
+DocumentRepositoryDep = Annotated[DocumentRepository, Depends(get_document_repository)]
+CategoryRepositoryDep = Annotated[CategoryRepository, Depends(get_category_repository)]
+KnowledgeLinkRepositoryDep = Annotated[
+    KnowledgeLinkRepository, Depends(get_knowledge_link_repository)
+]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
@@ -292,6 +389,211 @@ def get_tag_service(
 TagServiceDep = Annotated[TagService, Depends(get_tag_service)]
 
 
+def get_planner_service(
+    events: CalendarEventRepositoryDep,
+    sessions: WorkSessionRepositoryDep,
+    availability: AvailabilityRuleRepositoryDep,
+    projects: ProjectRepositoryDep,
+    tasks: TaskRepositoryDep,
+    activity: ActivityServiceDep,
+    audit: AuditServiceDep,
+    settings: SettingsDep,
+) -> PlannerService:
+    """Provide a request-scoped planner service.
+
+    **Three planner repositories, not one, because the three tables answer three
+    different questions.** An event is a point on a calendar, a work session is a
+    block of time against a task, and an availability rule is a recurring weekly
+    wall-clock window with no instant of its own. There is no join that would
+    collapse them, and one repository taking all three would be a repository
+    whose name had to list them.
+
+    ``projects`` and ``tasks`` are needed because an event or session may point
+    at a project or a task, and every such reference is re-checked through the
+    *scoped* lookup before it is written. The task repository additionally
+    supplies the scheduling engine's candidate backlog.
+
+    ``activity`` is wired rather than left as the service's documented ``None``
+    mode for the reason this module's docstring gives in full: a service built
+    from a degraded collaborator is not a simpler object graph, it is one that
+    silently does less. Booking a meeting, starting a timer and accepting a
+    planner suggestion are all facts about the work, and the activity feed is
+    where a user reads them back.
+
+    ``audit`` is accepted for symmetry with the other services and used by
+    neither, on ``ProjectService``'s reasoning: booking a meeting is a fact about
+    the work, not a fact about the account, and ``audit_logs`` is the security
+    trail.
+    """
+    return PlannerService(
+        events,
+        sessions,
+        availability,
+        projects,
+        tasks,
+        activity=activity,
+        audit=audit,
+        settings=settings,
+    )
+
+
+PlannerServiceDep = Annotated[PlannerService, Depends(get_planner_service)]
+
+
+def get_scheduling_service(
+    planner: PlannerServiceDep,
+    tasks: TaskRepositoryDep,
+    activity: ActivityServiceDep,
+    audit: AuditServiceDep,
+    settings: SettingsDep,
+) -> SchedulingService:
+    """Provide a request-scoped scheduling service.
+
+    **It takes the whole :class:`PlannerService` rather than the four
+    repositories underneath it.** The engine creates work sessions through
+    ``PlannerService.create_session``, not through the session repository
+    directly, and that is the point: a session accepted from a suggestion and one
+    created by hand then pass through exactly one set of rules — the window check,
+    the scoped lookups for ``task_id``/``project_id``, the status default — so
+    the engine cannot produce a row the API would have refused, and a change to
+    those rules cannot leave one of the two doors behind.
+
+    ``tasks`` supplies the candidate backlog: the open tasks that have both an
+    estimate and a due date, which is what makes a slot placeable rather than
+    arbitrary.
+
+    ``activity`` records ``PLANNER_SUGGESTION_ACCEPTED`` and
+    ``PLANNER_SUGGESTION_REJECTED``. It is wired rather than left as the
+    service's documented ``None`` mode because a schedule a user acted on and a
+    schedule they refused are exactly the two facts a later "why did you book
+    that?" question needs, and a rejected suggestion nobody recorded is
+    indistinguishable from one that was never made.
+
+    ``audit`` is accepted for symmetry and used by neither, on the reasoning the
+    other services give: accepting a slot is a fact about the work, not about the
+    account.
+    """
+    return SchedulingService(
+        planner,
+        tasks,
+        activity=activity,
+        audit=audit,
+        settings=settings,
+    )
+
+
+SchedulingServiceDep = Annotated[SchedulingService, Depends(get_scheduling_service)]
+
+
+def get_knowledge_service(
+    notes: NoteRepositoryDep,
+    concepts: ConceptRepositoryDep,
+    resources: ResourceRepositoryDep,
+    bookmarks: BookmarkRepositoryDep,
+    documents: DocumentRepositoryDep,
+    categories: CategoryRepositoryDep,
+    links: KnowledgeLinkRepositoryDep,
+    activity: ActivityServiceDep,
+    audit: AuditServiceDep,
+    settings: SettingsDep,
+) -> KnowledgeService:
+    """Provide a request-scoped knowledge service.
+
+    **Seven repositories, not one, and the reason is the schema rather than
+    taste.** Notes, concepts, resources, bookmarks, documents, categories and
+    links are seven tables with seven different uniqueness rules — a duplicate
+    edge is a conflict on a five-column key, a duplicate bookmark is a conflict
+    on ``(owner_id, url)``, a category is a self-referencing tree — and there is
+    no join that would collapse them. One repository taking all seven would be a
+    repository whose name had to list them.
+
+    ``links`` is the one that cannot be folded into the others. ``knowledge_links``
+    is **polymorphic**: ``source_type`` chooses which table ``source_id`` points
+    at, so neither endpoint column carries a foreign key. Only the link service
+    can resolve an endpoint through the right owner-scoped query before writing,
+    which is why the repositories above are all injected here rather than left for
+    the link service to construct itself.
+
+    ``activity`` records the Phase 5 events — a note published, an edge created —
+    beside the write they describe. It is wired rather than left as the service's
+    documented ``None`` mode for the reason this module's docstring gives in
+    full: a service built from a degraded collaborator is not a simpler object
+    graph, it is one that silently does less, and the Phase 6 analytics that read
+    this feed are downstream of it being true.
+
+    ``audit`` is accepted for symmetry with the other services and used by
+    neither, on ``ProjectService``'s reasoning: writing a note is a fact about
+    the work, not a fact about the account, and ``audit_logs`` is the security
+    trail.
+
+    Settings are injected rather than left to the service's own ``get_settings()``
+    fallback, so the values a request runs under are the ones resolved for it.
+    """
+    return KnowledgeService(
+        notes,
+        concepts,
+        resources,
+        bookmarks,
+        documents,
+        categories,
+        links,
+        activity=activity,
+        audit=audit,
+        settings=settings,
+    )
+
+
+KnowledgeServiceDep = Annotated[KnowledgeService, Depends(get_knowledge_service)]
+
+
+def get_analytics_service(
+    metrics: AnalyticsRepositoryDep,
+    tasks: TaskRepositoryDep,
+    projects: ProjectRepositoryDep,
+    sessions: WorkSessionRepositoryDep,
+    events: CalendarEventRepositoryDep,
+    notes: NoteRepositoryDep,
+    availability: AvailabilityRuleRepositoryDep,
+    activity: ActivityServiceDep,
+    audit: AuditServiceDep,
+    settings: SettingsDep,
+) -> AnalyticsService:
+    """Provide a request-scoped analytics service.
+
+    **Six repositories, and the reason is that six tables answer six different
+    questions.** ``daily_metrics`` is the aggregate tier, ``tasks`` and
+    ``work_sessions`` are where time and estimation are actually recorded,
+    ``calendar_events`` is reserved rather than spent time, ``projects`` and
+    ``notes`` carry the per-project and knowledge rollups, and
+    ``availability_rules`` is the schedule the workload figure is compared
+    against. There is no join that would collapse them.
+
+    ``activity`` and ``audit`` are accepted for wiring symmetry and used by
+    neither, on the reasoning every other service in this file gives: a rebuild
+    is a maintenance action over rows the user already owns, so it is neither a
+    fact about the work nor a security event.
+
+    Settings are injected rather than left to the service's own
+    ``get_settings()`` fallback, so the weights and the range ceiling a request
+    runs under are the ones resolved for that request.
+    """
+    return AnalyticsService(
+        metrics,
+        tasks,
+        projects,
+        sessions,
+        events,
+        notes,
+        activity=activity,
+        audit=audit,
+        settings=settings,
+        availability=availability,
+    )
+
+
+AnalyticsServiceDep = Annotated[AnalyticsService, Depends(get_analytics_service)]
+
+
 def get_client_context(request: Request) -> tuple[str | None, str | None]:
     """Return ``(ip_address, user_agent)`` for the calling request.
 
@@ -427,6 +729,10 @@ __all__ = [
     "ActivityRepositoryDep",
     "ActivityService",
     "ActivityServiceDep",
+    "AnalyticsRepository",
+    "AnalyticsRepositoryDep",
+    "AnalyticsService",
+    "AnalyticsServiceDep",
     "AuditRepository",
     "AuditRepositoryDep",
     "AuditService",
@@ -434,17 +740,41 @@ __all__ = [
     "AuthService",
     "AuthServiceDep",
     "AuthenticatedUser",
+    "AvailabilityRuleRepository",
+    "AvailabilityRuleRepositoryDep",
+    "BookmarkRepository",
+    "BookmarkRepositoryDep",
+    "CalendarEventRepository",
+    "CalendarEventRepositoryDep",
+    "CategoryRepository",
+    "CategoryRepositoryDep",
     "ClientContext",
+    "ConceptRepository",
+    "ConceptRepositoryDep",
     "Credentials",
     "CurrentSessionId",
     "CurrentUser",
     "DbSession",
+    "DocumentRepository",
+    "DocumentRepositoryDep",
+    "KnowledgeLinkRepository",
+    "KnowledgeLinkRepositoryDep",
+    "KnowledgeService",
+    "KnowledgeServiceDep",
+    "NoteRepository",
+    "NoteRepositoryDep",
     "PasswordResetRepository",
     "PasswordResetRepositoryDep",
+    "PlannerService",
+    "PlannerServiceDep",
     "ProjectRepository",
     "ProjectRepositoryDep",
     "ProjectService",
     "ProjectServiceDep",
+    "ResourceRepository",
+    "ResourceRepositoryDep",
+    "SchedulingService",
+    "SchedulingServiceDep",
     "SessionRepository",
     "SessionRepositoryDep",
     "SessionService",
@@ -464,20 +794,36 @@ __all__ = [
     "UserRepositoryDep",
     "UserService",
     "UserServiceDep",
+    "WorkSessionRepository",
+    "WorkSessionRepositoryDep",
     "bearer_scheme",
     "get_activity_repository",
     "get_activity_service",
+    "get_analytics_repository",
+    "get_analytics_service",
     "get_audit_repository",
     "get_audit_service",
     "get_auth_service",
     "get_authenticated_user",
+    "get_availability_rule_repository",
+    "get_bookmark_repository",
+    "get_calendar_event_repository",
+    "get_category_repository",
     "get_client_context",
+    "get_concept_repository",
     "get_current_session_id",
     "get_current_user",
+    "get_document_repository",
+    "get_knowledge_link_repository",
+    "get_knowledge_service",
+    "get_note_repository",
     "get_optional_user",
     "get_password_reset_repository",
+    "get_planner_service",
     "get_project_repository",
     "get_project_service",
+    "get_resource_repository",
+    "get_scheduling_service",
     "get_session_repository",
     "get_session_service",
     "get_settings",
@@ -487,4 +833,5 @@ __all__ = [
     "get_task_service",
     "get_user_repository",
     "get_user_service",
+    "get_work_session_repository",
 ]

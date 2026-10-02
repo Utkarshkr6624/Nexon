@@ -366,6 +366,29 @@ async def reopen_task(
 
 
 @router.post(
+    "/{task_id}/start",
+    response_model=TaskRead,
+    summary="Move a task to in-progress",
+    dependencies=[Depends(require_permission(Permission.TASKS_WRITE))],
+)
+async def start_task(
+    task_id: UUID,
+    current_user: AuthenticatedUser,
+    tasks: TaskServiceDep,
+) -> Task:
+    """Move a task into ``IN_PROGRESS``.
+
+    The state machine only allows ``COMPLETED`` from ``IN_PROGRESS`` or
+    ``BLOCKED``, so this is the route that makes completing a task reachable at
+    all. It was missing until the analytics phase, which surfaced it: every
+    completion metric read zero because no task could ever be completed, and
+    that looked exactly like a user who completes nothing.
+    """
+    task = await tasks.get(task_id=task_id, owner=current_user)
+    return await tasks.start(task=task, owner=current_user)
+
+
+@router.post(
     "/{task_id}/block",
     response_model=TaskRead,
     summary="Mark a task blocked",

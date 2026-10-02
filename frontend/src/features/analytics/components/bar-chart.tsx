@@ -1,0 +1,154 @@
+import type { ReactNode } from 'react'
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
+
+import { ChartShell, ChartTooltip } from '@/features/analytics/components/chart-shell'
+import { CHART_AXIS_PROPS, type ChartValueUnit } from '@/features/analytics/chart-theme'
+import { EmptyAnalytics, type AnalyticsMetricKey } from '@/features/analytics/components/empty-analytics'
+import { chartColor } from '@/features/analytics/format'
+import type { ChartRow } from '@/features/analytics/components/trend-chart'
+
+export interface BarSeries {
+  key: string
+  label: string
+  colorIndex?: number
+  unit?: ChartValueUnit
+}
+
+/**
+ * Bars for counts: tasks completed per day, and activity per project.
+ *
+ * **Horizontal when the labels are words.** A vertical bar chart of six project
+ * names rotates them into unreadable slanted text; a horizontal one reads
+ * top-to-bottom with the labels intact, so the orientation is a prop rather
+ * than a second component.
+ */
+export interface AnalyticsBarChartProps {
+  title: string
+  subtitle?: ReactNode
+  data: readonly ChartRow[]
+  series: readonly BarSeries[]
+  xKey?: string
+  /** `vertical` = categories along the x axis (dates); `horizontal` = along y. */
+  orientation?: 'vertical' | 'horizontal'
+  actions?: ReactNode
+  className?: string
+  isLoading?: boolean
+  isEmpty?: boolean
+  emptyMetric?: AnalyticsMetricKey
+  emptyReason?: string | null
+  /** Colours every bar differently — for a single-series categorical chart. */
+  colorByCategory?: boolean
+}
+
+export function AnalyticsBarChart({
+  title,
+  subtitle,
+  data,
+  series,
+  xKey = 'label',
+  orientation = 'vertical',
+  actions,
+  className,
+  isLoading = false,
+  isEmpty = false,
+  emptyMetric = 'trend',
+  emptyReason,
+  colorByCategory = false,
+}: AnalyticsBarChartProps) {
+  const units = Object.fromEntries(series.map((entry) => [entry.key, entry.unit ?? 'count']))
+  const empty = isEmpty || data.length === 0
+  const horizontal = orientation === 'horizontal'
+
+  const body = (
+    <ResponsiveContainer width="100%" height="100%">
+      <BarChart
+        data={data as ChartRow[]}
+        layout={horizontal ? 'vertical' : 'horizontal'}
+        margin={{ top: 4, right: 8, bottom: 0, left: horizontal ? 8 : -12 }}
+      >
+        <CartesianGrid stroke="hsl(var(--border))" vertical={horizontal} horizontal={!horizontal} />
+        {horizontal ? (
+          <>
+            <XAxis type="number" {...CHART_AXIS_PROPS} />
+            <YAxis
+              type="category"
+              dataKey={xKey}
+              width={120}
+              interval={0}
+              {...CHART_AXIS_PROPS}
+            />
+          </>
+        ) : (
+          <>
+            <XAxis
+              dataKey={xKey}
+              interval="preserveStartEnd"
+              minTickGap={16}
+              {...CHART_AXIS_PROPS}
+            />
+            <YAxis width={44} allowDecimals={false} {...CHART_AXIS_PROPS} />
+          </>
+        )}
+        <Tooltip
+          cursor={{ fill: 'hsl(var(--muted))' }}
+          content={(props) => (
+            <ChartTooltip
+              active={props.active}
+              label={props.label}
+              payload={props.payload as never}
+              units={units}
+            />
+          )}
+        />
+        {series.map((entry, index) =>
+          colorByCategory ? (
+            <Bar
+              key={entry.key}
+              dataKey={entry.key}
+              name={entry.label}
+              radius={[4, 4, 0, 0]}
+              isAnimationActive={false}
+            >
+              {data.map((_row, rowIndex) => (
+                <Cell key={`${entry.key}-${rowIndex}`} fill={chartColor(rowIndex)} />
+              ))}
+            </Bar>
+          ) : (
+            <Bar
+              key={entry.key}
+              dataKey={entry.key}
+              name={entry.label}
+              fill={chartColor(entry.colorIndex ?? index)}
+              radius={horizontal ? [0, 4, 4, 0] : [4, 4, 0, 0]}
+              isAnimationActive={false}
+            />
+          ),
+        )}
+      </BarChart>
+    </ResponsiveContainer>
+  )
+
+  return (
+    <ChartShell
+      title={title}
+      subtitle={subtitle}
+      actions={actions}
+      isLoading={isLoading}
+      className={className}
+      empty={
+        empty ? <EmptyAnalytics metric={emptyMetric} reason={emptyReason} /> : undefined
+      }
+    >
+      {body}
+    </ChartShell>
+  )
+}

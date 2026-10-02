@@ -191,8 +191,13 @@ describe('application shell', () => {
     })
 
     await user.keyboard('{Enter}')
+    // Assert the navigation only. Phase 4 replaced the `ModulePage` placeholder
+    // with a real planner that mounts its own queries, and this fixture's mocked
+    // `fetch` answers those with a 404 envelope — the page correctly renders its
+    // error surface. What this test owns is "the palette routes you", so pinning
+    // the destination's data-dependent copy would only couple it to which request
+    // happens to resolve.
     expect(router.state.location.pathname).toBe('/planner')
-    expect(await screen.findByText('Planned — Phase 3')).toBeInTheDocument()
   })
 
   it('applies the theme preference to the document element', async () => {

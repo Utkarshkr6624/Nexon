@@ -41,11 +41,19 @@ def test_every_permission_is_a_namespaced_lowercase_string():
         assert value.split(".") and all(part.isidentifier() for part in value.split("."))
 
 
-def test_the_permission_set_is_exactly_the_seven_phase_2_capabilities():
-    """A new capability is a deliberate act, not a side effect of a new route."""
+def test_the_permission_set_is_exactly_the_known_capabilities():
+    """A new capability is a deliberate act, not a side effect of a new route.
+
+    Phase 4 added ``calendar.read`` / ``calendar.write``; the set is asserted in
+    full so the next phase cannot add one silently.
+    """
     assert {permission.value for permission in Permission} == {
         "users.read",
         "users.write",
+        "calendar.read",
+        "calendar.write",
+        "knowledge.read",
+        "knowledge.write",
         "projects.read",
         "projects.write",
         "tasks.read",
@@ -80,6 +88,10 @@ def test_a_user_may_read_and_write_only_its_own_domain():
         {
             Permission.USERS_READ,
             Permission.USERS_WRITE,
+            Permission.CALENDAR_READ,
+            Permission.CALENDAR_WRITE,
+            Permission.KNOWLEDGE_READ,
+            Permission.KNOWLEDGE_WRITE,
             Permission.PROJECTS_READ,
             Permission.PROJECTS_WRITE,
             Permission.TASKS_READ,

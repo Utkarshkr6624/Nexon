@@ -42,6 +42,9 @@ MIGRATION_MODULES = (
     "migrations.versions.0001_initial_create_users",
     "migrations.versions.0002_phase2_identity_sessions",
     "migrations.versions.0003_phase3_projects_tasks",
+    "migrations.versions.0004_phase4_planner",
+    "migrations.versions.0005_phase5_knowledge",
+    "migrations.versions.0006_phase6_analytics",
 )
 
 PG = postgresql.dialect()
@@ -218,9 +221,19 @@ def test_the_migration_chain_is_linear_with_a_single_head():
     """
     script = ScriptDirectory.from_config(_alembic_config("postgresql+psycopg://unused"))
 
-    assert script.get_heads() == ["0003"]
-    assert [revision.revision for revision in script.walk_revisions()] == ["0003", "0002", "0001"]
+    assert script.get_heads() == ["0006"]
+    assert [revision.revision for revision in script.walk_revisions()] == [
+        "0006",
+        "0005",
+        "0004",
+        "0003",
+        "0002",
+        "0001",
+    ]
     assert {revision.revision: revision.down_revision for revision in script.walk_revisions()} == {
+        "0006": "0005",
+        "0005": "0004",
+        "0004": "0003",
         "0003": "0002",
         "0002": "0001",
         "0001": None,
@@ -547,6 +560,23 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
         "task_tags": 2,
         "project_tags": 2,
         "activity_events": 3,
+        "calendar_events": 3,
+        "work_sessions": 3,
+        "availability_rules": 1,
+        "notes": 2,
+        "note_revisions": 2,
+        "note_tags": 2,
+        "concept_tags": 2,
+        "concepts": 1,
+        "resources": 1,
+        "bookmarks": 1,
+        "documents": 1,
+        "categories": 2,
+        "knowledge_links": 1,
+        # Phase 6: the daily aggregate tier belongs outright to the account
+        # whose rows it summarises, so it cascades like every other per-user
+        # table in the schema.
+        "daily_metrics": 1,
     }
 
 
