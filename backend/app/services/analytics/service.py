@@ -125,6 +125,7 @@ from app.schemas.analytics import (
     VelocityRead,
     WorkloadRead,
 )
+from app.schemas.common import Page, PageMeta
 from app.services.activity_service import ActivityService
 from app.services.analytics.scoring import (
     NOT_ENOUGH_ACTIVITY,
@@ -188,6 +189,11 @@ MAX_TIME_BUCKETS = 20
 
 #: How many rows the overdue drill-down carries. A drill-down, not an export.
 MAX_OVERDUE_ROWS = 20
+
+#: How many projects the paginated roll-up serves when the caller names none. A
+#: project list is a picker a person scans, and the ceiling a route may ask for is
+#: the route's own business — this is only the fallback for a direct caller.
+_DEFAULT_PROJECT_PAGE_SIZE = 20
 
 #: The most project rows a read will page through to turn project ids into
 #: project names. A bound rather than a single page: the previous read asked for
@@ -860,7 +866,14 @@ class AnalyticsService:
         )
 
     async def project_analytics(
-        self, *, owner: User, start: date, end: date, project_id: uuid.UUID | None = None
+        self,
+        *,
+        owner: User,
+        start: date,
+        end: date,
+        project_id: uuid.UUID | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ProjectAnalyticsRead]:
         """Per-project roll-up, computed from the tasks themselves.
 
@@ -868,13 +881,115 @@ class AnalyticsService:
         of these numbers, kept in step by a job that can be late, and reading it
         would tell the user how current their figures were only if they also knew
         when the job last ran. The migration module docstring carries the argument.
+
+        **Every per-project figure is grouped, so the statement count does not
+        depend on how many projects the account has.** The window-scoped completion
+        pair used to be read per project, twice — once for the numerator and once
+        for the denominator — which made this method ``4 x N + 5`` statements:
+        9 at one project, 245 at sixty. It is now six whatever ``N`` is, because
+        :meth:`AnalyticsRepository.project_completion_counts_in_range` returns the
+        pair for every project at once. The count matters beyond this route:
+        :mod:`app.services.risk.detection` reaches this method on every evaluation
+        pass, so a detector run was multiplying the same N+1 by the number of
+        detectors that read a project row.
+
+        ``limit`` and ``offset`` page the roll-up; ``limit=None`` means every
+        project, which is what the internal callers want and what the HTTP route
+        deliberately does not offer. Use :meth:`project_analytics_page` for the
+        paginated form, which is the one carrying the total.
+
+        Args:
+            owner: The account being described.
+            start: First day of the window, inclusive.
+            end: Last day of the window, inclusive.
+            project_id: Narrow to one project. Another account's project is a 404,
+                resolved through the owner-scoped lookup before any aggregate runs.
+            limit: Projects to return, or ``None`` for all of them.
+            offset: Projects to skip, in the repository's own ``name`` order.
+
+        Returns:
+            The roll-up rows, in project-name order.
+        """
+        rows, _total = await self._project_rollups(
+            owner=owner, start=start, end=end, project_id=project_id, limit=limit, offset=offset
+        )
+        return rows
+
+    async def project_analytics_page(
+        self,
+        *,
+        owner: User,
+        start: date,
+        end: date,
+        project_id: uuid.UUID | None = None,
+        limit: int = _DEFAULT_PROJECT_PAGE_SIZE,
+        offset: int = 0,
+    ) -> Page[ProjectAnalyticsRead]:
+        """One bounded page of the per-project roll-up, and the size of the whole set.
+
+        ``meta.total`` counts every project the filters match rather than the rows in
+        ``items``. Without it a client cannot tell a complete answer from a truncated
+        one: a bare array of twenty roll-ups is indistinguishable from an account
+        that happens to own twenty projects, and a dashboard would render "your
+        projects" from whichever of the two it happened to be looking at.
+
+        Paging the read rather than slicing the answer is what keeps the cost bounded
+        — the grouped reads are asked only about the projects on this page, so
+        neither the statement count nor the rows examined grows with the size of the
+        account.
+        """
+        rows, total = await self._project_rollups(
+            owner=owner, start=start, end=end, project_id=project_id, limit=limit, offset=offset
+        )
+        return Page[ProjectAnalyticsRead](
+            items=rows,
+            meta=PageMeta(total=total, limit=max(1, limit), offset=max(0, offset)),
+        )
+
+    async def _project_rollups(
+        self,
+        *,
+        owner: User,
+        start: date,
+        end: date,
+        project_id: uuid.UUID | None,
+        limit: int | None,
+        offset: int,
+    ) -> tuple[list[ProjectAnalyticsRead], int]:
+        """Build the roll-up rows for one page, with the size of the whole set.
+
+        The single place both public methods read through, so the paged and unpaged
+        forms cannot answer differently for the same rows — the failure mode every
+        list envelope in this codebase is written to rule out.
+
+        The page is taken **before** the grouped reads run, not after: the window
+        completion counts are asked about the projects on this page alone, so a
+        twenty-row page over an account with six hundred projects still scans
+        twenty projects' tasks.
+
+        Returns:
+            The rows for the requested slice, and how many projects the filters
+            match in total.
         """
         self._check_range(start, end)
-        project_id = await self._owned_project(project_id, owner)
+        owned = await self._owned_project(project_id, owner)
         today = await self._today()
         counts = await self.metrics.project_task_counts(owner.id, as_of=today)
+        if owned is not None:
+            counts = [row for row in counts if row[0] == owned]
+        total = len(counts)
+
+        skip = max(0, offset)
+        page = counts[skip:] if limit is None else counts[skip : skip + max(0, limit)]
+
         minutes = await self.metrics.project_minutes_in_range(owner.id, start=start, end=end)
         activity = await self.metrics.project_activity_counts(owner.id, start=start, end=end)
+        window_counts = await self.metrics.project_completion_counts_in_range(
+            owner.id,
+            project_ids=[row[0] for row in page],
+            start=start,
+            end=end,
+        )
 
         weeks = max(1.0, round((end - start).days / 7, 4))
         results: list[ProjectAnalyticsRead] = []
@@ -887,12 +1002,9 @@ class AnalyticsService:
             remaining,
             overdue_tasks,
             _open_tasks,
-        ) in counts:
-            if project_id is not None and pid != project_id:
-                continue
+        ) in page:
             session_minutes, task_estimated, task_actual = minutes.get(pid, (0, 0, 0))
-            completed_in_window = await self._project_completions(owner.id, pid, start, end)
-            created_in_window = await self._project_creations(owner.id, pid, start, end)
+            created_in_window, completed_in_window = window_counts.get(pid, (0, 0))
             results.append(
                 ProjectAnalyticsRead(
                     project_id=pid,
@@ -931,7 +1043,7 @@ class AnalyticsService:
                     range=self._metric_range(start, end),
                 )
             )
-        return results
+        return results, total
 
     async def learning(self, *, owner: User, start: date, end: date) -> LearningAnalyticsRead:
         """Recorded study and knowledge-adjacent activity — no inference of mastery."""
@@ -1679,24 +1791,6 @@ class AnalyticsService:
         # flag is true whenever an open overdue task exists that the list does not
         # carry — including the case where a single status filled its own page.
         return overdue[:MAX_OVERDUE_ROWS], matched > MAX_OVERDUE_ROWS
-
-    async def _project_completions(
-        self, owner_id: uuid.UUID, project_id: uuid.UUID, start: date, end: date
-    ) -> int:
-        """Tasks completed in one project inside the window."""
-        _created, completed = await self.metrics.project_completion_counts(
-            owner_id, project_id, start=start, end=end
-        )
-        return completed
-
-    async def _project_creations(
-        self, owner_id: uuid.UUID, project_id: uuid.UUID, start: date, end: date
-    ) -> int:
-        """Tasks created in one project inside the window."""
-        created, _completed = await self.metrics.project_completion_counts(
-            owner_id, project_id, start=start, end=end
-        )
-        return created
 
     @staticmethod
     def _as_daily(row: DailyMetric) -> DailyMetricRead:

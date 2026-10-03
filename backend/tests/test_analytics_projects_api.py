@@ -20,9 +20,15 @@ two rows is visible in every field at once.
 What the two endpoints actually promise, as read from the code
 -------------------------------------------------------------
 * ``GET /analytics/projects`` declares exactly one filter beyond the window,
-  ``project_id``. It does **not** declare ``category``; the brief lists
-  ``category`` among the query parameters for the analytics API, and no route on
-  this router takes one.
+  ``project_id``, plus the ``limit`` and ``offset`` every paged route takes. Its
+  answer is the standard envelope — ``items`` and a ``meta`` naming ``total``,
+  ``limit`` and ``offset`` — and the project tests below read through ``items``.
+  It does **not** declare ``category``; the brief lists ``category`` among the
+  query parameters for the analytics API, and no route on this router takes one.
+  The envelope itself, the total and the paging order are covered by
+  ``tests/test_analytics_pagination.py``; what is asserted here is that the
+  *figures* in each row survive the move, and that neither the rows nor the total
+  can carry another account's project.
 * ``GET /analytics/tasks`` declares **no** filter beyond the window. A
   ``project_id`` sent to it is an unknown query parameter, which FastAPI
   discards, so the answer is the unfiltered one — asserted below, because a
@@ -245,6 +251,28 @@ async def _seed_borealis(seed: AnalyticsSeed):
     return project
 
 
+def _rows(response) -> list[dict]:
+    """The project rows of a ``/analytics/projects`` response, which is a page.
+
+    The route answers with the standard list envelope — ``items`` plus a ``meta``
+    naming ``total``, ``limit`` and ``offset`` — rather than with a bare array.
+    Every test in this file seeds fewer projects than one page holds and then
+    reads them by name, which only means anything if the response really did
+    carry all of them; ``len(items) == meta.total`` says so here rather than
+    letting a truncated page fail later as a name that is mysteriously absent.
+
+    ``test_an_account_with_no_projects_at_all_gets_an_empty_list`` and the
+    filtering tests read ``meta`` directly, because counting the set is part of
+    what they are about.
+    """
+    assert response.status_code == 200, response.text
+    body = response.json()
+    items = body["items"]
+    assert len(items) == body["meta"]["total"], body["meta"]
+    assert body["meta"]["offset"] == 0, body["meta"]
+    return items
+
+
 def _by_name(rows: list[dict], name: str) -> dict:
     """The one row for ``name``, failing loudly rather than returning ``None``."""
     matches = [row for row in rows if row["name"] == name]
@@ -271,8 +299,7 @@ async def test_two_projects_report_their_own_hand_computed_totals(client, db_ses
 
     response = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=auth)
 
-    assert response.status_code == 200, response.text
-    rows = response.json()
+    rows = _rows(response)
     assert [row["name"] for row in rows] == ["Atlas", "Borealis"]
 
     atlas = _by_name(rows, "Atlas")
@@ -309,8 +336,7 @@ async def test_time_tracked_and_time_estimated_are_reported_separately(client, d
 
     response = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=auth)
 
-    assert response.status_code == 200, response.text
-    atlas = _by_name(response.json(), "Atlas")
+    atlas = _by_name(_rows(response), "Atlas")
 
     # 60 + 45 + 75 minutes of work sessions. The 30-minute untracked session
     # seeded alongside them belongs to no project and is in none of these.
@@ -324,7 +350,7 @@ async def test_time_tracked_and_time_estimated_are_reported_separately(client, d
     # ... and 720 accumulated minutes spread over all 10 tasks, finished or not.
     assert atlas["avg_task_minutes"] == 72.0
 
-    borealis = _by_name(response.json(), "Borealis")
+    borealis = _by_name(_rows(response), "Borealis")
     assert borealis["total_work_minutes"] == 30
     assert borealis["estimated_minutes"] == 105
     assert borealis["actual_minutes"] == 135
@@ -351,8 +377,7 @@ async def test_velocity_is_eight_completions_over_three_measured_weeks(client, d
 
     response = await client.get("/api/v1/analytics/projects", params=VELOCITY_WINDOW, headers=auth)
 
-    assert response.status_code == 200, response.text
-    atlas = _by_name(response.json(), "Atlas")
+    atlas = _by_name(_rows(response), "Atlas")
 
     assert atlas["velocity"] is not None
     assert atlas["velocity"]["weeks_measured"] == 3.0
@@ -383,8 +408,7 @@ async def test_the_per_week_completion_counts_are_not_returned(client, db_sessio
 
     response = await client.get("/api/v1/analytics/projects", params=VELOCITY_WINDOW, headers=auth)
 
-    assert response.status_code == 200, response.text
-    atlas = _by_name(response.json(), "Atlas")
+    atlas = _by_name(_rows(response), "Atlas")
 
     # 2 completions in week one (Jan 5-11), 3 in week two (Jan 12-18), 3 in
     # week three (Jan 19-25). Reported as an average, never as a series.
@@ -421,7 +445,7 @@ async def test_the_velocity_bucket_is_the_window_and_not_a_calendar_week(client,
         )
 
         assert response.status_code == 200, f"{label}: {response.text}"
-        velocity = _by_name(response.json(), "Atlas")["velocity"]
+        velocity = _by_name(_rows(response), "Atlas")["velocity"]
         assert velocity["weeks_measured"] == weeks_measured, label
         assert velocity["tasks_per_week"] == expected, label
 
@@ -447,8 +471,7 @@ async def test_the_measured_week_count_excludes_the_last_day_of_the_window(clien
 
     response = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=auth)
 
-    assert response.status_code == 200, response.text
-    atlas = _by_name(response.json(), "Atlas")
+    atlas = _by_name(_rows(response), "Atlas")
 
     # The window itself reports 21 inclusive days ...
     assert atlas["range"]["start_date"] == "2026-01-05"
@@ -491,8 +514,8 @@ async def test_estimated_minutes_per_week_does_not_move_with_the_window(client, 
 
     assert short_response.status_code == 200, short_response.text
     assert long_response.status_code == 200, long_response.text
-    short_atlas = _by_name(short_response.json(), "Atlas")
-    long_atlas = _by_name(long_response.json(), "Atlas")
+    short_atlas = _by_name(_rows(short_response), "Atlas")
+    long_atlas = _by_name(_rows(long_response), "Atlas")
 
     # Identical all-time estimate sum over both windows ...
     assert short_atlas["estimated_minutes"] == 480
@@ -516,8 +539,7 @@ async def test_a_project_with_no_tasks_appears_with_zeros(client, db_session):
 
     response = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=auth)
 
-    assert response.status_code == 200, response.text
-    vacant = _by_name(response.json(), "Vacant")
+    vacant = _by_name(_rows(response), "Vacant")
 
     assert vacant["project_id"] == str(empty.id)
     assert vacant["total_tasks"] == 0
@@ -545,27 +567,31 @@ async def test_a_project_with_no_tasks_appears_with_zeros(client, db_session):
     }
 
 
-async def test_an_account_with_no_projects_at_all_gets_an_empty_list(client, db_session):
-    """No projects is an empty array and a 200, never a 404 or a 500.
+async def test_an_account_with_no_projects_at_all_gets_an_empty_page(client, db_session):
+    """No projects is an empty page and a 200, never a 404 or a 500.
 
     The "never crash because there is no activity" rule from the brief, at its
     simplest: the route is a list, and a list with nothing in it is the answer.
+    The envelope carries the same news as the array it replaced — ``items`` empty
+    and a ``total`` of **zero**, which is a real count of nothing rather than a
+    count that could not be taken. The page size and offset ride along because a
+    client paginating needs them echoed even on the first, empty request.
     """
     _seed, auth = await seeded_client(client, db_session)
 
     response = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=auth)
 
     assert response.status_code == 200, response.text
-    assert response.json() == []
+    assert response.json() == {"items": [], "meta": {"total": 0, "limit": 20, "offset": 0}}
 
 
 async def test_project_rows_carry_the_window_they_were_computed_over(client, db_session):
     """Every row states the window, so a client never re-derives it.
 
-    The response is a bare list, and a bare list has nowhere else to record
-    which days the numbers cover. Each row carries its own ``range`` for that
-    reason, and a client that mixed rows from two requests could otherwise render
-    them as one series.
+    The envelope's ``meta`` names the page, not the period — it says which slice
+    of which set came back, and nothing about which days the figures describe.
+    Each row still carries its own ``range`` for that reason, and a client that
+    mixed rows from two requests could otherwise render them as one series.
     """
     seed, auth = await seeded_client(client, db_session)
     await _seed_atlas(seed)
@@ -573,8 +599,7 @@ async def test_project_rows_carry_the_window_they_were_computed_over(client, db_
 
     response = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=auth)
 
-    assert response.status_code == 200, response.text
-    for row in response.json():
+    for row in _rows(response):
         assert row["range"] == {
             "start_date": WINDOW_START.isoformat(),
             "end_date": WINDOW_END.isoformat(),
@@ -609,9 +634,12 @@ async def test_the_project_id_filter_returns_only_that_project(client, db_sessio
     )
 
     assert response.status_code == 200, response.text
-    rows = response.json()
+    rows = response.json()["items"]
     assert len(rows) == 1
-    assert rows[0] == _by_name(unfiltered.json(), "Atlas")
+    assert rows[0] == _by_name(_rows(unfiltered), "Atlas")
+    # The total describes the filtered set, so narrowing to one project of two
+    # reports one — the envelope cannot claim the caller's whole account here.
+    assert response.json()["meta"]["total"] == 1
 
 
 async def test_an_unknown_project_id_filter_answers_404(client, db_session):
@@ -703,6 +731,12 @@ async def test_a_users_own_list_never_contains_another_accounts_projects(client,
     hole: a client that never filters would still see another account's project
     name, task counts and tracked minutes. Grace's project is given a distinctive
     999 tracked minutes so her row is recognisable if it ever appears.
+
+    The paging envelope is asserted here too, because ``meta.total`` is a second
+    place a cross-tenant row could surface: it counts the caller's projects, and
+    a total of two on an account that owns one would disclose that Grace's
+    project exists even with her name nowhere in the body. It reads **1**, and
+    the count is not reachable from the items alone.
     """
     seed, auth = await seeded_client(client, db_session)
     await _seed_atlas(seed)
@@ -716,7 +750,9 @@ async def test_a_users_own_list_never_contains_another_accounts_projects(client,
     response = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=auth)
 
     assert response.status_code == 200, response.text
-    assert [row["name"] for row in response.json()] == ["Atlas"]
+    body = response.json()
+    assert [row["name"] for row in body["items"]] == ["Atlas"]
+    assert body["meta"]["total"] == 1
     assert str(grace_project.id) not in response.text
 
 
@@ -1073,7 +1109,12 @@ async def test_an_unknown_category_is_ignored_by_both_analytics_routes(client, d
     assert projects_plain.status_code == 200, projects_plain.text
     assert projects_categorised.status_code == 200, projects_categorised.text
     assert projects_categorised.json() == projects_plain.json()
-    assert len(projects_categorised.json()) == 2
+    # Read through ``items``: the envelope dict itself has two keys, so counting
+    # the response body would pass whatever the page held.
+    assert [row["name"] for row in projects_categorised.json()["items"]] == [
+        "Atlas",
+        "Task board",
+    ]
     assert str(atlas.id) in projects_categorised.text
 
     assert tasks_plain.status_code == 200, tasks_plain.text

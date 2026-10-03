@@ -231,6 +231,20 @@ def _indexes(table_name: str) -> dict[str, tuple[str, ...]]:
     }
 
 
+def _index(table_name: str, index_name: str):
+    """The named :class:`~sqlalchemy.Index` on ``table_name``.
+
+    Read as the object rather than through :func:`_indexes` because the
+    deduplication index's behaviour lives in three flags a column list cannot
+    show: ``unique``, ``postgresql_nulls_not_distinct`` and ``postgresql_where``.
+    Those three *are* the rule — a unique index without the second is a rule that
+    never fires, and one without the third is a rule that refuses things it
+    should not — so a test that reads only the columns asserts a shape and calls
+    it behaviour.
+    """
+    return next(index for index in _TABLES[table_name].indexes if index.name == index_name)
+
+
 def _foreign_keys(table_name: str) -> dict[str, tuple[str, str]]:
     """``{column name: (referenced table, ON DELETE rule)}`` for the whole table."""
     rules: dict[str, tuple[str, str]] = {}
@@ -522,26 +536,74 @@ def test_an_evidence_row_needs_a_type_a_title_and_a_date():
 
 
 def test_the_evidence_uniqueness_is_six_columns_and_does_not_include_the_title():
-    """``uq_career_evidence_source_identity``, asserted column by column.
+    """``uq_career_evidence_source_identity``, asserted key and flags.
 
-    Nulls do not collide in a btree unique index, so several manually-added rows
-    — identical in all six columns — coexist, while a project-derived row cannot
-    be derived twice. ``title`` is deliberately *not* in the key: adding it would
-    let a rename of a project-derived row insert a second row, which is the
-    failure this constraint exists to prevent. That no client can re-point the row
-    in the first place is
-    :func:`test_evidence_cannot_be_re_pointed_at_a_different_record`.
+    This is an **``Index``**, not a ``UniqueConstraint``, and the difference is
+    the whole point: PostgreSQL will only apply a ``WHERE`` predicate to an
+    index, so "at most one of these, but only once one of these three is set"
+    cannot be written as a table constraint. That is why the deduplication rule
+    is an object here rather than a ``UniqueConstraint`` — and why this test
+    asserts it as one. :func:`test_the_evidence_dedup_is_the_only_uniqueness_on_the_table`
+    keeps the two shapes from drifting back into each other.
+
+    Three flags, and each is load-bearing:
+
+    * ``unique=True`` — the rule itself.
+    * ``postgresql_nulls_not_distinct=True`` — without it a project-derived row
+      (one foreign key set, two null) collided with nothing, so a second
+      derivation of the same project inserted cleanly. **This flag is the only
+      reason the index refuses it**, and a unique index without it is exactly
+      the bug: it looks like the rule and behaves as though it were not there.
+    * ``postgresql_where`` — rows naming no source at all are outside it, which
+      is what lets a person record several manual achievements.
+
+    ``title`` is deliberately *not* in the key: adding it would let a rename of
+    a project-derived row insert a second row, which is the failure this key
+    exists to prevent. That no client can re-point the row in the first place is
+    :func:`test_evidence_cannot_be_re_pointed_at_a_different_record`, and the
+    rendered DDL is asserted in ``tests/test_migration_ddl.py``; the columns
+    themselves are asserted here because that is the model a migration is
+    written from.
     """
-    assert _unique_constraints("career_evidence") == {
-        "uq_career_evidence_source_identity": (
-            "user_id",
-            "evidence_type",
-            "source",
-            "project_id",
-            "skill_id",
-            "repository_id",
-        )
+    index = _index("career_evidence", "uq_career_evidence_source_identity")
+    columns = tuple(column.name for column in index.columns)
+
+    assert index.unique is True
+    assert columns == (
+        "user_id",
+        "evidence_type",
+        "source",
+        "project_id",
+        "skill_id",
+        "repository_id",
+    )
+    assert "title" not in columns
+    assert dict(index.dialect_kwargs) == {
+        "postgresql_nulls_not_distinct": True,
+        "postgresql_where": (
+            "project_id IS NOT NULL OR skill_id IS NOT NULL OR repository_id IS NOT NULL"
+        ),
     }
+    # Nothing else on the table claims uniqueness over the evidence rows, so a
+    # second rule cannot quietly sit alongside this one and refuse something the
+    # partial index deliberately lets through.
+    assert _unique_constraints("career_evidence") == {}
+
+
+def test_the_evidence_dedup_is_the_only_uniqueness_on_the_table():
+    """The dedup key is the only unique thing on ``career_evidence``.
+
+    Split from the test above so the *absence* of the old table-level
+    ``UNIQUE`` is its own assertion. Two objects with the same name and
+    different shapes is the state that confused this suite: the constraint could
+    not enforce what its name promised, and the index that can is invisible to a
+    reader scanning ``constraints`` for a ``UNIQUE``.
+    """
+    uniques = {
+        index.name for index in CareerEvidence.__table__.indexes if index.unique
+    }
+
+    assert uniques == {"uq_career_evidence_source_identity"}
 
 
 def test_every_evidence_link_is_set_null_so_the_trail_outlives_what_it_points_at():
@@ -641,12 +703,20 @@ def test_no_career_table_declares_an_index_that_the_contract_does_not_name():
     indexes is a sequential scan over the table a career profile grows fastest
     on. Neither is a large cost here, which is precisely why the set is fixed
     rather than left to whoever edits next.
+
+    ``uq_career_evidence_source_identity`` is listed here as an index rather
+    than as a constraint because that is what it now is. It joined this set when
+    the deduplication rule moved off a table-level ``UNIQUE``, which could not
+    carry the ``NULLS NOT DISTINCT`` behaviour or the partial predicate the rule
+    needs; :func:`test_the_evidence_uniqueness_is_six_columns_and_does_not_include_the_title`
+    asserts what it does.
     """
     assert set(_indexes("career_profiles")) == {"ix_career_profiles_user_id"}
     assert set(_indexes("career_experience")) == {"ix_career_experience_user_id"}
     assert set(_indexes("career_evidence")) == {
         "ix_career_evidence_user_id",
         "ix_career_evidence_user_occurred",
+        "uq_career_evidence_source_identity",
     }
 
 

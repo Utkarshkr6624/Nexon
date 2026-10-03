@@ -48,6 +48,7 @@ MIGRATION_MODULES = (
     "migrations.versions.0007_phase7_intelligence",
     "migrations.versions.0008_phase8_developer_intelligence",
     "migrations.versions.0009_phase9_learning_career",
+    "migrations.versions.0010_learning_career_integrity",
 )
 
 PG = postgresql.dialect()
@@ -59,12 +60,42 @@ _CREATE_TABLE = re.compile(r"CREATE TABLE (\w+) \((.*?)\n\)[;]?", re.S)
 # a regex that stopped at the closing paren would silently exclude every one
 # of them from the comparison, which is the failure mode this module exists
 # to prevent: an index that is never checked is an index that can drift.
-_CREATE_INDEX = re.compile(r"CREATE (UNIQUE )?INDEX (\w+) ON (\w+) \(([^)]*)\)(?: WHERE (.+?))?;")
+# ``0010`` added the second thing that can sit between the column list and the
+# predicate: ``NULLS NOT DISTINCT`` (PostgreSQL 15+), which is the difference
+# between a uniqueness rule that fires and one that looks like it fires.
+_CREATE_INDEX = re.compile(
+    r"CREATE (UNIQUE )?INDEX (\w+) ON (\w+) \(([^)]*)\)"
+    r"( NULLS NOT DISTINCT)?(?: WHERE (.+?))?;"
+)
 _ADD_COLUMN = re.compile(r"ALTER TABLE (\w+) ADD COLUMN (\w+) ([^;]+);")
 _RENAME_COLUMN = re.compile(r"ALTER TABLE (\w+) RENAME (\w+) TO (\w+);")
 _SET_NOT_NULL = re.compile(r"ALTER TABLE (\w+) ALTER COLUMN (\w+) SET NOT NULL;")
 _FOREIGN_KEY = re.compile(r"FOREIGN KEY\((\w+)\) REFERENCES (\w+) \((\w+)\)([^,\n]*)")
 _ON_DELETE = re.compile(r"ON DELETE ([A-Z ]+?)\s*$")
+
+#: The three statement shapes a ``learning_activities.skill_id`` delete rule
+#: arrives in. PostgreSQL cannot alter a foreign key's ``ON DELETE``, so the
+#: only way to change it is to drop the constraint and add it again — which means
+#: the chain contains an ``ALTER TABLE`` this module had no reason to understand
+#: until ``0010`` wrote one. Matched as one alternation rather than three passes
+#: so the statements are replayed in the order the migration emits them; reading
+#: the ``CREATE TABLE`` blocks in isolation would report the superseded
+#: ``CASCADE`` as the current rule and every foreign-key assertion below would be
+#: checking a schema that no longer exists.
+_ALTER_FOREIGN_KEY = re.compile(
+    r"ALTER TABLE (?P<alter_table>\w+) ADD CONSTRAINT (?P<alter_name>\w+)"
+    r" FOREIGN KEY\((?P<alter_child>\w+)\) REFERENCES (?P<alter_parent>\w+)"
+    r" \(\w+\)(?P<alter_rule>[^;]*);"
+)
+_DROP_FOREIGN_KEY = re.compile(
+    r"ALTER TABLE (?P<drop_table>\w+) DROP CONSTRAINT (?P<drop_name>\w+);"
+)
+_STATEMENTS_WITH_FOREIGN_KEYS = re.compile(
+    r"CREATE TABLE (\w+) \((.*?)\n\)[;]?"
+    rf"|{_ALTER_FOREIGN_KEY.pattern}"
+    rf"|{_DROP_FOREIGN_KEY.pattern}",
+    re.S,
+)
 
 #: ``0002`` renames one of ``0001``'s columns. The replayed shape keys on the
 #: name the model uses, and this map records the name that came before it.
@@ -165,12 +196,35 @@ def _foreign_keys(ddl: str) -> set[tuple[str, str, str, str | None]]:
 
     The child table is not named in a ``FOREIGN KEY`` clause, so it has to be
     carried over from the enclosing ``CREATE TABLE`` block.
+
+    Statements are replayed in emission order so that an ``ALTER TABLE ... ADD
+    CONSTRAINT ... FOREIGN KEY`` *replaces* the rule recorded for the same
+    ``(table, column)`` when the table was created. ``0010`` is the first
+    revision to need this: changing a foreign key's delete rule is a drop
+    followed by an add, because PostgreSQL has no ``ALTER CONSTRAINT`` for it.
+
+    A ``DROP CONSTRAINT`` on its own deliberately removes nothing, since the
+    constraint name carries no column and nothing in this module may guess at a
+    naming convention. That is the safe direction: an unbalanced drop leaves the
+    superseded rule standing, so ``expected == declared`` below disagrees with
+    ``Base.metadata`` and fails, rather than the two sides quietly agreeing on a
+    constraint that no longer exists.
     """
-    found = set()
-    for match in _CREATE_TABLE.finditer(ddl):
-        table = match.group(1)
-        for child, parent, _referenced, rule in _FOREIGN_KEY.findall(match.group(2)):
-            ondelete = _ON_DELETE.findall(rule)
+    found: set[tuple[str, str, str, str | None]] = set()
+    for match in _STATEMENTS_WITH_FOREIGN_KEYS.finditer(ddl):
+        if match.group(1) is not None:
+            table = match.group(1)
+            for child, parent, _referenced, rule in _FOREIGN_KEY.findall(match.group(2)):
+                ondelete = _ON_DELETE.findall(rule)
+                found.add((table, child, parent, ondelete[0] if ondelete else None))
+        elif match.group("alter_table") is not None:
+            table, child, parent = (
+                match.group("alter_table"),
+                match.group("alter_child"),
+                match.group("alter_parent"),
+            )
+            ondelete = _ON_DELETE.findall(match.group("alter_rule"))
+            found = {entry for entry in found if entry[:2] != (table, child)}
             found.add((table, child, parent, ondelete[0] if ondelete else None))
     return found
 
@@ -237,8 +291,9 @@ def test_the_migration_chain_is_linear_with_a_single_head():
     """
     script = ScriptDirectory.from_config(_alembic_config("postgresql+psycopg://unused"))
 
-    assert script.get_heads() == ["0009"]
+    assert script.get_heads() == ["0010"]
     assert [revision.revision for revision in script.walk_revisions()] == [
+        "0010",
         "0009",
         "0008",
         "0007",
@@ -250,6 +305,7 @@ def test_the_migration_chain_is_linear_with_a_single_head():
         "0001",
     ]
     assert {revision.revision: revision.down_revision for revision in script.walk_revisions()} == {
+        "0010": "0009",
         "0009": "0008",
         "0008": "0007",
         "0007": "0006",
@@ -631,6 +687,81 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
         "career_experience": 1,
         "career_evidence": 4,
     }
+    # `learning_activities` still has three after 0010: that revision changed what
+    # one of the three does on delete rather than adding or removing a reference,
+    # which is the point the rule-level assertion below makes.
+
+
+# -- Phase 10: repairs --------------------------------------------------------
+
+
+def test_a_recorded_activity_outlives_the_skill_it_was_recorded_against(ddl, created_tables):
+    """``learning_activities.skill_id`` is ``SET NULL``, not ``CASCADE``.
+
+    ``0009`` shipped this foreign key as ``CASCADE`` while its own prose said
+    that deleting a skill leaves the recorded trail standing; the constraint won.
+    The consequence was invisible by construction, because ``learning_activities``
+    carries no ``updated_at`` — nothing recorded that rows had been destroyed, and
+    ``skills.evidence_count`` went on counting a set that no longer existed.
+
+    Both references on the table are asserted, not just the one that changed: the
+    point of the repair is that ``skill_id`` and ``goal_id`` now follow the same
+    rule, and an assertion that only ever named ``skill_id`` would still pass if
+    someone reverted ``goal_id``.
+    """
+    rules = {
+        (child, parent, ondelete)
+        for child_table, child, parent, ondelete in _foreign_keys(ddl)
+        if child_table == "learning_activities"
+    }
+    assert rules == {
+        ("user_id", "users", "CASCADE"),
+        ("skill_id", "skills", "SET NULL"),
+        ("goal_id", "learning_goals", "SET NULL"),
+    }
+    # SET NULL is only meaningful against a nullable column, and so is the second
+    # half of the argument: the surviving row must still be able to say "no skill
+    # was named" rather than being forced to carry a dangling id.
+    assert created_tables["learning_activities"]["skill_id"] == "skill_id UUID"
+
+
+def test_the_evidence_deduplication_index_treats_nulls_as_equal_to_each_other(ddl):
+    """The rendered index says ``NULLS NOT DISTINCT``, and is partial besides.
+
+    Two separate defects hide behind one index name, and the DDL is the only
+    place either is visible:
+
+    * **Partial.** A row with all three foreign keys null is a manual
+      achievement, and the user may record several of them. Leaving those rows in
+      the index would make the rule refuse the second, which is the opposite of
+      what the phase wants.
+    * **``NULLS NOT DISTINCT``.** A plain btree unique index treats nulls as equal
+      to nothing, so a project-derived row — ``project_id`` set, the other two
+      null — was never a duplicate of itself. This flag is the only reason the
+      index refuses the second derivation.
+
+    The phrase is asserted rather than inferred from the word ``UNIQUE`` because
+    a unique index without it is exactly the bug: it looks like the rule and
+    behaves as though it were not there.
+    """
+    assert (
+        "CREATE UNIQUE INDEX uq_career_evidence_source_identity "
+        "ON career_evidence (user_id, evidence_type, source, project_id, "
+        "skill_id, repository_id) NULLS NOT DISTINCT "
+        "WHERE project_id IS NOT NULL OR skill_id IS NOT NULL "
+        "OR repository_id IS NOT NULL;" in ddl
+    )
+    # And the table-level constraint that could not enforce either half is
+    # released before the index takes its name, rather than sitting alongside it
+    # and still pretending to. The ``CREATE TABLE`` above is `0009`'s and still
+    # contains it, which is exactly why the order has to be asserted: the
+    # constraint stops existing part way through the chain, not in the table
+    # definition.
+    dropped = ddl.index(
+        "ALTER TABLE career_evidence DROP CONSTRAINT uq_career_evidence_source_identity;"
+    )
+    created = ddl.index("CREATE UNIQUE INDEX uq_career_evidence_source_identity")
+    assert dropped < created
 
 
 # -- Indexes -----------------------------------------------------------------
@@ -674,6 +805,18 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
         ("ix_activity_events_project_id", "activity_events", ("project_id",), False),
         ("ix_activity_events_task_id", "activity_events", ("task_id",), False),
         ("ix_activity_events_event_type", "activity_events", ("event_type",), False),
+        # 0010. The feed's own read: an equality probe on `user_id` and then a
+        # sort on `created_at`. `id` is deliberately absent — it only breaks ties
+        # within a microsecond, and it would widen every insert into an
+        # append-only table for that. The bare `(user_id)` index above stays
+        # exactly as narrow as it was, because it is still the cheapest thing to
+        # reach for when nothing is being ordered.
+        (
+            "ix_activity_events_owner_created",
+            "activity_events",
+            ("user_id", "created_at"),
+            False,
+        ),
         # Phase 7. The two partial unique indexes are the deduplication
         # mechanism, so they are listed here like any other index — which is
         # only possible because `_CREATE_INDEX` was taught to match a WHERE
@@ -789,6 +932,26 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
             "career_evidence",
             ("user_id", "occurred_on"),
             False,
+        ),
+        # 0010. This one was a table-level `UNIQUE` constraint until 0010 and is
+        # listed here now only because it became an *index*: a partial unique
+        # index is the only form of "at most one of these, when one of these" that
+        # PostgreSQL will apply the predicate to. `unique=True` is the assertion
+        # that matters and it is asserted; the predicate itself is checked in
+        # `tests/test_migration_0010.py`, where the behaviour it produces is
+        # actually attempted against a live server.
+        (
+            "uq_career_evidence_source_identity",
+            "career_evidence",
+            (
+                "user_id",
+                "evidence_type",
+                "source",
+                "project_id",
+                "skill_id",
+                "repository_id",
+            ),
+            True,
         ),
     ],
 )

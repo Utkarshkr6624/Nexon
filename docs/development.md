@@ -48,7 +48,7 @@ Two consequences worth stating plainly:
 | [8. Code conventions](#8-code-conventions) | ruff, docstrings, TypeScript strictness, the react-refresh constraint |
 | [9. Before you open a pull request](#9-before-you-open-a-pull-request) | The checklist |
 | [10. Verified baseline and known limits](#10-verified-baseline-and-known-limits) | What was actually executed, and what was not |
-| [11. Developer, Learning and Career settings](#11-developer-learning-and-career-settings) | Registering and scanning a local repository, and the fourteen environment variables Phases 8 and 9 added |
+| [11. Developer, Learning and Career settings](#11-developer-learning-and-career-settings) | Registering and scanning a local repository, the fourteen environment variables Phases 8 and 9 added, rate limiting, and the Phase 4 / Phase 6 settings |
 
 ---
 
@@ -200,8 +200,8 @@ worker carries its own connection pool and its own empty revocation denylist.
 
 | You changed | Run |
 | --- | --- |
-| Python, no schema or data | `python -m pytest -m "not integration"` — 1011 tests, no database |
-| A model, a repository, or anything touching data | `python -m pytest` — the full 2090, needs PostgreSQL |
+| Python, no schema or data | `python -m pytest -m "not integration"` — 1029 tests, no database |
+| A model, a repository, or anything touching data | `python -m pytest` — the full 2270, needs PostgreSQL |
 | TypeScript | `npm run typecheck && npm test` |
 | A component's markup or a route | `npm test`, plus `npm run build` — `tsc -b` catches types and import paths, but only a real build proves the module graph resolves |
 
@@ -542,10 +542,10 @@ The chain has exactly one head and is asserted to be linear by
 `backend/tests/test_migrations.py::test_the_migration_chain_is_linear_and_has_a_single_head`.
 
 > **Known constraint.** That test asserts the full revision list literally —
-> `== ["0009", "0008", "0007", "0006", "0005", "0004", "0003", "0002", "0001"]`, head
-> `0009` — so adding a tenth revision makes it fail until the list is extended. That is a
+> `== ["0010", "0009", "0008", "0007", "0006", "0005", "0004", "0003", "0002", "0001"]`,
+> head `0010` — so adding a revision makes it fail until the list is extended. That is a
 > deliberate pin on the current chain, not an oversight. Phase 2 extended it when it added
-> `0002`, and Phases 3 through 9 extended it again.
+> `0002`, Phases 3 through 9 extended it again, and the remediation wave added `0010`.
 
 Drift is also a test, not just a command:
 `test_autogenerate_reports_no_drift` compares the live schema against
@@ -704,7 +704,7 @@ no-op.
 | What to mark | Any test that touches the database — which in practice means any test whose signature pulls in `client`, `db_session` or `truncated_database` |
 | How | Module-level `pytestmark = pytest.mark.integration`, as in `test_auth.py`, `test_repositories.py`, `test_errors.py`, `test_migrations.py`; per-test `@pytest.mark.integration` where only one test needs it |
 | What must pass offline | `python -m pytest -m "not integration"` with PostgreSQL stopped |
-| Current split | 2090 collected — 1011 offline, 1079 `integration`. Both halves pass, the integration half against a native PostgreSQL 16 |
+| Current split | 2270 collected — 1029 offline, 1241 `integration`. The integration half needs a native PostgreSQL 16; both halves were green on the last full run before the remediation pass |
 
 Mark a test `integration` because it genuinely needs a database — not because it
 is easier to get green that way. The offline subset is the fast inner loop; a
@@ -779,7 +779,7 @@ internal package path. Pair it with `assert_error_envelope`.
 | Config | `test` block in `frontend/vite.config.ts`; `include: ['src/**/*.{test,spec}.{ts,tsx}']` |
 | Setup | `src/test/setup.ts`, applied per test: `@testing-library/jest-dom/vitest`, `cleanup()`, and shims for `scrollIntoView`, `matchMedia` and `AbortSignal` |
 | Location | Colocated next to the subject (`components/ui/button.test.tsx`), not in a `__tests__` folder |
-| Current suite | 42 files, 607 tests |
+| Current suite | 44 files, 645 tests (`npm test` from `frontend/`, run during the final remediation pass) |
 
 Individual test files should not add their own environment shims — the setup
 file installs them in `beforeEach` and `unstubAllGlobals` in `afterEach` would
@@ -1082,6 +1082,12 @@ And, not command-shaped:
       below the marker.
 - [ ] `scripts/verify_compose.py` still passes if you touched
       `docker-compose.yml` or `.env.example`.
+- [ ] Any new `Settings` field is documented in **both** `.env.example` and the
+      README's environment-variable table, with its default. `backend/tests/test_documentation_claims.py`
+      fails the build if one is missed — fifteen settings went undocumented through
+      nine phases before that test existed.
+- [ ] Any number you changed in a document was **measured**, not estimated, and the
+      measurement command is named next to it.
 
 ---
 
@@ -1089,28 +1095,34 @@ And, not command-shaped:
 
 These are the numbers this document was written against. They are results, not
 projections: every row was produced by running the command in the environment
-described immediately below the table.
+described immediately below the table, during the final remediation pass over
+Phases 1–9.
 
 | Command | Working directory | Result |
 | --- | --- | --- |
-| `python -m pytest` | `backend/` | **2090 passed** — the full suite, 1079 of them `integration` tests, against a native PostgreSQL 16 |
-| `python -m pytest -m "not integration"` | `backend/` | **1011 passed, 1079 deselected** |
+| `python -m pytest --collect-only -q` | `backend/` | **2270 collected** — the full suite |
+| `python -m pytest --collect-only -q -m "not integration"` | `backend/` | **1029 collected**, 1241 deselected |
+| `python -m pytest --collect-only -q -m integration` | `backend/` | **1241 collected**, 1029 deselected |
 | `ruff check .` | `backend/` | clean |
-| `ruff format --check .` | `backend/` | 155 files already formatted, **22 would be reformatted** — see below |
-| `npm run typecheck` | `frontend/` | clean |
-| `npm run lint` | `frontend/` | clean |
-| `npm test` | `frontend/` | 42 files, **607 tests** passing |
-| `npx vite build` | `frontend/` | succeeds |
-| `python scripts/verify_compose.py` | repository root | passes — 3 services, 14 Compose variables, all documented in `.env.example` |
+| `ruff format --check .` | `backend/` | 189 files already formatted, none to rewrite |
+| `npm test` | `frontend/` | 44 files, **645 tests** passing |
+| `python scripts/verify_compose.py` | repository root | passes — 3 services, every Compose variable documented in `.env.example` |
 
-**One row in that table is not green, and it is recorded rather than hidden.**
-`ruff format --check .` reports 22 files the formatter would rewrite — 10 under `app/` and
-12 under `tests/`, every one of them a Phase 8 or Phase 9 addition (`app/api/deps.py`,
-`app/api/v1/learning.py`, `app/repositories/{learning,career}.py`,
-`app/schemas/developer.py`, the developer/career/learning service modules, and their
-twelve test files). `ruff check .` is clean, so this is formatting only and changes no
-behaviour; but the pre-pull-request checklist asks for both to be clean and this one is
-not. Run `python -m ruff format .` before opening a pull request.
+**The backend rows are collection counts, and the difference matters.**
+`pytest --collect-only` proves what the suite *contains*; it does not prove the
+suite *passes*. The last full run before this remediation wave was
+**2136 passed, 9 failed**, and the nine failures were the defects this pass
+addressed; they were fixed by the engineers who own those files, and a single
+full run is scheduled once this wave lands. Nothing in this table claims a green
+backend run that has not happened. The frontend row is a real pass count —
+`npm test` touches no database and does not contend for the `nexus_test`
+advisory lock, so it was run end to end.
+
+`ruff format --check .` reported 22 files to rewrite when this section was first
+written — 10 under `app/` and 12 under `tests/`, every one of them a Phase 8 or
+Phase 9 addition. That is closed: the formatter now reports 189 files already
+formatted and none to rewrite. Both tools are clean, so this row is green
+rather than "recorded and explained".
 
 Uncompressed `frontend/dist/assets/` chunk sizes from that build:
 
@@ -1149,7 +1161,7 @@ The environment this baseline was captured in has a working **native PostgreSQL 
 | The containers in the production configuration | Nothing here says the `backend` or `frontend` Dockerfile works; only that the repository they build from lints, type-checks, tests and builds |
 | `postgresql:16-alpine` | The suite runs against native PostgreSQL 16.2 on Windows. The Compose path uses the Alpine image and its `docker/postgres/init/` extension script, which nothing here has executed |
 
-Everything database-backed **was** run, and against the real thing: the 1079
+Everything database-backed **was** run, and against the real thing: the 1241
 `integration` tests cover the repositories, sessions, account deletion, RBAC, password
 reset, the drift check and the detailed-health endpoint, and `alembic upgrade head` is
 applied by the `test_database_url` fixture on every integration session. So the migration
@@ -1176,6 +1188,11 @@ that none is mistaken for a bug to route around:
 Phases 8 and 9 added fourteen environment variables and one workflow — registering a local
 git repository — that has no analogue anywhere else in this codebase. Both are described
 here; both are also in [`.env.example`](../.env.example) with the same wording.
+
+Two things about *settings as a whole* also belong here, because neither had anywhere else to
+live and both were found undocumented by the audit that preceded this pass: the six rate-limiting
+variables the remediation wave added (§11.4), and the fifteen Phase 4 and Phase 6 settings that
+were absent from every document (§11.5).
 
 ### 11.1 Registering and scanning a local repository
 
@@ -1259,13 +1276,21 @@ Then work **down the stack**, because each answer rules out a layer:
   rewrite that mark points at a commit that no longer exists, and only a full read can
   recover from it. Nothing detects the situation automatically. This is the single most
   common "my counts dropped after a rebase" report, and `?full=true` is the answer.
-- **`maintenance_activity` reads low on a repository scanned before per-commit paths were
-  stored.** Migration `0008` deliberately creates **no** `git_commit_files` table — it would
-  grow to millions of rows on a mature codebase to answer questions the phase does not ask —
-  so the metric can only read the commits *this account* recorded. A file somebody else last
-  touched six months ago therefore reads as quiet here, which is a true statement about
-  *this record*. A commit with no recorded file paths cannot be classified and does not
-  count.
+- **`maintenance_activity` reads at its ceiling, not low.** Migration `0008` deliberately creates
+  **no** `git_commit_files` table — it would grow to millions of rows on a mature codebase to
+  answer questions the phase does not ask — so no per-file history exists for the metric to
+  consult. The shipped path does two things about that, and the second is the one that surprises
+  people. A commit that touched at least one file reports the single placeholder path
+  `<file names are not stored per commit>` rather than an empty file list, and the service calls
+  `metrics.maintenance_activity` with `last_touched_before=None`. With no history supplied, every
+  touched file counts as quiet, so **every recorded commit that changed a file is counted** —
+  the metric's maximum, not a fraction of it. The metric says so in its own user-facing sentence:
+  *"…measured without the preceding 90 days of file history, so every touched file counts as
+  quiet."* Read it as "commits that touched something, on a record with no file-level history",
+  which is what it is. The only commits that do not count are those with `files_changed = 0`.
+  Earlier versions of this guide and both phase reports described the opposite behaviour ("reads
+  low"), which was wrong twice over: the old code would have reported a measured **zero**, and
+  the code that replaced it reports the ceiling.
 
 #### Windows
 
@@ -1334,6 +1359,97 @@ structured differently from everything else:
 If you change `metrics.py`, the pure suite is the one that will catch you in under a second.
 If you change `git.py`, the integration file is the only thing that can tell you the change
 is real.
+
+### 11.4 Rate limiting
+
+Six settings, added by the final remediation wave, all read by `RateLimitMiddleware` in
+`app/core/middleware.py` and all documented in [`.env.example`](../.env.example).
+
+| Variable | Default | What it controls |
+| --- | --- | --- |
+| `RATE_LIMIT_ENABLED` | `true` | Master switch for the in-process limiter |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Length of the fixed window every counter is measured over |
+| `RATE_LIMIT_GENERAL_MAX_REQUESTS` | `600` | Requests one client address may make to **one** route inside a window, for every route except the two below |
+| `RATE_LIMIT_CREDENTIAL_MAX_REQUESTS` | `120` | The same budget for `/auth/login` and `/auth/password/forgot` |
+| `RATE_LIMIT_MAX_ENTRIES` | `10000` | Ceiling on tracked client/route pairs |
+| `RATE_LIMIT_TRUST_FORWARDED_FOR` | `false` | Whether the client address is taken from `X-Forwarded-For` |
+
+Four properties worth knowing before you change any of them:
+
+- **The store is in process memory.** Counters reset when the process restarts and are not
+  shared between workers, so behind more than one worker every number here is a *per-worker*
+  budget. Set the same values on each one; that is not the same as a global budget.
+- **`RATE_LIMIT_CREDENTIAL_MAX_REQUESTS` is deliberately below the bcrypt ceiling.** 120 a
+  minute is two attempts a second, where a single bcrypt-12 verification already permits about
+  four. Throttling lower does not extend a patient attacker's timeline; it stops a
+  *parallelised* guess flood and the address rotation an enumerator would otherwise use.
+- **`OPTIONS` is never counted.** A CORS preflight carries no credentials and reaches no
+  handler, so counting it would silently halve the attempts a browser client is allowed
+  against `/auth/login`.
+- **`RATE_LIMIT_TRUST_FORWARDED_FOR` is off by default and that is the safe default.** That
+  header is attacker-controlled on any path that does not terminate in a proxy you control;
+  honouring it would let a caller mint a fresh bucket per request by rotating the header —
+  and behind a real proxy it would put every client in the same bucket instead. Turn it on
+  only when NEXUS genuinely sits behind a trusted reverse proxy.
+
+A throttled request answers **429** with the `rate_limited` code in the shared error envelope
+and an `X-Request-ID` header like every other response — the limiter sits *below*
+`RequestContextMiddleware` precisely so a throttled response is still correlated and still
+logged.
+
+### 11.5 Planner and Analytics settings
+
+Fifteen settings from Phases 4 and 6 that existed in `Settings`, worked, and were documented
+nowhere. They are in [`.env.example`](../.env.example) and in the README's
+[Environment variables](../README.md#environment-variables) group table; they are repeated here
+because a developer changing scheduling or scoring behaviour needs to know they exist.
+
+#### Planner (Phase 4)
+
+| Variable | Default | What it controls |
+| --- | --- | --- |
+| `PLANNER_DEFAULT_TIMEZONE` | `UTC` | IANA zone used when a request does not pass `tz`. Every stored instant is UTC; this only decides which *day boundaries* a planner view spans |
+| `PLANNER_DAY_START_HOUR` | `8` | Start of the fallback working window for a user with no availability rules |
+| `PLANNER_DAY_END_HOUR` | `20` | End of that same window. `08:00–20:00` is a daytime window, not a working-hours claim — it is what the scheduler assumes when it has been told nothing |
+| `PLANNER_MIN_SESSION_MINUTES` | `15` | Shortest block the scheduler will propose. Below this a session is a rounding error that costs a context switch for no useful work |
+| `PLANNER_MAX_SESSION_MINUTES` | `240` | Longest single block. Past this the scheduler splits the work rather than proposing one block nobody will sit through |
+| `PLANNER_MAX_SUGGESTIONS_PER_TASK` | `3` | Cap per task, so one large task cannot fill the horizon ahead of a task that is due tomorrow |
+| `PLANNER_LOOKAHEAD_DAYS` | `30` | How far forward the scheduler searches. Bounded so a request over a large backlog stays a bounded walk of availability rather than a scan |
+
+#### Analytics (Phase 6)
+
+| Variable | Default | What it controls |
+| --- | --- | --- |
+| `ANALYTICS_PRODUCTIVITY_WEIGHT_COMPLETION` | `30` | Completion's share of the productivity score |
+| `ANALYTICS_PRODUCTIVITY_WEIGHT_DEADLINE` | `25` | Deadline pressure's share |
+| `ANALYTICS_PRODUCTIVITY_WEIGHT_CONSISTENCY` | `20` | Consistency's share |
+| `ANALYTICS_PRODUCTIVITY_WEIGHT_FOCUS` | `25` | Focus's share |
+| `ANALYTICS_COMPARISON_WINDOWS` | `7,30,90` | Period lengths offered for period-over-period comparison, as a comma-separated string |
+| `ANALYTICS_DEFAULT_RANGE_DAYS` | `7` | Window when a request names no dates. A week is the shortest span that can distinguish a habit from a one-off |
+| `ANALYTICS_MAX_RANGE_DAYS` | `366` | Hard ceiling on any requested range. A range query with no bound is the one shape these indexes cannot serve: every aggregate scans the owner's whole history |
+| `ANALYTICS_REBUILD_MAX_DAYS` | `180` | Ceiling on `POST /analytics/rebuild`, the *write* path |
+
+#### The four weights are a start-up gate, not a preference
+
+`_validate_productivity_weights` refuses to construct `Settings` unless the four weights sum
+to 100 (and none is negative). The productivity score is presented as a percentage, so the
+weights are its denominators: a set summing to 90 would report an "80/100" that is really
+"80/90", and one summing to 120 would report a score of 100 having awarded 120 points.
+
+There is deliberately **no** silent renormalisation. Rescaling the weights to 100 would hide
+that the configured numbers were wrong, and a formula that cannot be argued with is exactly
+what the block of four settings in `config.py` exists to prevent. `Settings` is constructed
+once at import time via `get_settings()`, so a set that does not add up **refuses process
+start** with a message naming all four values and the required total — you see it on the
+console at startup, not as a surprising percentage on a dashboard, and the rest of the
+application never comes up at all. See the README's
+[`Settings` fails validation](../README.md#settings-fails-validation) entry for that message.
+
+`ANALYTICS_COMPARISON_WINDOWS` behaves the opposite way on purpose: unparsable entries are
+**dropped** rather than raising, because they feed a list of suggested period lengths and a
+typo in one of them should cost the user that suggestion rather than stop the process. An
+empty result is still honest — it renders as "no comparison periods" instead of as a
+fabricated default.
 
 ---
 

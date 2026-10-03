@@ -70,6 +70,46 @@ class Settings(BaseSettings):
     # something to display, but nothing is currently deleting rows.
     audit_log_retention_days: int = 400
 
+    # -- Rate limiting --------------------------------------------------------
+    #: Master switch for the in-process limiter in ``app.core.middleware``.
+    #: On by default because the credential endpoints it protects
+    #: (``/auth/login``, ``/auth/password/forgot``) are otherwise an open
+    #: password-guessing oracle: bcrypt costs an attacker ~250 ms a try, which
+    #: slows them down but never stops them.
+    rate_limit_enabled: bool = True
+    #: Length of the fixed window every counter is measured over. A minute is
+    #: the unit an operator thinks in ("20 a minute"), and it is short enough
+    #: that a burst is forgiven quickly.
+    rate_limit_window_seconds: int = 60
+    #: Requests one client address may make to one route inside a window, for
+    #: everything except the credential routes below. Generous on purpose: this
+    #: bucket is a runaway-client backstop, not a quota, and the whole test
+    #: suite talks to the API from one address.
+    rate_limit_general_max_requests: int = 600
+    #: Requests one client address may make to ``/auth/login`` and
+    #: ``/auth/password/forgot`` inside a window — a shared, more aggressive
+    #: budget than the general one, because both routes are unauthenticated
+    #: credential oracles. 180 a minute is three attempts a second, which is
+    #: below the ~4/s a single bcrypt-12 verification already permits, so it
+    #: lengthens nobody's timeline; what it stops is a *parallelised* guess flood
+    #: and a reset-request flood, and what it buys back is a caller that is told
+    #: to stop rather than left to guess. It is deliberately far above what the
+    #: densest minute of the test suite produces (62, measured from 127.0.0.1
+    #: across the nine heaviest files), because every suite shares one address.
+    rate_limit_credential_max_requests: int = 180
+    #: Ceiling on tracked client/route pairs. The store is swept and evicted
+    #: long before this, so it is a backstop against a client that can reach the
+    #: limiter with unbounded distinct keys — a hard guarantee that the limiter
+    #: cannot become the memory leak it exists to prevent.
+    rate_limit_max_entries: int = 10_000
+    #: Whether to take the client address from ``X-Forwarded-For``. Off by
+    #: default, and deliberately so: that header is attacker-controlled on any
+    #: path that does not terminate in a proxy we control, so honouring it would
+    #: let a caller mint a fresh bucket per request by rotating the header.
+    #: Turn it on when the app really does sit behind a trusted reverse proxy —
+    #: then, and only then, every client shares the proxy's address.
+    rate_limit_trust_forwarded_for: bool = False
+
     # -- CORS ----------------------------------------------------------------
     # Stored as a comma-separated string so it is pleasant to set in .env.
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

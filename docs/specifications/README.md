@@ -32,6 +32,22 @@ A phase is marked complete when its brief is implemented, the full suite is gree
 mandatory regression check in that brief has been run. Each completed phase has a report
 documenting what was built, what was wrong, and what was actually executed.
 
+### Remediation pass
+
+After Phase 9 shipped, an audit ran over Phases 1–9 and found real defects — three of them
+data-loss or correctness blockers, plus a coverage gap where Phases 3–5 had no dedicated test
+modules at all. Both phase reports carry a clearly-marked remediation section recording what
+changed and which of their own claims were wrong:
+
+| Report | Remediation section |
+| --- | --- |
+| [`phase-8-developer-report.md`](./phase-8-developer-report.md) | [§12 Remediation pass](./phase-8-developer-report.md#12-remediation-pass) — the never-scanned repository leaving the feature vector, and the inverted `maintenance_activity` claim |
+| [`phase-9-learning-career-report.md`](./phase-9-learning-career-report.md) | [§13 Remediation pass](./phase-9-learning-career-report.md#13-remediation-pass) — migration `0010`'s three unenforced invariants, and the same inverted claim |
+
+[`../architecture.md` §18](../architecture.md#18-remediation-pass-over-phases-19) is the
+single account of the whole pass: the three blockers, the coverage gap, the versioned feature
+vector, and every number in the documentation set that moved because of it.
+
 ## Why these are stored rather than kept in chat
 
 Several of these phases were issued across separate sessions and were, more than once, sent

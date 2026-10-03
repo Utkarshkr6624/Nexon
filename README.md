@@ -22,7 +22,7 @@ then made the module surface real, one module per phase. What exists today:
 | Password policy, password change, and password reset (no mail service required) | Done |
 | Role-based permissions (`user` / `admin`) with a fail-closed `require_permission()` | Done |
 | Security audit trail (`audit_logs`, 12 event types, best-effort writes) | Done |
-| Alembic migration pipeline | Done — nine revisions, `0001_initial_create_users` → `0009_phase9_learning_career`, a single linear head |
+| Alembic migration pipeline | Done — ten revisions, `0001_initial_create_users` → `0010_learning_career_integrity`, a single linear head |
 | PostgreSQL 16 | The Compose stack is declared and statically validated but has **never** been executed by `docker compose`. A **native** PostgreSQL 16 runs in the development environment and backs every database-backed test |
 | React + TypeScript frontend: router, app shell, design system, theming | Done |
 | Frontend design-system primitives, several hand-rolled (see below) | Done |
@@ -31,15 +31,28 @@ then made the module surface real, one module per phase. What exists today:
 | Projects, Tasks, Planner, Knowledge, Analytics, Risks, Recommendations (Phases 3–7) | Live — migrations `0003`–`0007`, backend routes and real pages |
 | Developer, Learning, Career (Phases 8 and 9) | Live — see [Phase 8 and Phase 9](#phase-8-and-phase-9--developer-learning-and-career) |
 | Search, AI Assistant, Experiments | Designed placeholder pages only |
-| Automated tests | Passing — **2090 backend** (1011 offline, 1079 `integration`, every one of them run against PostgreSQL 16) and **607 frontend** across 42 files |
+| Automated tests | **2270 backend collected** (1029 offline, 1241 `integration`) — collection counts, not a pass count; and **645 frontend** in 44 files, all passing |
 
-The 2090 backend figure is the result of `python -m pytest` from `backend/` — the full
-suite, not a subset. `pytest -m "not integration"` is the 1011-test offline slice and
-`pytest -m "integration"` is the other 1079; both are green, so the migrations, the
-repositories and every database-backed endpoint have been executed against a real
-server. `frontend/` runs 607 tests across 42 files with `npm test`. Docker is still not
-installed on this machine, so `docker compose up` remains untested — see
+The backend figure is a **collection** count from `pytest --collect-only` in `backend/`, and
+it is labelled that way on purpose. The last full run before the final remediation pass was
+2136 passed and 9 failed; the nine were real defects — three of them lost user data — and
+they have been fixed by the engineers who own those files. One full run is scheduled once this
+pass lands, so nothing here claims a green backend run that has not happened. The frontend
+figure *is* a pass count: `npm test` touches no database, was run end to end, and reports 44
+files and 645 tests passing. Docker is still not installed on this machine, so
+`docker compose up` remains untested — see
 [Troubleshooting](#docker-compose-up-fails-before-anything-starts).
+
+**What the audit found, and what this README now says differently.** Between the last phase
+report and this line, an audit ran over Phases 1–9 and found real defects: deleting a project
+destroyed subtasks that had been moved to another board; `PUT /availability` deleted the user's
+whole week and then refused the replacement; a risk deadline was rendered a day late whenever a
+detection pass straddled midnight. Phases 3–5 had no dedicated test modules at all. The
+feature vector gained a wrapper so its version string sits beside the numeric matrix rather
+than inside it, and a repository that has never been scanned no longer appears in it as a row
+of zeros. Each of those has a regression test, each is recorded in
+[`docs/architecture.md` §18](docs/architecture.md#18-remediation-pass-over-phases-19) and in
+both phase reports, and the counts above were recounted rather than carried forward.
 
 **What does not exist yet.** Search, AI Assistant and Experiments are *designed
 placeholder pages only*. They render a real module description, the planned capabilities
@@ -53,7 +66,7 @@ Settings carries profile, password, active sessions with per-device revoke and "
 everywhere", theme, and a password-protected account deletion. Projects, Project detail,
 Tasks, Planner, Month, Knowledge, Note detail, Concept detail, Analytics, Risk center,
 Recommendations, Developer, Developer repository, Learning and Career are all backed by
-real routes and real tables. The backend serves **136 paths and 183 operations**; the
+real routes and real tables. The backend serves **140 paths and 187 operations**; the
 per-module inventories live in the phase reports and in
 [`docs/api-conventions.md`](docs/api-conventions.md).
 
@@ -302,7 +315,7 @@ Nexo/
 | Auth | PyJWT 2.15 + bcrypt 5.0 | HS256, access + refresh, in-process access-token denylist plus database-backed device sessions |
 | Database | PostgreSQL 16 (`postgres:16-alpine`) | `pg_trgm`, `unaccent` enabled on first init |
 | Lint / format (backend) | ruff 0.16 | `check` + `format --check`, line length 100 |
-| Tests (backend) | pytest 9.1 + pytest-asyncio + httpx | 2090 collected and passing — 1011 run with the database down, 1079 are `integration`-marked and run against PostgreSQL |
+| Tests (backend) | pytest 9.1 + pytest-asyncio + httpx | 2270 collected — 1029 run with the database down, 1241 are `integration`-marked and run against PostgreSQL |
 | Framework (frontend) | React 19 | function components, StrictMode |
 | Language (frontend) | TypeScript 5.7 | `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax` |
 | Build / dev server | Vite 7 | dev proxy, manual chunks, Vitest config |
@@ -311,7 +324,7 @@ Nexo/
 | Client state | Zustand 5 | auth session, theme, command palette, toasts |
 | Styling | Tailwind CSS 3.4 + shadcn/ui conventions | `cva` variants, lucide icons, and a small number of hand-rolled primitives where no Radix package is installed |
 | Charts | recharts 2.15 | reserved for the Analytics module |
-| Tests (frontend) | Vitest 3.2 + React Testing Library | 607 tests in 42 files |
+| Tests (frontend) | Vitest 3.2 + React Testing Library | 645 tests in 44 files |
 
 Production bundle is code-split per route and by vendor group. Current build, uncompressed
 `frontend/dist/assets/` sizes, as produced by `npx vite build`: entry chunk `index`
@@ -478,9 +491,12 @@ directory. Every variable is case-insensitive.
 | Application | `ENVIRONMENT`, `DEBUG`, `APP_NAME`, `APP_VERSION`, `APP_DESCRIPTION` (shown in the OpenAPI schema and the docs UI), `OPENAPI_URL`, `DOCS_URL`, `REDOC_URL`, `API_V1_PREFIX` (the prefix every versioned route is mounted under; change it and `VITE_API_BASE_URL` has to change with it) |
 | Security | `SECRET_KEY`, `JWT_ALGORITHM`, `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS` |
 | Accounts, sessions and audit (Phase 2) | `PASSWORD_MIN_LENGTH` (default 8, plus uppercase/lowercase/digit/special), `PASSWORD_RESET_EXPIRE_MINUTES` (30), `SESSION_ABSOLUTE_LIFETIME_DAYS` (30), `MAX_ACTIVE_SESSIONS` (20), `AUDIT_LOG_RETENTION_DAYS` (400 — **declared, not enforced**; no pruning job exists) |
+| Rate limiting | `RATE_LIMIT_ENABLED` (true), `RATE_LIMIT_WINDOW_SECONDS` (60), `RATE_LIMIT_GENERAL_MAX_REQUESTS` (600 per route per address per window), `RATE_LIMIT_CREDENTIAL_MAX_REQUESTS` (120, for `/auth/login` and `/auth/password/forgot`), `RATE_LIMIT_MAX_ENTRIES` (10000 — the backstop that keeps the in-memory store from becoming the leak it prevents), `RATE_LIMIT_TRUST_FORWARDED_FOR` (false — turn it on **only** behind a trusted reverse proxy) |
 | Backend server (read by `backend/run.py`) | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_RELOAD` |
 | CORS | `CORS_ORIGINS` (comma-separated, no trailing slashes) |
 | Database | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_HOST`, `POSTGRES_PORT`, `DATABASE_URL`, `TEST_DATABASE_URL`, `DB_ECHO`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE`, `DB_PROBE_TIMEOUT_SECONDS` |
+| Planner (Phase 4) | `PLANNER_DEFAULT_TIMEZONE` (`UTC` — the zone that decides which *day boundaries* a view spans; every stored instant stays UTC), `PLANNER_DAY_START_HOUR` (8), `PLANNER_DAY_END_HOUR` (20) — the fallback working window for a user with no availability rules, `PLANNER_MIN_SESSION_MINUTES` (15), `PLANNER_MAX_SESSION_MINUTES` (240), `PLANNER_MAX_SUGGESTIONS_PER_TASK` (3), `PLANNER_LOOKAHEAD_DAYS` (30) |
+| Analytics (Phase 6) | `ANALYTICS_PRODUCTIVITY_WEIGHT_COMPLETION` (30), `ANALYTICS_PRODUCTIVITY_WEIGHT_DEADLINE` (25), `ANALYTICS_PRODUCTIVITY_WEIGHT_CONSISTENCY` (20), `ANALYTICS_PRODUCTIVITY_WEIGHT_FOCUS` (25) — **these four must sum to 100 or the process refuses to start**; see [`Settings` fails validation](#settings-fails-validation). Also `ANALYTICS_COMPARISON_WINDOWS` (`7,30,90`), `ANALYTICS_DEFAULT_RANGE_DAYS` (7), `ANALYTICS_MAX_RANGE_DAYS` (366), `ANALYTICS_REBUILD_MAX_DAYS` (180) |
 | Logging | `LOG_LEVEL`, `LOG_JSON`, `LOG_FILE`, `LOG_REQUEST_BODY`, `SLOW_REQUEST_MS` |
 | Frontend — read by the app (only `VITE_*` reaches the browser) | `VITE_API_BASE_URL` |
 | Frontend — dev server only | `VITE_DEV_PROXY_TARGET` — server-side, read by `frontend/vite.config.ts`; it is never bundled into the browser build |
@@ -558,7 +574,7 @@ scripts and npm scripts. `make` with no argument lists them.
 | `make db-wait` | `scripts/wait_for_db.py --timeout $(TIMEOUT)` — block until PostgreSQL accepts connections. `make db-wait TIMEOUT=120` to wait longer. |
 | `make test-db` | `scripts/create_test_database.py` — create the `nexus_test` database. Never drops anything by default; pass `TEST_DB_FLAGS=--drop` to rebuild it, which is destructive. |
 | `make test` | `test-backend` then `test-frontend` |
-| `make test-backend` | `pytest` in `backend/` (all 2090 tests — the 1079 `integration` ones included, and they need PostgreSQL) |
+| `make test-backend` | `pytest` in `backend/` (all 2270 tests — the 1241 `integration` ones included, and they need PostgreSQL) |
 | `make test-frontend` | `npm run test` in `frontend/` |
 | `make lint` | ruff check, ruff format --check, eslint, tsc -b |
 | `make backend` | `scripts/dev.sh backend` |
@@ -586,8 +602,8 @@ Backend — run from `backend/`:
 
 ```bash
 python run.py                                   # dev server, honours NEXUS_HOST/PORT/RELOAD
-python -m pytest                                # 2090 collected: 1011 offline plus 1079 integration (need PostgreSQL)
-python -m pytest -m "not integration"           # 1011 tests, no database needed
+python -m pytest                                # 2270 collected: 1029 offline plus 1241 integration (need PostgreSQL)
+python -m pytest -m "not integration"           # 1029 tests, no database needed
 python -m ruff check .
 python -m ruff format --check .
 python -m alembic upgrade head                  # apply migrations
@@ -606,7 +622,7 @@ Frontend — run from `frontend/`:
 npm run dev            # Vite dev server on :5173
 npm run build          # tsc -b && vite build
 npm run preview        # serve dist/ on :4173
-npm test               # vitest run (607 tests in 42 files)
+npm test               # vitest run (645 tests in 44 files)
 npm run test:watch     # vitest
 npm run test:coverage  # vitest run --coverage
 npm run lint           # eslint .
@@ -649,7 +665,7 @@ bash scripts/dev.sh [both|backend|frontend]
 
 ### Endpoints
 
-The API serves **136 paths and 183 operations** today, across nineteen routers mounted
+The API serves **140 paths and 187 operations** today, across nineteen routers mounted
 under `/api/v1` by `backend/app/api/v1/router.py`.
 
 The table below is the **Phase 2 slice** — health, auth and users — which is the part
@@ -665,7 +681,7 @@ and, by convention, in [`docs/api-conventions.md`](docs/api-conventions.md).
 | `GET` | `/health` | no | 200 `{"status":"ok"}` — never touches the database |
 | `GET` | `/api/v1/health` | no | 200, app/version/environment/database status + latency/uptime/timestamp |
 | `POST` | `/api/v1/auth/register` | no | 201, `UserRead` — 409 if the email **or** the username is taken |
-| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` — opens a device session |
+| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` — opens a device session. 429 `rate_limited` once an address exhausts its credential budget |
 | `POST` | `/api/v1/auth/refresh` | no | 200, `TokenPair` — single-use rotation on the same session row |
 | `POST` | `/api/v1/auth/logout` | optional | 204 no content |
 | `POST` | `/api/v1/auth/logout-all` | bearer | 204 — revokes every **other** session, keeps the caller's |
@@ -673,7 +689,7 @@ and, by convention, in [`docs/api-conventions.md`](docs/api-conventions.md).
 | `GET` | `/api/v1/auth/sessions` | bearer | 200, `SessionListRead` — the caller's live devices |
 | `DELETE` | `/api/v1/auth/sessions/{session_id}` | bearer | 204 — 404 if the caller does not own that session |
 | `PATCH` | `/api/v1/auth/password` | bearer | 204 — ends every session except the caller's |
-| `POST` | `/api/v1/auth/password/forgot` | no | 202 — identical body for a known and an unknown address |
+| `POST` | `/api/v1/auth/password/forgot` | no | 202 — identical body for a known and an unknown address. 429 `rate_limited` on the same credential budget as login |
 | `POST` | `/api/v1/auth/password/reset` | no | 204 — ends **every** session, including the caller's |
 | `PATCH` | `/api/v1/users/me` | bearer + `users.write` | 200, `UserRead` |
 | `DELETE` | `/api/v1/users/me` | bearer | 204 — requires the account password and `confirm: true` |
@@ -775,6 +791,26 @@ database.
 `SECRET_KEY must be set to a strong random value when ENVIRONMENT=production.` — or
 `DEBUG must be false when ENVIRONMENT=production.` Both are raised from
 `app/core/config.py` at import time.
+
+A third validator refuses to build `Settings` at all when the four productivity
+weights do not sum to 100:
+
+```text
+The analytics productivity weights must sum to 100; they sum to 95.0
+(analytics_productivity_weight_completion=30.0, ..._deadline=25.0,
+..._consistency=20.0, ..._focus=20.0).
+```
+
+This is deliberate, and it is worth knowing before you retune the score. The
+productivity score is presented as a percentage, so the weights are its
+denominators: a set summing to 90 would report a "80/100" that is really
+"80/90", and one summing to 120 would report a score of 100 having awarded 120
+points. There is no silent renormalisation, because hiding that the configured
+numbers were wrong would make the scale unarguable. `Settings` is constructed
+once at import time, so a set that does not add up takes the process down rather
+than serving analytics whose formula does not hold — you will see it on startup,
+not in a dashboard. To retune the score, change one weight and give the
+difference to another.
 
 ### Hot reload is not working
 

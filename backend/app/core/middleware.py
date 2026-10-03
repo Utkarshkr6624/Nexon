@@ -1,4 +1,4 @@
-"""Request-scoped context: correlation ids, timing and access logging.
+"""Request-scoped context: correlation ids, timing, access logging and throttling.
 
 :func:`add_request_context_middleware` installs :class:`RequestContextMiddleware`
 as the outermost middleware, ahead of ``ServerErrorMiddleware``. A middleware
@@ -12,6 +12,9 @@ frontend's error correlation on exactly the requests that need it.
 Both the header and the access line therefore work on raw ASGI messages: the
 header is stamped onto ``http.response.start`` as it goes out, and the status
 code is read back from the same message.
+
+:class:`RateLimitMiddleware` sits the other way round: one layer *below* the
+request context, so a throttled response is still correlated and still logged.
 """
 
 from __future__ import annotations
@@ -19,9 +22,13 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -29,6 +36,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.config import Settings, get_settings
+from app.core.exceptions import ErrorCode, build_error_response
 from app.core.logging import (
     REDACTED_KEYS,
     get_logger,
@@ -41,6 +49,7 @@ from app.core.logging import (
 __all__ = [
     "REQUEST_ID_HEADER",
     "BodyCaptureMiddleware",
+    "RateLimitMiddleware",
     "RequestContextMiddleware",
     "add_request_context_middleware",
 ]
@@ -71,6 +80,29 @@ _REDACTED = "***redacted***"
 #: :data:`REDACTED_KEYS`. The value runs to the next parameter separator, so
 #: nothing after the secret is swallowed and nothing inside it survives.
 _REDACTED_PARAM_PATTERN = re.compile(rf"(?i)\b({'|'.join(sorted(REDACTED_KEYS))})(\s*=\s*)[^&#]*")
+
+#: Routes measured against the tighter credential budget, relative to
+#: ``Settings.api_v1_prefix`` so the prefix stays a configuration concern. These
+#: are the two endpoints that answer an unauthenticated caller with something an
+#: attacker wants: whether a password is guessable, and whether an address has
+#: an account at all. They share **one** budget rather than one each — guessing
+#: a password and enumerating an address are the same attack, so a caller must
+#: not be handed double the allowance by splitting its traffic across them.
+_CREDENTIAL_ROUTES = frozenset({"/auth/login", "/auth/password/forgot"})
+
+#: The bucket key every credential route is counted under, in place of its own
+#: path. See :data:`_CREDENTIAL_ROUTES`.
+_CREDENTIAL_BUCKET = "credential"
+
+#: Never counted against a budget. A CORS preflight carries no credentials and
+#: reaches no handler, so counting it would silently halve the attempts a
+#: browser client is allowed against ``/auth/login``.
+_EXEMPT_METHODS = frozenset({"OPTIONS"})
+
+#: Bucket shared by requests whose client address is unknown, because the
+#: transport reported none. Sharing one bucket is the conservative reading: a
+#: caller we cannot address is a caller we cannot throttle separately.
+_UNKNOWN_CLIENT = "unknown"
 
 
 class RequestContextMiddleware:
@@ -185,6 +217,208 @@ class BodyCaptureMiddleware:
         await self.app(scope, replay, send)
 
 
+@dataclass(frozen=True, slots=True)
+class _Verdict:
+    """What the limiter decided about one request."""
+
+    allowed: bool
+    #: Whole seconds the caller should wait, always >= 1 when denied. RFC 9110
+    #: allows a delay to be rounded up, and rounding down would invite a caller
+    #: straight back into the 429 it was just told to avoid.
+    retry_after: int
+
+
+class _Window:
+    """One client's request count against one route, and when it started."""
+
+    __slots__ = ("count", "started_at")
+
+    def __init__(self, count: int, started_at: float) -> None:
+        self.count = count
+        self.started_at = started_at
+
+
+class _FixedWindowLimiter:
+    """Counters keyed by ``(client address, route)``, each over a fixed window.
+
+    Bounded in two independent ways, because a limiter that can be made to grow
+    without limit is a denial-of-service tool aimed at the server:
+
+    * **Self-evicting.** An entry is dropped once its window has elapsed. The
+      sweep runs at most once per window rather than on every request, so it
+      costs one pass over the keys per window instead of one per request, and a
+      quiet key is gone within one window of expiring.
+    * **Capped.** Inserting past ``max_entries`` evicts the oldest-inserted key
+      outright. This is FIFO rather than LRU because it is O(1): at capacity the
+      alternative is a scan, and a scan per request under a flood of distinct
+      keys is exactly the amplification the cap exists to prevent.
+
+    No lock: a single event loop thread runs the read-modify-write in one
+    synchronous step, and the entries are plain floats and ints.
+
+    Both arguments are floored at one. A zero from a mistyped environment
+    variable would otherwise make the sweep run on every request — a full pass
+    over the keys per call — or make the cap evict from an empty dict.
+    """
+
+    def __init__(self, *, window_seconds: float, max_entries: int) -> None:
+        self._window = max(1.0, window_seconds)
+        self._max_entries = max(1, max_entries)
+        self._windows: dict[tuple[str, str], _Window] = {}
+        self._last_sweep = 0.0
+
+    def consume(self, key: tuple[str, str], now: float, limit: int) -> _Verdict:
+        """Count one request against ``key`` and say whether it may proceed.
+
+        A denied request is **not** counted. Counting it would extend the
+        penalty past the window that caused it: a caller who kept hammering
+        would never see the budget return, and the ``Retry-After`` it was handed
+        would be a lie.
+        """
+        self._sweep(now)
+        window = self._windows.get(key)
+        if window is None or now - window.started_at >= self._window:
+            if limit <= 0:
+                return _Verdict(False, self._full_window())
+            self._admit(key, now)
+            return _Verdict(True, 0)
+        if window.count >= limit:
+            return _Verdict(False, max(1, math.ceil(self._window - (now - window.started_at))))
+        window.count += 1
+        return _Verdict(True, 0)
+
+    def _admit(self, key: tuple[str, str], now: float) -> None:
+        """Open a fresh window for ``key`` with a count of one."""
+        if len(self._windows) >= self._max_entries:
+            self._windows.pop(next(iter(self._windows)))
+        self._windows[key] = _Window(count=1, started_at=now)
+
+    def _sweep(self, now: float) -> None:
+        """Drop every window that has elapsed, at most once per window."""
+        if now - self._last_sweep < self._window:
+            return
+        self._last_sweep = now
+        stale = [key for key, win in self._windows.items() if now - win.started_at >= self._window]
+        for key in stale:
+            del self._windows[key]
+
+    def _full_window(self) -> int:
+        return max(1, math.ceil(self._window))
+
+
+class RateLimitMiddleware:
+    """Refuse a caller who is asking for the same route too often.
+
+    Why it exists: ``POST /auth/login`` and ``POST /auth/password/forgot`` are
+    unauthenticated and were entirely unthrottled. bcrypt answers that the
+    password check costs ~250 ms, which slows an online guess down without
+    stopping it, and ``/auth/password/forgot`` has nothing at all in its way.
+
+    **What it keys on.** A client address and a route path, so a busy address
+    cannot spend the budget of a different one and one route's traffic cannot
+    starve another's. ``/auth/login`` and ``/auth/password/forgot`` are the
+    exception: they are counted under one shared key rather than their own, so
+    neither can double the allowance by splitting across the other. Both draw on
+    a separate, tighter budget than the rest of the API.
+
+    **Why a wrong password still reads as a wrong password.** The counter is
+    checked *before* the request is counted, so the first ``limit`` attempts are
+    answered by the real handler — 401 for a bad password, on every one of them.
+    Only attempt ``limit + 1`` is refused. A limiter that answered 429 to the
+    first attempt would be worse than no limiter: the attacker learns the limit
+    instead of the password, and a legitimate user who mistypes is told the
+    wrong thing about why.
+
+    **Why the refusal reveals nothing.** The 429 body and the 401 body are both
+    independent of whether an account exists — the limiter runs before the
+    handler has looked at a single row, so a caller cannot tell "no such
+    account" from "wrong password" from "you are not allowed to ask again this
+    minute", and the message says only how long to wait.
+
+    **What it does not do.** This is an in-process counter, so it is *per
+    worker*: run ``uvicorn --workers 4`` or two replicas behind a load balancer
+    and each holds its own tally, multiplying every limit above by the worker
+    count, and restarting the process clears them. That is the same documented
+    weakness the session revocation denylist in ``app.services.auth_service``
+    carries and the same reason it is stated there rather than glossed over.
+    A shared limit needs a shared store — Redis, or a table — which Phase 1 has
+    no deployment story for yet. Until then this is a floor, not a ceiling, and
+    it is worth having: it raises the cost of a flood without pretending to end
+    it.
+
+    It is also keyed on the *concrete* path, so an enumerator varying the last
+    segment (``/projects/1``, ``/projects/2``, ...) draws a fresh budget each
+    time. That is acceptable here because this bucket is the generous one; the
+    credential routes it exists for are fixed paths by construction.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        settings: Settings | None = None,
+        *,
+        time_source: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.app = app
+        self.settings = settings or get_settings()
+        self.enabled = self.settings.rate_limit_enabled
+        self.prefix = self.settings.api_v1_prefix
+        self.trust_forwarded = self.settings.rate_limit_trust_forwarded_for
+        self.general_limit = self.settings.rate_limit_general_max_requests
+        self.credential_limit = self.settings.rate_limit_credential_max_requests
+        self._now = time_source
+        self._limiter = _FixedWindowLimiter(
+            window_seconds=float(self.settings.rate_limit_window_seconds),
+            max_entries=self.settings.rate_limit_max_entries,
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Count the request, and refuse it with 429 once the budget is gone."""
+        if not self.enabled or scope["type"] != "http" or scope["method"] in _EXEMPT_METHODS:
+            await self.app(scope, receive, send)
+            return
+
+        path = scope["path"]
+        credential = self._is_credential_route(path)
+        client = _client_ip(Request(scope), trust_forwarded=self.trust_forwarded) or _UNKNOWN_CLIENT
+        verdict = self._limiter.consume(
+            (client, _CREDENTIAL_BUCKET if credential else path),
+            self._now(),
+            self.credential_limit if credential else self.general_limit,
+        )
+        if verdict.allowed:
+            await self.app(scope, receive, send)
+            return
+
+        log_event(
+            logger,
+            logging.WARNING,
+            "rate_limited",
+            path=path,
+            client_ip=client,
+            retry_after_seconds=verdict.retry_after,
+            budget="credential" if credential else "general",
+        )
+        # The same envelope every other failure uses, so the frontend needs no
+        # special case: `request_id` comes from the request context this
+        # middleware sits inside, and the header below comes from the layer
+        # outside it.
+        retry_after = verdict.retry_after
+        response = build_error_response(
+            code=ErrorCode.RATE_LIMITED,
+            message=f"Too many requests from this address. Try again in {retry_after} seconds.",
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(retry_after)},
+        )
+        await response(scope, receive, send)
+
+    def _is_credential_route(self, path: str) -> bool:
+        """Whether ``path`` is one of the credential routes, prefix removed."""
+        if self.prefix and path.startswith(self.prefix):
+            path = path[len(self.prefix) :] or "/"
+        return path in _CREDENTIAL_ROUTES
+
+
 def _access_log_level(status_code: int, duration_ms: float, slow_request_ms: int) -> int:
     if status_code >= 500:
         return logging.ERROR
@@ -203,11 +437,20 @@ def _resolve_request_id(request: Request) -> str:
     return str(uuid.uuid4())
 
 
-def _client_ip(request: Request) -> str | None:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        # Left-most entry is the originating client.
-        return forwarded.split(",")[0].strip() or None
+def _client_ip(request: Request, *, trust_forwarded: bool = True) -> str | None:
+    """The address to attribute a request to.
+
+    ``trust_forwarded`` decides whether ``X-Forwarded-For`` is believed. The
+    access log trusts it because a misattributed log line is a cosmetic problem;
+    the rate limiter does not, by default, because a header any caller can set
+    would let them mint a fresh budget by rotating it — a limiter keyed on
+    attacker-controlled data is not a limiter.
+    """
+    if trust_forwarded:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            # Left-most entry is the originating client.
+            return forwarded.split(",")[0].strip() or None
     return request.client.host if request.client else None
 
 

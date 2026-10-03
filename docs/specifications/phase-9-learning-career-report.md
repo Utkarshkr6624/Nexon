@@ -732,9 +732,43 @@ Stated plainly, because several claims above depend on it.
   advisory lock per test database precisely so two sessions cannot destroy each other's
   rows. The 1034 tests executed above are the Phase 8, Phase 9 and migration suites — not
   the Phases 1–7 suites, which were left to the other agents.
-- **`alembic upgrade head` and `alembic check` were not run against the live database.**
-  `test_migration_ddl.py` renders the DDL offline and compares it to the models, which is
-  real evidence about the DDL and **not** the same as having applied it.
+- **`alembic upgrade head` and the drift check were not run *as commands*, and this report used
+  to say they were not run at all.** Both effects happen inside the integration suite: the
+  `test_database_url` fixture applies `alembic upgrade head` to `nexus_test` on every
+  integration session, and `tests/test_migrations.py::test_autogenerate_reports_no_drift`
+  compares the applied schema with `Base.metadata` under the same `compare_type` and
+  `compare_server_default` options `migrations/env.py` uses — the comparison `alembic check`
+  performs. The 155 migration tests pasted in §7 passed, drift check included, so the chain
+  really was applied and really was compared. What was not done is a human typing the command
+  at a prompt. Both statements are true; only one was written down.
+  `test_migration_ddl.py` proves something narrower and still worth having — that the *DDL the
+  migrations emit* matches the models without applying anything — and it does not substitute
+  for the applied case, which is what caught `0010`'s three defects.
+
+  The remediation pass closed the remaining gap by running the two commands themselves against
+  a live PostgreSQL 16.2 and pasting the output, rather than reasoning about what the suite
+  does on the suite's behalf:
+
+  ```text
+  $ cd backend && DATABASE_URL=postgresql+psycopg://nexus:nexus@127.0.0.1:5432/nexus_test_docs \
+      .venv/Scripts/python.exe -m alembic current
+  INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+  INFO  [alembic.runtime.migration] Will assume transactional DDL.
+  0010 (head)
+
+  $ cd backend && DATABASE_URL=postgresql+psycopg://nexus:nexus@127.0.0.1:5432/nexus_test_docs \
+      .venv/Scripts/python.exe -m alembic check
+  INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.types
+  INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.constraints
+  INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.defaults
+  INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.comments
+  No new upgrade operations detected.
+  ```
+
+  `0010` is at `head` on a real server, and the applied schema needs no upgrade operations to
+  match `Base.metadata`. That is the strongest form of the claim: it is not the offline DDL
+  rendering of §7, and it is not the suite's drift test — it is the command a reader would
+  type, run against a running database, answering "no drift".
 - **The Windows subprocess fallback has only ever run on Windows.** The `git` engine's
   Windows branch (`ProactorEventLoop` on a worker thread) is exercised here; the POSIX
   branch — where none of it runs — is asserted by a class test rather than by execution.
@@ -753,13 +787,17 @@ Each of these is a property of the shipped code, not of this environment.
     rescan cheap and idempotent. After a rebase, a `filter-branch` or a force-push the
     stored mark points at a commit that no longer exists, and only a full read recovers.
     Nothing detects the situation automatically.
-  - **`maintenance_activity` is computed without the preceding 90 days of file history,
-    because no per-commit file table is stored.** `0008` deliberately creates no
-    `git_commit_files` table — it would grow to millions of rows on a mature codebase to
-    answer questions Phase 8 does not ask — so the metric can only read the commits *this
-    account* recorded. It reads **low** on a repository scanned before per-commit paths
-    were stored, and a commit with no recorded file paths cannot be classified and does not
-    count. The metric's own docstring says so.
+  - **`maintenance_activity` reads at its ceiling, not low — this report previously said the
+    opposite.** Migration `0008` deliberately creates no `git_commit_files` table, so there is
+    no per-file history for the metric to consult. The shipped path therefore reports one
+    placeholder path (`<file names are not stored per commit>`) for every commit that changed
+    a file, and calls the metric with `last_touched_before=None`; with no history supplied
+    every touched file counts as quiet, so **every recorded commit that changed a file is
+    counted**. The figure is an upper bound, and the metric's own user-facing sentence says
+    so: *"measured without the preceding 90 days of file history, so every touched file counts
+    as quiet."* Only commits with `files_changed = 0` do not count. The earlier wording in this
+    report had it backwards; it is corrected in the Phase 8 report too, and in
+    `development.md` §11.1.
 - **The Windows subprocess/selector-loop handling.** NEXUS runs a `SelectorEventLoop` on
   every platform, because psycopg's async driver needs `loop.add_reader` and asyncio's
   Windows default does not provide it. But on Windows a `SelectorEventLoop` raises
@@ -809,10 +847,26 @@ Each of these is a property of the shipped code, not of this environment.
   `Skill.evidence_count` and `last_activity_at`; it does not touch `current_level`. The one
   level this schema lets NEXUS derive is derived on read and labelled, and no write route
   can create one.
-- **Deletion semantics differ per resource, and that is the design.** `DELETE
-  /learning/skills/{id}` cascades its activities (an activity whose only subject is gone is
-  not evidence of anything) while `DELETE /learning/goals/{id}` sets them null (the trail
-  outlives the intention). `DELETE /career/evidence/{id}` sweeps nothing.
+- **Deletion semantics: the trail outlives every subject, and `user_id` is the one cascade.**
+  This bullet originally read that `DELETE /learning/skills/{id}` cascades its activities
+  while `DELETE /learning/goals/{id}` sets them null. The second half was always true; the
+  first half described the `ON DELETE CASCADE` that migration `0009` wrote, which the audit
+  found was the *only* row in this schema whose deletion would be invisible —
+  `learning_activities` has no `updated_at`, so nothing would record that the history had
+  been removed, and `skills.evidence_count` would go on counting a set that had already been
+  destroyed. Migration `0010` changes `learning_activities.skill_id` to `ON DELETE SET NULL`,
+  so an activity now survives its skill and reads as an append-only fact with an
+  unattributed subject — a case `app/services/learning/metrics.py` already treats as a real
+  session rather than an orphan. Both `skill_id` and `goal_id` are `SET NULL` now, for the
+  same reason: an abandoned goal and a deleted skill are the same event. `user_id` stays
+  `CASCADE`, and the asymmetry is deliberate: a row nobody can reach is an orphan no query
+  can reach, while a row whose *subject* is gone is still part of the account's own history.
+  `DELETE /career/evidence/{id}` sweeps nothing.
+
+  > **One thing is known to be stale and is not corrected here:**
+  > `LearningService.delete_skill`'s own docstring still says "The activities cascade". The
+  > schema says otherwise, and the service's behaviour follows the schema — that file belongs
+  > to another engineer in this wave and was not edited from here. See the handoff notes.
 
 ---
 
@@ -823,7 +877,7 @@ fault, not the document's.
 
 | # | Contract | What shipped | Why |
 | --- | --- | --- | --- |
-| 1 | §5's `/learning` table lists 11 routes | 20 | The contract's table is a summary, not a complete OpenAPI list; the six write routes and the extras are implemented per the prose. Verified against the live OpenAPI schema |
+| 1 | §5's `/learning` table lists 11 routes | 19 | The contract's table is a summary, not a complete OpenAPI list; the six write routes and the extras are implemented per the prose. Verified against the live OpenAPI schema |
 | 2 | §5 does not list `GET /career/features` | it ships | §6 names `career_features.v1` as a feature set. A feature vector with no route is not extractable |
 | 3 | §5 does not list `POST /learning/recommendations` | it ships | §9.9 requires the two rules to run somewhere; the Phase 7 precedent is `POST /intelligence/evaluate` |
 | 4 | §5 says literal sub-paths "are declared before `/{id}` paths" | true, and it is load-bearing | The contract states the rule; the router docstring states *why* it is the entire mechanism, since Starlette does not prefer a literal segment over a parameter |
@@ -850,6 +904,91 @@ fault, not the document's.
 - **`career_features.v1.project_activity` is the training-set's null-not-zero test case.**
   A trainer that fills it with `0` has silently asserted that every repository has zero
   commits.
+
+## 13. Remediation pass
+
+Phase 9 shipped, then an audit ran over Phases 1–9. Most of what it found was in Phases 3–7,
+but the Phase 9 schema turned out to carry three more defects of its own, and the two claims
+this report makes about the environment were wrong. This section is the part to read if you
+want what is true now.
+
+### `0010` — three invariants `0009` described but did not enforce
+
+Migration `0009` wrote prose beside its DDL describing rules the DDL did not enforce. An
+audit of the applied schema found all three, and `0010_learning_career_integrity` is the
+repair. Models are still not imported, so a later change to `app/models/` cannot rewrite it.
+
+**1. `uq_career_evidence_source_identity` deduplicated nothing.** `0009` created it as a
+table-level unique constraint over `(user_id, evidence_type, source, project_id, skill_id,
+repository_id)`, and the comment beside it claimed that several manually-added `ACHIEVEMENT`
+rows coexist while a project-derived one cannot be inserted twice. Only the first half was
+true. PostgreSQL's default btree semantics are `NULLS DISTINCT`, so a null never equals
+anything: two rows whose `skill_id` is null do not collide even when every other column is
+identical, and two rows derived from the same project differ by exactly two nulls — so both
+insert cleanly. The constraint fired only when all three foreign keys were non-null, which is
+the one case in which nothing needs it.
+
+The replacement is a **partial unique index with `NULLS NOT DISTINCT`**, predicated on "a row
+that names at least one source is inserted at most once per identity". Partial, because a
+plain `NULLS NOT DISTINCT` over all six columns would also collide two manual achievements —
+all three foreign keys null, differing only in `title` and `occurred_on` — and the user's
+ability to write down four separate things they did is not a defect to be deduplicated away.
+`source` stays in the key, so a row NEXUS derived from a project and a row the user typed
+against the same project are both allowed; `title` stays out, so a rename cannot become a
+second row. Existing duplicates are deleted before the index is built, because the rule was
+never enforced and a database that has been through `0009` may already hold several.
+
+**2. `learning_activities.skill_id` cascaded.** `0009` gave it `ON DELETE CASCADE` while
+giving `goal_id` `ON DELETE SET NULL`, and §10 of this report described the asymmetry as a
+design decision. It was not — it was the only row in this schema whose deletion would be
+invisible. `learning_activities` has no `updated_at`, so nothing would record that the history
+had been removed, and `skills.evidence_count` would go on counting a set that had already been
+destroyed. `0010` sets it to `ON DELETE SET NULL`, so an activity survives its skill and reads
+as an append-only fact with an unattributed subject — a case
+`app/services/learning/metrics.py` already treats as a real session rather than an orphan.
+The service never deletes activities explicitly, so the change is invisible at the service
+layer and total at the data layer.
+
+**3. The activity feed had no index on the read that matters.** `ix_activity_events_owner_created`
+— `(user_id, created_at)` — is added on the table every phase's feed query reads. It is the
+same class of omission the other two are: the invariant was understood, written down in a
+prose comment, and never expressed in the DDL.
+
+### `career_features.v1.project_activity` was already right, and stayed right
+
+Worth saying explicitly, because it is the one Phase 10 contract rule this pass did **not**
+have to change: an account with no repository that has ever been scanned gets
+`project_activity: null`, not `0`, and the service's own docstring argues why. The Phase 8
+side of the same vector was the one that needed repairing — see
+[`phase-8-developer-report.md`](./phase-8-developer-report.md) §12.
+
+### `analytics_features.v1` — the version belongs beside the matrix, not inside it
+
+Phase 9's vectors were already wrapped (`schema_version` beside `features`). The Phase 6
+`feature_snapshot` was not: it returned a bare mapping of feature columns, so a training row
+produced from it could not be attributed to the extraction that made it, and there was no
+mechanism preventing someone from later adding the version *inside* the mapping — at which
+point it becomes a column a model fits. It now returns
+`{schema_version: "analytics_features.v1", generated_at, task_id, features: {…}}`, the same
+shape as the three vectors this phase shipped. The rule is one sentence long: **every column
+of `features` is a number; everything that is not a number belongs beside it.**
+
+### Two claims in this report were wrong
+
+| Claim | Correction |
+| --- | --- |
+| §9: "`alembic upgrade head` and `alembic check` were not run against the live database" | Half true and misleadingly worded. Neither was run *as a command*; both effects run inside the suite, and the 155 migration tests in §7 include the drift check that `alembic check` performs |
+| §10: "`maintenance_activity` … reads **low**" | Inverted. It reads at its **ceiling** — every recorded commit that changed a file counts, because no per-file history exists and the shipped path says so in the metric's own explanation |
+| §11, row 1: "§5's `/learning` table lists 11 routes → **20** shipped" | 19. Counted from `app.openapi()`; §3 of this report already said 19, so the two disagreed with each other |
+
+### Everything else in this report stands
+
+The eleven tables, the five enums, `SkillGap` and its cold-start refusal, the two deduplication
+mechanisms, the delete-semantics decision, the eight contract disagreements in §11, and the
+Phase 10 starting points are unchanged. §12's "a figure that could not be computed is `null`,
+never `0`" is more load-bearing after this pass than before it: two of the three defects in
+`0010` were invariants stated in prose and not enforced in the schema, which is the same class
+of mistake in the same direction — writing the rule down without making the database hold it.
 
 ## See also
 

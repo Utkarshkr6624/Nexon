@@ -128,6 +128,28 @@ async def _skill_columns(db_session, skill_id: uuid.UUID) -> tuple:
     ).one()
 
 
+async def _activity_columns(db_session, activity_id: uuid.UUID) -> tuple:
+    """Read one activity's stored columns straight out of the database.
+
+    Read from the table rather than off the returned object for the same reason
+    the two helpers above do it, and it matters more here: the session runs with
+    ``expire_on_commit=False``, so an instance the test already holds keeps the
+    attribute values it was loaded with, and a later ``SELECT`` does not
+    overwrite them. A database-side ``ON DELETE SET NULL`` is invisible on such
+    an instance — only the stored row says what the constraint did.
+    """
+    return (
+        await db_session.execute(
+            select(
+                LearningActivity.title,
+                LearningActivity.duration_minutes,
+                LearningActivity.occurred_at,
+                LearningActivity.skill_id,
+            ).where(LearningActivity.id == activity_id)
+        )
+    ).one()
+
+
 async def _make_skill(repository, owner, name: str, **overrides) -> Skill:
     """Create one skill for the owner, with the columns the tests care about."""
     return await repository.create_skill(owner.id, name=name, **overrides)
@@ -642,16 +664,29 @@ async def test_recording_evidence_for_a_foreign_skill_changes_nothing(
     assert last_seen is None
 
 
-async def test_deleting_a_skill_takes_the_activities_recorded_against_it(repository, owner):
-    """One skill, one activity — then a delete.
+async def test_deleting_a_skill_leaves_its_activities_recorded_against_no_skill(
+    repository, owner, db_session
+):
+    """One skill, one activity — then a delete, and the activity survives.
 
-    ``learning_activities.skill_id`` is ``ON DELETE CASCADE`` because an activity
-    that outlived the skill it was recorded against would sit in no skill's
-    evidence count and no page would ever show it. The assertion is on the
-    account's totals afterwards: nothing orphaned, nothing left to be counted.
+    ``learning_activities.skill_id`` is ``ON DELETE SET NULL``, not CASCADE. An
+    activity is an append-only record that the person spent 45 minutes on
+    something, and CASCADE meant that deleting a *skill* destroyed every such
+    record silently, from a different table, with nothing said and nothing left
+    to notice. The row now outlives its subject with a null pointer.
+
+    The assertion is on what is left, field by field: the account still counts
+    **one** activity, and the surviving row still carries its title, its 45
+    minutes and its original ``occurred_at``. Only the pointer to the deleted
+    skill is gone — so the guarantee is "the record survives", not "the row is
+    somehow still there but empty".
+
+    The activity stays out of the skill-scoped reads, which is what a null
+    ``skill_id`` means everywhere else in this repository: it belongs to the
+    account, not to a skill that no longer exists.
     """
     created = await _make_skill(repository, owner, "Rust")
-    await repository.create_activity(
+    activity = await repository.create_activity(
         owner.id,
         title="Read the ownership chapter",
         activity_type=LearningActivityType.STUDY_SESSION,
@@ -664,9 +699,24 @@ async def test_deleting_a_skill_takes_the_activities_recorded_against_it(reposit
 
     assert removed is True
     assert await repository.get_skill(owner.id, created.id) is None
-    totals = await repository.activity_totals(owner.id)
-    assert totals.activities == 0
     assert await repository.delete_skill(owner.id, created.id) is False
+
+    survivors, total = await repository.list_activities(owner.id)
+    assert total == 1
+    assert len(survivors) == 1
+    assert survivors[0].id == activity.id
+
+    title, minutes, occurred_at, skill_id = await _activity_columns(db_session, activity.id)
+    assert title == "Read the ownership chapter"
+    assert minutes == 45
+    assert occurred_at == ANCHOR
+    assert skill_id is None
+
+    # Still counted in the account's own totals, and still excluded from the
+    # skill-scoped read that has no skill to match against.
+    totals = await repository.activity_totals(owner.id)
+    assert totals.activities == 1
+    assert await repository.list_activities(owner.id, skill_id=created.id) == ([], 0)
 
 
 async def test_another_accounts_skills_are_invisible(repository, owner, other):

@@ -439,11 +439,23 @@ Stated plainly, because several claims above depend on it.
   that produced a number in this report really executed against a live PostgreSQL at
   `127.0.0.1:5432` on the `nexus_test` database. That is why `test_developer_api.py` and
   `test_developer_git_integration.py` report real pass counts rather than collection counts.
-- **`alembic upgrade head` / `alembic check` were not run against the live database by the
-  documentation agent.** `test_migration_ddl.py` renders the DDL offline and compares it to
-  the models, which is real evidence about the DDL and **not** the same as having applied
-  it. `test_migrations.py` (5 tests, `integration`-marked, contains the drift check) was
-  part of the 155 that passed only in its non-database cases.
+- **`alembic upgrade head` and the drift check were not run *as commands* by the
+  documentation agent, and this report used to say they were not run at all.** The
+  distinction the earlier revision of this sentence missed is that both effects happen
+  inside the integration suite: the `test_database_url` fixture runs `alembic upgrade head`
+  against `nexus_test` on every integration session, and
+  `tests/test_migrations.py::test_autogenerate_reports_no_drift` compares the applied schema
+  with `Base.metadata` using the same `compare_type` / `compare_server_default` options
+  `migrations/env.py` uses — which is the same comparison `alembic check` performs. The
+  `test_migrations.py` tests pasted in §6 passed as part of that 155, so the chain really was
+  applied and really was compared; what was not done is a human typing
+  `python -m alembic check` at a prompt. Both statements are true and only one of them was
+  written down. `test_migration_ddl.py` remains the cheaper offline check — it proves the
+  *DDL* agrees with the models without applying anything, which is a different claim and does
+  not stand in for the applied one. The remediation pass closed the gap by running the two
+  commands against a live PostgreSQL 16.2; the pasted output is in
+  [`phase-9-learning-career-report.md`](./phase-9-learning-career-report.md) §13, which reports
+  `0010 (head)` and `No new upgrade operations detected.`
 - **The git engine has never been exercised against a repository on a non-Windows
   platform.** See §10.
 - **`git` itself is a platform binary and was available on this machine.** The engine is
@@ -480,18 +492,26 @@ Each of these is a property of the shipped code, not of this environment.
   incremental read cannot recover from it. The route exposes `?full=true` for exactly this,
   and the query parameter's own description says when it is needed. Nothing detects the
   situation automatically, so after a rewrite the user must ask for a full scan.
-- **`maintenance_activity` is computed without the preceding 90 days of file history,
-  because no per-commit file table is stored.** The metric answers "commits that reached a
-  file this record had not seen touched recently", with a 90-day lookback
-  (`DEFAULT_MAINTENANCE_LOOKBACK_DAYS`). It reads `last_touched_before`, a
-  `{(repository_id, path): last recorded change}` map the service supplies from *the
-  commits this account has recorded*. A file somebody else last touched six months ago
-  therefore reads as quiet here — which is a true statement about *this record* and is what
-  the window means everywhere else in the module. The consequence is stated in the code as
-  well: the metric reads **low** on a repository scanned before per-commit paths were
-  stored, and a commit with no recorded file paths cannot be classified and does not count.
-  Storing per-commit file rows would grow the table to millions of rows on a mature
-  codebase, so the trade was made deliberately — but it is a trade.
+- **`maintenance_activity` reads at its ceiling, not low — this report previously said the
+  opposite, and the correction matters.** The metric answers "commits that reached a file this
+  record had not seen touched recently", with a 90-day lookback
+  (`DEFAULT_MAINTENANCE_LOOKBACK_DAYS`). Migration `0008` deliberately creates no
+  `git_commit_files` table — it would grow to millions of rows on a mature codebase — so
+  there is no file history for the metric to consult. The shipped path does two things about
+  that, and the second is the one that surprises people: a commit that touched at least one
+  file reports the single placeholder path `<file names are not stored per commit>` rather
+  than an empty list, and the service calls `metrics.maintenance_activity` with
+  `last_touched_before=None`. With no history supplied every touched file counts as quiet, so
+  **every recorded commit that changed a file is counted** — the metric's maximum. Its own
+  explanation says so: *"measured without the preceding 90 days of file history, so every
+  touched file counts as quiet."* The only commits that do not count are those with
+  `files_changed = 0`.
+
+  An earlier revision of this report said the metric read **low**. That was wrong twice
+  over: the path before the repair would have reported a measured **zero** for every
+  repository, which is the one outcome this codebase may never produce, and the path that
+  replaced it reports the ceiling. The same correction appears in `development.md` §11.1 and
+  in the Phase 9 report.
 - **The Windows subprocess handling costs a thread hop per git invocation.** This is the
   one place where two of this codebase's own architectural rules collide. NEXUS runs on a
   `SelectorEventLoop` on every platform, because psycopg's async driver needs
@@ -540,6 +560,87 @@ Each of these is a property of the shipped code, not of this environment.
   objects, days carrying a commit, or lines git counted from a diff. A column derived from
   `committed_at` that treats two commits an hour apart as an hour of work would reintroduce
   the exact claim this schema was designed to be unable to make.
+
+## 12. Remediation pass
+
+Phase 8 shipped, then an audit ran over Phases 1–9 and found real defects. Most were in
+Phases 3–7; two were in this phase's own territory. This section records both, plus the
+corrections made to the report above, and is the section to read if you are here to know what
+is true now rather than what was true on the day.
+
+The two structural findings — the three data-loss and correctness blockers in Phases 3 and 7,
+and the fact that Phases 3–5 had no dedicated test modules of their own at all — are told
+once, in [`../architecture.md` §18](../architecture.md#18-remediation-pass-over-phases-19),
+rather than repeated in both reports. What follows is what belongs to Phase 8.
+
+### A never-scanned repository no longer appears in the feature vector at all
+
+`GET /developer/features` publishes one row per account and one per repository. A repository
+that has **never been successfully scanned** — `last_scanned_at IS NULL`, or its last scan
+errored — used to get a row of zeros.
+
+That row was the training set's worst possible lie. Seven zeros tell a model "this developer
+committed nothing in the last seven days, has no activity spread and no change volume", and
+the truth is that **nobody has looked**. There is no `available` column on
+`RepositoryFeatureVectorRead` to mark the difference with, and adding one would be a schema
+change for a single case; so `_has_measurement` now drops the repository from
+`per_repository` entirely.
+
+The rule the two states now encode: **a row that exists is a row that was measured.** A
+repository that was scanned and found nothing keeps its row and its real zeros, because "the
+scan ran and the answer was zero" is a true sentence. A repository that was never scanned has
+no row, because there is no sentence to say. The account-level row aggregates the recorded
+commits and nothing else, so an unscanned repository contributes nothing to it — exactly as a
+directory NEXUS was never pointed at contributes nothing.
+
+This is the same null-not-zero rule the Phase 9 half already honoured with
+`career_features.v1.project_activity`, applied to a surface that had missed it. It is
+pinned by `tests/test_developer_features.py`, which asserts the repository's id is absent
+from the response by id, not merely that some count is right.
+
+### The Phase 8 route count was wrong in one document, not two
+
+§1 of this report says **14** routes under `/developer`, and the live schema agrees — counted
+from `app.openapi()` by path and method during the remediation pass.
+[`api-conventions.md`](../api-conventions.md) said **15**, and its Phase 9 neighbours said 20
+under `/learning` and 13 under `/career` against a live 19 and 12. So the error was in
+`api-conventions.md`, which drew its Phase 8 and 9 figures from the phase reports rather than
+from the schema — and then read them back as if they were measured. That file now carries a
+per-prefix table generated from `app.openapi()`, and the counts in this report are unchanged.
+
+### `maintenance_activity` reads at its ceiling, not low
+
+The claim in §10 of this report was **inverted**, and is corrected there. In short: the
+shipped path supplies no file history and a placeholder path for every commit that changed a
+file, so every such commit counts. It reports a maximum, not a fraction. The reason it was
+described as reading low is that the metric's *definition* is about quiet files, and the
+absence of stored paths was read as an absence of counted files; the repair put a value in
+`MetricSample.file_paths` specifically so the metric would stop answering zero, and the
+prose was never updated to match.
+
+### The Phase 8 and 9 settings are still fourteen, and are still additive
+
+Nothing in §11 of `development.md` about `DEVELOPER_*` and `LEARNING_*` changed. What changed
+is that the report no longer implies they are the only settings a new deployment has to
+consider: the six `RATE_LIMIT_*` variables arrived with the remediation pass, and the fifteen
+Phase 4 and Phase 6 settings this report's sibling phases had added turned out to be
+documented **nowhere** at all — not in `.env.example`, not in the README's group table, not in
+`development.md`. Both sets are now in `development.md` §11.4 and §11.5, and
+`scripts/verify_compose.py` independently confirms the `.env.example` coverage: it lists
+every `ANALYTICS_*`, `PLANNER_*` and `RATE_LIMIT_*` variable as documented-but-unreferenced,
+which it can only do by reading the file.
+
+`backend/tests/test_documentation_claims.py` now asserts that **every** `Settings` field
+appears in both `.env.example` and the README — as a property over the class rather than a
+list, so the sixteenth undocumented setting fails the same way the first would have.
+
+### What else in this report is superseded
+
+| Claim | Status |
+| --- | --- |
+| §6 "The full backend suite was not run" | Still true of *that* session, and recorded as such. The suite has since been re-measured: `pytest --collect-only -q` now reports **2270 tests across 67 files** (1029 offline, 1241 `integration`) |
+| §6's per-file test counts | Superseded by the table in `architecture.md` §13, regenerated during the remediation pass |
+| §10 "Migration `0008` deliberately creates no `git_commit_files` table" | Unchanged, and still the reason `maintenance_activity` reads as it does |
 
 ## See also
 

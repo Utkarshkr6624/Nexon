@@ -63,7 +63,7 @@ from collections.abc import Callable, Mapping
 from datetime import date
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, literal, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -87,6 +87,14 @@ __all__ = ["CareerRepository"]
 #: a report.
 _MAX_PAGE_SIZE = 200
 _DEFAULT_PAGE_SIZE = 50
+
+#: Labels distinguishing the two band vocabularies in a combined tally read.
+#: ``by_type`` is the closed :class:`~app.models.enums.CareerEvidenceType` set;
+#: ``by_source`` is open, because a subsystem that has never run has no band to
+#: appear in. They are labels on rows rather than two statements so both come
+#: from one filter over one set of rows.
+_BAND_BY_TYPE = "type"
+_BAND_BY_SOURCE = "source"
 
 #: The only columns a profile write may touch. ``user_id`` is absent because it
 #: is the *key* of the upsert and the owner is not something a request may
@@ -161,6 +169,47 @@ def _bounded(limit: int, offset: int) -> tuple[int, int]:
     answering with an empty page for every request would look like an outage.
     """
     return max(1, min(int(limit), _MAX_PAGE_SIZE)), max(0, int(offset))
+
+
+def _evidence_filters(
+    owner_id: uuid.UUID,
+    *,
+    evidence_type: str | None = None,
+    project_id: uuid.UUID | None = None,
+    skill_id: uuid.UUID | None = None,
+    repository_id: uuid.UUID | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[Any]:
+    """The ``WHERE`` clauses selecting one owner's matching evidence.
+
+    One builder for :meth:`CareerRepository.list_evidence` and
+    :meth:`CareerRepository.evidence_tally`, because the page and the counts
+    printed beside it have to describe the same set. Two copies of these seven
+    clauses would be two answers that can drift apart the first time a filter is
+    added to one of them and forgotten in the other — and a header that counts a
+    different set from the list under it is worse than no header.
+
+    ``owner_id`` is a predicate here and never an argument a caller can widen:
+    every read of this table goes through this function, so there is no signature
+    in this repository that can be asked for somebody else's evidence.
+    """
+    filters: list[Any] = [CareerEvidence.user_id == owner_id]
+    if evidence_type is not None:
+        filters.append(
+            CareerEvidence.evidence_type == validate_career_evidence_type(evidence_type).value
+        )
+    if project_id is not None:
+        filters.append(CareerEvidence.project_id == project_id)
+    if skill_id is not None:
+        filters.append(CareerEvidence.skill_id == skill_id)
+    if repository_id is not None:
+        filters.append(CareerEvidence.repository_id == repository_id)
+    if since is not None:
+        filters.append(CareerEvidence.occurred_on >= since)
+    if until is not None:
+        filters.append(CareerEvidence.occurred_on < until)
+    return filters
 
 
 def _reject_unknown_columns(
@@ -598,21 +647,15 @@ class CareerRepository:
             The page of rows and the total number of rows the filters match.
         """
         page_size, skip = _bounded(limit, offset)
-        filters: list[Any] = [CareerEvidence.user_id == owner_id]
-        if evidence_type is not None:
-            filters.append(
-                CareerEvidence.evidence_type == validate_career_evidence_type(evidence_type).value
-            )
-        if project_id is not None:
-            filters.append(CareerEvidence.project_id == project_id)
-        if skill_id is not None:
-            filters.append(CareerEvidence.skill_id == skill_id)
-        if repository_id is not None:
-            filters.append(CareerEvidence.repository_id == repository_id)
-        if since is not None:
-            filters.append(CareerEvidence.occurred_on >= since)
-        if until is not None:
-            filters.append(CareerEvidence.occurred_on < until)
+        filters = _evidence_filters(
+            owner_id,
+            evidence_type=evidence_type,
+            project_id=project_id,
+            skill_id=skill_id,
+            repository_id=repository_id,
+            since=since,
+            until=until,
+        )
 
         statement = (
             select(CareerEvidence, func.count().over().label("total"))
@@ -630,6 +673,116 @@ class CareerRepository:
             )
         )
         return [], total
+
+    async def evidence_tally(
+        self,
+        owner_id: uuid.UUID,
+        *,
+        evidence_type: str | None = None,
+        project_id: uuid.UUID | None = None,
+        skill_id: uuid.UUID | None = None,
+        repository_id: uuid.UUID | None = None,
+        since: date | None = None,
+        until: date | None = None,
+    ) -> dict[str, Any]:
+        """Whole-set counts over the matching evidence rows, in **two statements**.
+
+        These are the figures printed beside the page in
+        :meth:`list_evidence` and carried by the summary and the feature vector. They
+        describe **every** matching row, never the page, and they are aggregates over
+        the same rows rather than a second opinion read differently.
+
+        **Two statements, not a walk.** The obvious way to produce these is to page
+        the whole set and count in Python, and that is what this method replaces: it
+        cost one round trip per 200 rows, so an account with 450 evidence rows spent
+        three statements to learn how many there were — and the career page asks for
+        this tally three times (summary, list, features), so nine statements where
+        two suffice, growing with the account and never with anything else. Here the
+        band counts come from two grouped reads the database runs over an index and
+        the distinct/derived figures from one aggregate row. The cost is two
+        statements and a handful of rows back whatever the account holds.
+
+        The two vocabularies are read in one statement because a band count needs a
+        ``GROUP BY`` on a different column each time and the answer has to come from
+        the *same* filter; ``UNION ALL`` of two grouped selects over one set of
+        predicates is that, with a literal label to say which vocabulary a row
+        belongs to.
+
+        Args:
+            owner_id: Whose evidence to count.
+            evidence_type: Narrow to one evidence type.
+            project_id: Narrow to the evidence drawn from one project.
+            skill_id: Narrow to the evidence drawn from one skill.
+            repository_id: Narrow to the evidence drawn from one repository.
+            since: Inclusive lower bound on ``occurred_on``.
+            until: Exclusive upper bound.
+
+        Returns:
+            A mapping with ``by_type`` and ``by_source`` band counts, ``total``,
+            ``manual_count``, ``skill_linked_count``, ``skills_with_evidence``,
+            ``linked_project_count`` and ``latest_evidence_on``. Every count is a
+            real count of a set that was searched and found empty, and
+            ``latest_evidence_on`` is ``None`` — never today's date — when nothing
+            matched.
+        """
+        filters = _evidence_filters(
+            owner_id,
+            evidence_type=evidence_type,
+            project_id=project_id,
+            skill_id=skill_id,
+            repository_id=repository_id,
+            since=since,
+            until=until,
+        )
+        by_type = (
+            select(
+                literal(_BAND_BY_TYPE).label("vocabulary"),
+                CareerEvidence.evidence_type.label("band"),
+                func.count().label("rows"),
+            )
+            .where(*filters)
+            .group_by(CareerEvidence.evidence_type)
+        )
+        by_source = (
+            select(
+                literal(_BAND_BY_SOURCE).label("vocabulary"),
+                CareerEvidence.source.label("band"),
+                func.count().label("rows"),
+            )
+            .where(*filters)
+            .group_by(CareerEvidence.source)
+        )
+        counts: dict[str, dict[str, int]] = {
+            _BAND_BY_TYPE: {},
+            _BAND_BY_SOURCE: {},
+        }
+        for vocabulary, band, rows in (
+            await self.session.execute(union_all(by_type, by_source))
+        ).all():
+            counts[str(vocabulary)][str(band)] = int(rows)
+
+        row = (
+            await self.session.execute(
+                select(
+                    func.count(),
+                    func.count().filter(CareerEvidence.source == DEFAULT_CAREER_EVIDENCE_SOURCE),
+                    func.count().filter(CareerEvidence.skill_id.is_not(None)),
+                    func.count(func.distinct(CareerEvidence.skill_id)),
+                    func.count(func.distinct(CareerEvidence.project_id)),
+                    func.max(CareerEvidence.occurred_on),
+                ).where(*filters)
+            )
+        ).one()
+        return {
+            "by_type": counts[_BAND_BY_TYPE],
+            "by_source": counts[_BAND_BY_SOURCE],
+            "total": int(row[0]),
+            "manual_count": int(row[1]),
+            "skill_linked_count": int(row[2]),
+            "skills_with_evidence": int(row[3]),
+            "linked_project_count": int(row[4]),
+            "latest_evidence_on": row[5],
+        }
 
     async def get_evidence(
         self, owner_id: uuid.UUID, evidence_id: uuid.UUID

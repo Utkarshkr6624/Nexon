@@ -58,19 +58,36 @@ The FKs are declared as strings rather than by importing :mod:`app.models.projec
 is the single registration site, and a model module that reaches sideways for
 its neighbours is a module whose table graph depends on import order.
 
-**Deduplication is one constraint and it leans on a PostgreSQL detail.** A
+**Deduplication is one index, and it leans on two PostgreSQL details.** A
 derived evidence row — one NEXUS proposed from a project or a repository — can be
 re-derived every time the source changes, so it needs an identity that is not the
 row id. ``uq_career_evidence_source_identity`` covers ``(user_id,
-evidence_type, source, project_id, skill_id, repository_id)``, and it works
-because **nulls do not collide in a btree unique index**: several manually-added
-``ACHIEVEMENT`` rows all have three null FKs, all compare unequal, and all coexist,
-while a project-derived row that names its project is rejected on the second
-insert. That is the whole mechanism, and it is the same trick
-``uq_risks_live_identity`` already uses in this codebase. Widening it to include
-``title`` would have been the easy alternative and would have broken the first
-case: the same user renaming a project-derived row would have been allowed to
-duplicate it.
+evidence_type, source, project_id, skill_id, repository_id)`` and it is
+**partial**: only rows that name at least one source are in it. Both halves of
+that are load-bearing.
+
+*The predicate* is what keeps manual achievements writable. Four separate things
+a person did have all three foreign keys null, and the user is entitled to record
+all four; putting a blanket unique constraint over the six columns would refuse
+the second, and refusing it is not the product's decision to make.
+
+*The ``NULLS NOT DISTINCT``* (PostgreSQL 15+) is what makes the index do what
+the name says. A btree unique index is ``NULLS DISTINCT`` by default: nulls never
+equal anything, so two rows that differ only by a null do not collide. That is
+precisely the failure this index exists to prevent — a project-derived row has
+``project_id`` set and ``skill_id``/``repository_id`` null, so a second
+derivation of the same project differs from the first by two nulls and was
+inserted happily. Inside a ``NULLS NOT DISTINCT`` index those two nulls are equal
+to each other, the second derivation is a genuine duplicate of the first, and the
+database refuses it. The constraint that shipped this behaviour was a table-level
+``UNIQUE`` with no predicate and no such flag: it fired only when all three
+foreign keys were non-null, which is the one case in which nothing needed it.
+
+``source`` stays in the key, so a row NEXUS derived from a project and a row the
+user typed against that same project are different claims and both are allowed.
+``title`` stays out, for the reason ``0009`` gave: widening the key to include it
+would let a rename become a second row — the row is identified by where it came
+from, not by how it reads.
 
 What is deliberately absent
 ---------------------------
@@ -115,7 +132,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-from sqlalchemy import CheckConstraint, Date, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, Date, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -123,6 +140,8 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 __all__ = [
     "DEFAULT_CAREER_EVIDENCE_SOURCE",
+    "EVIDENCE_SOURCE_IDENTITY",
+    "EVIDENCE_SOURCE_REFERENCED_PREDICATE",
     "CareerEvidence",
     "CareerExperience",
     "CareerProfile",
@@ -172,6 +191,32 @@ _MAX_EVIDENCE_TITLE_LENGTH = 200
 #: ``repository``). It is part of the uniqueness key below, which is why it is
 #: NOT NULL with a default rather than left to a guess at read time.
 _MAX_EVIDENCE_SOURCE_LENGTH = 64
+
+#: The columns that identify one piece of evidence. A row is deduplicated by
+#: what it was derived *from*, never by how it reads: ``title`` is excluded so a
+#: rename cannot become a second row, and ``source`` is included so a row NEXUS
+#: derived and a row the user typed against the same project can both exist.
+#: Exported so the deduplication regression test asserts against the same tuple
+#: the schema is built from rather than against a copy of it.
+EVIDENCE_SOURCE_IDENTITY = (
+    "user_id",
+    "evidence_type",
+    "source",
+    "project_id",
+    "skill_id",
+    "repository_id",
+)
+
+#: Which rows the deduplication rule applies to. Spelled as a literal rather than
+#: interpolated, because this text is part of the schema — the index definition is
+#: generated from it — so building it by string formatting would mean a typo in a
+#: tuple became a silently different index instead of a syntax error. It is the
+#: same discipline ``app.models.risk`` applies to its live-status predicates, and
+#: ``migrations/versions/0010_learning_career_integrity.py`` re-states it rather
+#: than importing this, because a migration may not import ``app.models``.
+EVIDENCE_SOURCE_REFERENCED_PREDICATE = (
+    "project_id IS NOT NULL OR skill_id IS NOT NULL OR repository_id IS NOT NULL"
+)
 
 
 class CareerProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -317,20 +362,31 @@ class CareerEvidence(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "career_evidence"
 
     __table_args__ = (
-        # THE IDEMPOTENCY ANCHOR, and the whole deduplication mechanism. Nulls do
-        # not collide in a btree unique index, so two manually-added achievements
-        # — identical in every column — both insert, while a project-derived row
-        # is refused the second time it is derived. Same trick as
-        # `uq_risks_live_identity`. `title` is deliberately NOT part of the key:
-        # including it would let a rename become a second row.
-        UniqueConstraint(
-            "user_id",
-            "evidence_type",
-            "source",
-            "project_id",
-            "skill_id",
-            "repository_id",
-            name="uq_career_evidence_source_identity",
+        # THE IDEMPOTENCY ANCHOR, and the whole deduplication mechanism. Two
+        # independent pieces of PostgreSQL behaviour are doing the work, and
+        # either alone leaves a hole:
+        #
+        # * `postgresql_where` keeps manual achievements out of the index. Four
+        #   things one person did have all three foreign keys null; the index is
+        #   about re-derivation, not about distinctness of achievements.
+        # * `postgresql_nulls_not_distinct` is what makes it fire at all. A
+        #   project-derived row has `skill_id` and `repository_id` null, and a
+        #   default btree unique index treats those nulls as equal to nothing —
+        #   so the second derivation of the same project inserted cleanly. Inside
+        #   a NULLS NOT DISTINCT index they are equal to each other and the
+        #   duplicate is refused.
+        #
+        # Same shape as `uq_risks_live_identity` — a partial unique index rather
+        # than a table constraint — and for a related reason: both states of the
+        # thing being deduplicated are worth keeping, so the rule has to be
+        # scoped to the one state where it applies. `title` is deliberately NOT
+        # part of the key: including it would let a rename become a second row.
+        Index(
+            "uq_career_evidence_source_identity",
+            *EVIDENCE_SOURCE_IDENTITY,
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+            postgresql_where=EVIDENCE_SOURCE_REFERENCED_PREDICATE,
         ),
         Index("ix_career_evidence_user_id", "user_id"),
         # "My evidence, newest first" and every dated window in the career

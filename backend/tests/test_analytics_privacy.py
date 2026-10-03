@@ -526,8 +526,13 @@ async def test_the_first_account_really_does_have_the_data_the_markers_name(clie
         "/api/v1/analytics/projects", params=WINDOW, headers=world.alpha_headers
     )
     assert projects.status_code == 200, projects.text
-    assert [entry["name"] for entry in projects.json()] == [ALPHA_PROJECT]
-    assert projects.json()[0]["project_id"] == str(world.alpha_project_id)
+    assert [entry["name"] for entry in projects.json()["items"]] == [ALPHA_PROJECT]
+    assert projects.json()["items"][0]["project_id"] == str(world.alpha_project_id)
+    # The control also covers the paging total: the sweep below reads
+    # ``/projects`` as the *other* account, and a ``total`` counted across
+    # owners would report the first account's project there without its name or
+    # id ever appearing in the body.
+    assert projects.json()["meta"]["total"] == 1
 
     knowledge = await client.get(
         "/api/v1/analytics/knowledge", params=WINDOW, headers=world.alpha_headers
@@ -632,13 +637,19 @@ async def test_the_second_accounts_figures_are_its_own_exact_ones(client, db_ses
         "/api/v1/analytics/projects", params=WINDOW, headers=world.bravo_headers
     )
     assert projects.status_code == 200, projects.text
-    assert len(projects.json()) == 1
-    entry = projects.json()[0]
+    body = projects.json()
+    assert len(body["items"]) == 1
+    entry = body["items"][0]
     assert entry["name"] == BRAVO_PROJECT
     assert entry["project_id"] == str(world.bravo_project_id)
     assert entry["total_tasks"] == 2
     assert entry["completed_tasks"] == 1
     assert entry["total_work_minutes"] == BRAVO_SESSION_MINUTES
+    # The envelope's total is counted from the caller's projects. The first
+    # account owns one project too, so a total of two here would disclose that
+    # the neighbour has something — a leak the rows above cannot see, because
+    # the total is a count rather than a name or an id.
+    assert body["meta"]["total"] == 1
 
     # -- the point-in-time figures -----------------------------------------
     deadlines = await client.get(
@@ -938,7 +949,10 @@ async def test_a_foreign_project_id_filter_leaks_nothing_even_where_it_succeeds(
     can widen the answer to "the caller's whole dataset" while looking like it
     narrowed. So the second account's own project id is passed to
     ``/projects`` and the response is checked to describe that project alone.
-    (``/time`` takes the same parameter and is covered by the test below.)
+    ``meta.total`` is checked alongside it, because a filter that named one
+    project and reported the caller's whole account as the total would satisfy
+    every assertion about the rows. (``/time`` takes the same parameter and is
+    covered by the test below.)
     """
     world = await _seed_world(client, db_session)
     params = {**WINDOW, "project_id": str(world.bravo_project_id)}
@@ -947,9 +961,11 @@ async def test_a_foreign_project_id_filter_leaks_nothing_even_where_it_succeeds(
         "/api/v1/analytics/projects", params=params, headers=world.bravo_headers
     )
     assert projects.status_code == 200, projects.text
-    assert [entry["project_id"] for entry in projects.json()] == [str(world.bravo_project_id)]
-    assert [entry["name"] for entry in projects.json()] == [BRAVO_PROJECT]
-    world.assert_no_alpha_data(projects.json(), where="/projects?project_id=<own>")
+    body = projects.json()
+    assert [entry["project_id"] for entry in body["items"]] == [str(world.bravo_project_id)]
+    assert [entry["name"] for entry in body["items"]] == [BRAVO_PROJECT]
+    assert body["meta"]["total"] == 1
+    world.assert_no_alpha_data(body, where="/projects?project_id=<own>")
 
 
 async def test_the_time_route_answers_a_filter_by_the_callers_own_project(
@@ -1161,7 +1177,11 @@ async def test_a_fresh_account_gets_empty_rollups_rather_than_another_users_rows
     )
 
     projects = await client.get("/api/v1/analytics/projects", params=WINDOW, headers=headers)
-    assert projects.status_code == 200 and projects.json() == []
+    assert projects.status_code == 200, projects.text
+    # The paging total is asserted as well as the rows: an account owning no
+    # projects at all reports a total of zero, and a total of one or two would
+    # say that the first account's projects are being counted for somebody else.
+    assert projects.json() == {"items": [], "meta": {"total": 0, "limit": 20, "offset": 0}}
     world.assert_no_alpha_data(projects.json(), where="/projects (empty account)")
 
     trends = await client.get("/api/v1/analytics/trends", params=WINDOW, headers=headers)

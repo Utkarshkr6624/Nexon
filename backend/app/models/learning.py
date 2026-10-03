@@ -52,6 +52,19 @@ revised. The two tables above it *are* revised (a level is re-asserted, a goal
 progresses) and therefore carry :class:`~app.db.base.TimestampMixin`. This is the
 same split Phase 8 drew between ``git_repositories`` and ``git_commits``.
 
+**``learning_activities`` is SET NULL on both of its references.** ``goal_id``
+and ``skill_id`` are treated the same way and for the same reason: an abandoned
+goal and a deleted skill are the same event, and neither should erase the record
+that the user once worked on it. A cascade on ``skill_id`` would be the one row
+in this module whose deletion is invisible — this table has no ``updated_at``, so
+nothing would record that the history had been removed, and
+``skills.evidence_count`` would go on counting a set that had already been
+destroyed. What survives is an append-only fact with an unattributed subject, and
+``app/services/learning/metrics.py`` already reads exactly that case as a real
+session rather than an orphan. ``user_id`` stays ``CASCADE``, and the asymmetry
+is deliberate: a row nobody can reach is an orphan no query can reach, while a
+row whose *subject* is gone is still part of the account's own history.
+
 **``duration_minutes`` is null for an event, not zero.** "I opened the article"
 and "I spent forty minutes with it" are different facts and the column can tell
 them apart; ``0`` would claim a measured zero-length session rather than the
@@ -410,19 +423,23 @@ class LearningActivity(UUIDPrimaryKeyMixin, Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
-    #: The skill this is evidence for, when the user named one. ``CASCADE``:
-    #: an activity that outlived the skill it was recorded against would sit in
-    #: no skill's evidence count and no page would ever show it. Nullable
-    #: because a study session legitimately precedes having a skill row.
+    #: The skill this is evidence for, when the user named one. ``SET NULL``:
+    #: an activity that outlived the skill it was recorded against still says
+    #: *this user did this thing on this date*, and deleting it would make the
+    #: recorded trail the one thing in this schema that a single row can erase.
+    #: Nullable on the same account — a study session legitimately precedes
+    #: having a skill row — so "no skill was named" and "the skill was deleted"
+    #: are the same ``NULL`` and both are ordinary rather than loss.
     skill_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("skills.id", ondelete="CASCADE"),
+        ForeignKey("skills.id", ondelete="SET NULL"),
         nullable=True,
     )
-    #: The goal this was recorded towards. ``SET NULL``, the opposite of
-    #: :attr:`skill_id` on purpose: the trail outlives the goal. Deleting a goal
-    #: the user abandoned must not erase the record that they once worked on it,
-    #: which is exactly the history the skill's evidence count summarises.
+    #: The goal this was recorded towards. ``SET NULL``, the same rule as
+    #: :attr:`skill_id` and for the same reason: an abandoned goal and a deleted
+    #: skill are the same event, and neither should erase the record that the
+    #: user once worked on it — which is exactly the history the skill's
+    #: evidence count summarises.
     goal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("learning_goals.id", ondelete="SET NULL"),

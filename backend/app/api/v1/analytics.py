@@ -72,6 +72,7 @@ from app.schemas.analytics import (
     TrendPoint,
     WorkloadRead,
 )
+from app.schemas.common import Page
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -85,6 +86,14 @@ _ANALYTICS_READ = [Depends(require_permission(Permission.ANALYTICS_READ))]
 #: than a free string, because the value selects a bucketing rule and an unknown
 #: one has no rule to fall back to.
 _GRANULARITY_DESCRIPTION = "Bucket size: day, week or month."
+
+#: Rows a project roll-up page carries when the caller names none.
+DEFAULT_PAGE_SIZE = 20
+
+#: The largest project page any caller may ask for. A ceiling, not a default: a
+#: caller reaching it is a script walking the whole set, and such a caller pages
+#: through ``offset`` rather than being handed everything in one response.
+MAX_PAGE_SIZE = 100
 
 
 async def get_today(session: DbSession) -> date:
@@ -339,8 +348,8 @@ async def get_time_distribution(
 
 @router.get(
     "/projects",
-    response_model=list[ProjectAnalyticsRead],
-    summary="Per-project rollups for the window",
+    response_model=Page[ProjectAnalyticsRead],
+    summary="Per-project rollups for the window, one page at a time",
     dependencies=_ANALYTICS_READ,
 )
 async def get_project_analytics(
@@ -348,8 +357,12 @@ async def get_project_analytics(
     analytics: AnalyticsServiceDep,
     window: _Window,
     project_id: Annotated[UUID | None, Query(description="Restrict to one project.")] = None,
-) -> list[ProjectAnalyticsRead]:
-    """Return per-project figures computed from the source rows.
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE, description="Rows per page.")] = (
+        DEFAULT_PAGE_SIZE
+    ),
+    offset: Annotated[int, Query(ge=0, description="Rows to skip.")] = 0,
+) -> Page[ProjectAnalyticsRead]:
+    """Return a bounded page of per-project figures computed from the source rows.
 
     **There is no ``project_metrics`` table.** A weekly or monthly figure is a
     bucket of ``daily_metrics``; a per-project figure is a ``GROUP BY`` over
@@ -357,10 +370,28 @@ async def get_project_analytics(
     hold the truth. Materialising either would create a second answer to a
     question the source rows answer exactly, and a recompute job to keep the two
     in step.
+
+    **The response is a page, not an array.** ``meta.total`` counts every project
+    the filters match, so a client can tell twenty of two hundred from twenty of
+    twenty; ``items`` is the window ``[offset, offset + limit)`` in project-name
+    order. An unbounded array here said nothing about whether the set was
+    complete, and the only way to find out was to ask for a page that did not
+    exist.
+
+    A ``project_id`` for another account is a **404** — the id is resolved through
+    the owner-scoped lookup before any aggregate runs, so the route cannot be used
+    to learn which project ids are real.
+
+    Errors: 422 for an inverted or oversized window, or a ``limit`` outside 1-100.
     """
     start, end = window
-    return await analytics.project_analytics(
-        owner=current_user, start=start, end=end, project_id=project_id
+    return await analytics.project_analytics_page(
+        owner=current_user,
+        start=start,
+        end=end,
+        project_id=project_id,
+        limit=limit,
+        offset=offset,
     )
 
 

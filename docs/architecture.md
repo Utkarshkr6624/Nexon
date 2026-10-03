@@ -43,6 +43,7 @@ against Phase 2 and still describe that slice where the text is phase-specific;
 | [15. Extension roadmap](#15-extension-roadmap) | Named seams for later phases |
 | [16. Design decisions](#16-design-decisions) | Decision → rationale → cost |
 | [17. Developer, Learning and Career](#17-developer-learning-and-career) | The three subsystems Phase 8 and 9 added: git scanning, and two surfaces that describe a person |
+| [18. Remediation pass over Phases 1–9](#18-remediation-pass-over-phases-19) | What the audit found, what shipped, and what in this document moved because of it |
 
 ---
 
@@ -159,15 +160,23 @@ outermost first.
 | # | Layer | Installed by | Behaviour |
 | --- | --- | --- | --- |
 | 1 | `RequestContextMiddleware` | `add_request_context_middleware` → `_install_outermost` | Binds the correlation id, stamps `X-Request-ID` onto the outgoing `http.response.start`, times the request, emits the access line. |
-| 2 | `BodyCaptureMiddleware` | `app.add_middleware` — only when `LOG_REQUEST_BODY=true` | Buffers the ASGI body messages, publishes a capped copy on `scope["state"]`, replays them verbatim. |
-| 3 | `CORSMiddleware` | `app.add_middleware`, first | Preflight and header work. `X-Request-ID` is in `expose_headers`; credentials are allowed. |
-| 4 | `ServerErrorMiddleware` | Starlette, in `build_middleware_stack` | Catches anything escaping layer 5 and renders it through the catch-all handler. |
-| 5 | `ExceptionMiddleware` → router → dependencies | Starlette, in `build_middleware_stack` | Registered handlers, routing, `app/api/v1/router.py` — which now mounts nineteen routers (`health`, `auth`, `users`, `projects`, `tasks`, `tags`, `activity`, `calendar`, `work_sessions`, `planner`, `availability`, `knowledge`, `analytics`, `developer`, `risks`, `recommendations`, `intelligence`, `learning`, `career`) — mounted at `settings.api_v1_prefix`. |
+| 2 | `BodyCaptureMiddleware` | `app.add_middleware`, added last from inside `add_request_context_middleware`, and only when `LOG_REQUEST_BODY=true` | Buffers the ASGI body messages, publishes a capped copy on `scope["state"]`, replays them verbatim. |
+| 3 | `CORSMiddleware` | `app.add_middleware` | Preflight and header work. `X-Request-ID` is in `expose_headers`; credentials are allowed. |
+| 4 | `RateLimitMiddleware` | `app.add_middleware`, added **first** | Fixed-window counters keyed by client address and concrete path; answers 429 with the shared envelope plus `Retry-After`. Added by the final remediation pass; skips `OPTIONS`, and treats a missing client address as one shared `unknown` bucket |
+| 5 | `ServerErrorMiddleware` | Starlette, in `build_middleware_stack` | Catches anything escaping layer 6 and renders it through the catch-all handler. |
+| 6 | `ExceptionMiddleware` → router → dependencies | Starlette, in `build_middleware_stack` | Registered handlers, routing, `app/api/v1/router.py` — which now mounts nineteen routers (`health`, `auth`, `users`, `projects`, `tasks`, `tags`, `activity`, `calendar`, `work_sessions`, `planner`, `availability`, `knowledge`, `analytics`, `developer`, `risks`, `recommendations`, `intelligence`, `learning`, `career`) — mounted at `settings.api_v1_prefix`. |
 
-`add_middleware` inserts outermost-last, which is why body capture ends up
-*outside* CORS: `create_app` adds CORS first and then, from inside
-`add_request_context_middleware`, adds body capture. Both still sit below
-`RequestContextMiddleware`.
+`add_middleware` inserts outermost-last, so the order above is the *reverse* of the order
+`create_app` registers in: it adds the rate limiter first, then CORS, then body capture, and
+the last one added is the outermost of the three.
+
+`RateLimitMiddleware` sits in two deliberate places at once. It is **below**
+`RequestContextMiddleware`, so a throttled response is still correlated and still
+access-logged — a 429 with no `X-Request-ID` and no log line is a response an operator cannot
+tie to the client that caused it. And it is **inside** `CORSMiddleware`, immediately above the
+router, so a browser that is refused can read the 429 and its `Retry-After` instead of seeing
+an opaque CORS failure. Being innermost is also what makes it the only layer positioned to
+refuse a request before a handler runs.
 
 `RequestContextMiddleware` is **above** `ServerErrorMiddleware`, and that is
 load-bearing rather than incidental. Starlette builds the user middleware stack
@@ -818,12 +827,23 @@ the column.
 | Scope | `include_object` restricts autogenerate to the `public` schema and excludes `alembic_version`, `spatial_ref_sys` |
 | Rendering | `render_item` emits `postgresql.UUID(as_uuid=True)` so generated migrations state the dialect explicitly |
 
-Current chain: **nine revisions**, one linear head, `0001_initial_create_users` →
+Current chain: **ten revisions**, one linear head, `0001_initial_create_users` →
 `0002_phase2_identity_sessions` → `0003_phase3_projects_tasks` → `0004_phase4_planner` →
 `0005_phase5_knowledge` → `0006_phase6_analytics` → `0007_phase7_intelligence` →
-`0008_phase8_developer_intelligence` → `0009_phase9_learning_career`.
+`0008_phase8_developer_intelligence` → `0009_phase9_learning_career` →
+`0010_learning_career_integrity`.
 Models are deliberately **not** imported by migration files, so editing `app/models/`
 cannot rewrite history.
+
+`0010` is the only revision added after the nine phase revisions, and it repairs three
+invariants `0009` stated in prose but did not enforce: `uq_career_evidence_source_identity`
+rebuilt as a *partial* unique index with `NULLS NOT DISTINCT` (a plain table-level unique
+constraint over six columns, two of which are usually null, deduplicated nothing at all under
+PostgreSQL's default `NULLS DISTINCT` btree semantics);
+`learning_activities.skill_id` changed from `ON DELETE CASCADE` to `ON DELETE SET NULL`; and
+`ix_activity_events_owner_created` added on the table the activity feed reads. Existing
+duplicates are deleted before the index is built, because the rule was never enforced and a
+database that has been through `0009` may hold several rows for one derived identity.
 
 `0002` does three things autogenerate cannot do for it, and each is a case where
 the generated draft would have been wrong:
@@ -849,13 +869,23 @@ python -m alembic check                   # autogenerate drift check
 same thing with `compare_type` and `compare_server_default` enabled, so drift is a
 test failure rather than a discovery. Both need a live PostgreSQL — `nexus_test` — and
 both now run against one: `alembic upgrade head` is applied by the `test_database_url`
-fixture on every integration session, and the whole suite is green.
+fixture on every integration session. The two commands were also run by hand during the
+final remediation pass, against a live PostgreSQL 16.2, because two phase reports had
+claimed they had never been:
+
+```text
+$ cd backend && .venv/Scripts/python.exe -m alembic current
+0010 (head)
+
+$ cd backend && .venv/Scripts/python.exe -m alembic check
+No new upgrade operations detected.
+```
 
 Two database-free checks exist, and they are not the same claim:
 
 - `test_migrations.py::test_the_migration_chain_is_linear_and_has_a_single_head`
   parses the version files and asserts the literal chain
-  `["0009", "0008", …, "0001"]` with head `0009`. It needs no database, and it does mean
+  `["0010", "0009", …, "0001"]` with head `0010`. It needs no database, and it does mean
   a new revision comes with a one-line test update — a deliberate pin, not an oversight.
 - `tests/test_migration_ddl.py` renders the chain **offline** (`as_sql=True` into a
   buffer), parses the emitted SQL and compares every `CREATE TABLE` column, foreign key
@@ -940,6 +970,54 @@ python -c "import secrets; print(secrets.token_urlsafe(64))"
 
 A second normaliser turns an all-whitespace `LOG_FILE` into `None`, so a blank
 line in `.env` does not create a file named `" "`.
+
+### The one validator that is not about production
+
+`_validate_productivity_weights` refuses to construct `Settings` at all unless
+the four weights
+`analytics_productivity_weight_{completion,deadline,consistency,focus}` sum to
+100 and none is negative.
+
+The productivity score is presented as a percentage, so those four numbers are
+its denominators: a set summing to 90 would report an "80/100" that is really
+"80/90", and one summing to 120 would report a score of 100 having awarded 120
+points. Neither is a tuning choice; both are a broken scale.
+
+The obvious third option — silently renormalising the weights to 100 — is the
+one this validator exists to refuse. Rescaling would hide that the configured
+numbers were wrong, and a formula whose constants cannot be argued with is
+precisely what the block of four settings in `config.py` was written to
+prevent. `get_settings()` is an `lru_cache`d singleton constructed at import
+time, so **the failure is a refused process start**, with a message naming all
+four values and the required total:
+
+```text
+The analytics productivity weights must sum to 100; they sum to 95.0
+(analytics_productivity_weight_completion=30.0, ..._deadline=25.0,
+..._consistency=20.0, ..._focus=20.0).
+```
+
+Contrast `analytics_comparison_windows`, in the same module, which deliberately
+does the opposite: unparsable entries are dropped rather than raised, because
+they feed a list of *suggested* period lengths and a typo in one of them should
+cost the user that suggestion rather than take the app down. The difference is
+the difference between an invariant and a preference.
+
+### Bounds that refuse an unbounded query
+
+Fifteen settings from Phases 4 and 6 bound a computation rather than describe a
+preference. They were undocumented until the final remediation pass; the full
+tables are in [`development.md`](development.md) §11.5 and in the README's
+[environment-variable table](../README.md#environment-variables). The shape they
+share:
+
+| Group | Settings | What the bound is for |
+| --- | --- | --- |
+| Planner | `planner_lookahead_days` | How far forward the scheduler searches, so a large backlog stays a bounded walk of availability rather than a scan |
+| Planner | `planner_max_session_minutes`, `planner_min_session_minutes`, `planner_max_suggestions_per_task` | The shape of one proposal, so one large task cannot fill the horizon ahead of a task that is due tomorrow |
+| Analytics | `analytics_max_range_days` (366), `analytics_rebuild_max_days` (180) | Every windowed aggregate scans the owner's whole history; an unbounded range is the one query shape these indexes cannot serve |
+| Analytics | `analytics_default_range_days`, `analytics_comparison_windows` | What a request that names no dates gets. A week is the shortest span that can distinguish a habit from a one-off |
+| Planner | `planner_default_timezone`, `planner_day_start_hour`, `planner_day_end_hour` | Which *day boundaries* a view spans. Every stored instant is UTC regardless; `08:00–20:00` is a daytime window the scheduler assumes when told nothing, not a working-hours claim |
 
 ### Where the variables live
 
@@ -1344,9 +1422,14 @@ front the API.
 
 ```bash
 # from backend/
-python -m pytest                        # 2090 collected and passing, needs nexus_test
-python -m pytest -m "not integration"   # 1011 pass, 1079 deselected, no database required
+python -m pytest                        # 2270 collected, needs nexus_test
+python -m pytest -m "not integration"   # 1029 collected, 1241 deselected, no database required
 ```
+
+Those are **collection** counts, from `pytest --collect-only`. The last full run before the
+final remediation pass was 2136 passed and 9 failed; the nine were fixed by the engineers who
+own those files, and one full run is scheduled once the pass lands. Collection says what the
+suite contains, not that it passes, and this document does not conflate the two.
 
 `pytest.ini` sets `testpaths = tests`, `pythonpath = .`, `asyncio_mode = auto`,
 function-scoped event loops (`asyncio_default_fixture_loop_scope` and
@@ -1377,15 +1460,15 @@ run](#what-has-not-been-run) records what has actually been executed.
 
 | File | Offline | Integration | Covers |
 | --- | --- | --- | --- |
-| `test_migration_ddl.py` | 150 | — | Renders the whole migration chain to SQL offline and compares every emitted `CREATE TABLE` column, foreign key and index against `Base.metadata` |
+| `test_migration_ddl.py` | 154 | — | Renders the whole migration chain to SQL offline and compares every emitted `CREATE TABLE` column, foreign key and index against `Base.metadata` |
 | `test_learning_schemas.py` | 146 | — | Phase 9's learning domain at both ends of its surface: schemas and routers' contracts, with no database |
 | `test_learning_career_routers.py` | — | 124 | The Phase 9 HTTP surface end to end: two routers |
-| `test_risk_recommendation.py` | — | 112 | What a stored risk turns into: a suggestion with a stated reason, raised once |
+| `test_risk_recommendation.py` | — | 117 | What a stored risk turns into: a suggestion with a stated reason, raised once |
 | `test_career_schemas.py` | 87 | — | Phase 9's career domain at both ends of its surface |
-| `test_risk_scoring.py` | 76 | — | The risk scoring formulas as pure arithmetic |
+| `test_risk_scoring.py` | 79 | — | The risk scoring formulas as pure arithmetic |
 | `test_risk_api.py` | — | 75 | The Phase 7 surface end to end: risks, recommendations, detection |
 | `test_learning_api.py` | — | 70 | The Phase 9 learning HTTP surface end to end |
-| `test_developer_git.py` | — | 66 | The git engine, against real repositories built in the test |
+| `test_developer_git.py` | — | 72 | The git engine, against real repositories built in the test |
 | `test_analytics_scoring.py` | 63 | — | The analytics scoring formulas as pure arithmetic |
 | `test_developer_api.py` | — | 60 | The Phase 8 HTTP surface end to end |
 | `test_password_policy.py` | 55 | — | Each rule in isolation, the length bound, and that the message states the actual configured number |
@@ -1393,8 +1476,8 @@ run](#what-has-not-been-run) records what has actually been executed.
 | `test_developer_metrics.py` | 45 | — | The developer metric formulas as pure arithmetic — no database and no `.git` directory |
 | `test_auth_phase2.py` | — | 42 | The Phase 2 auth surface end to end: sessions, password change, reset, logout-all |
 | `test_permissions.py` | 42 | — | The eleven-member `Permission` enum, `ROLE_PERMISSIONS`, the fail-closed unknown-role path, `has_all` / `has_any` |
-| `test_logging.py` | 41 | — | JSON and human formatter shape, `REDACTED_KEYS` folding, hyphenated keys, `ContextFilter` request-id propagation |
-| `test_middleware.py` | 40 | — | Access-log fields, body-preview redaction, query redaction, capture cap vs. verbatim replay, non-default `create_app(settings=…)` wiring |
+| `test_logging.py` | 42 | — | JSON and human formatter shape, `REDACTED_KEYS` folding, hyphenated keys, `ContextFilter` request-id propagation |
+| `test_middleware.py` | 41 | — | Access-log fields, body-preview redaction, query redaction, capture cap vs. verbatim replay, non-default `create_app(settings=…)` wiring |
 | `test_security.py` | 39 | — | JWT issue/verify, `type` enforcement, tamper and expiry rejection, bcrypt behaviour, `hash_token` / `token_fingerprint_matches` |
 | `test_models.py` | 37 | — | Model-level invariants that need no database |
 | `test_regressions_security.py` | 32 | 5 | The security fixes, with the evidence each one rests on |
@@ -1408,7 +1491,7 @@ run](#what-has-not-been-run) records what has actually been executed.
 | `test_analytics_daily_metrics.py` | — | 25 | The `daily_metrics` tier: one row per user per UTC day, and nothing else |
 | `test_analytics_learning_api.py` | — | 25 | The learning, knowledge and ML-feature reads, end to end over HTTP |
 | `test_learning_gaps.py` | 24 | — | The skill-gap formulas as pure arithmetic — the module that cannot lie about a level |
-| `test_risk_detection.py` | — | 24 | One detection pass: what it writes, what it refuses, what it closes |
+| `test_risk_detection.py` | — | 32 | One detection pass: what it writes, what it refuses, what it closes |
 | `test_analytics_overview_api.py` | — | 23 | The analytics dashboard surface, end to end through HTTP |
 | `test_analytics_projects_api.py` | — | 23 | Per-project and task-level analytics through the HTTP layer |
 | `test_career_repository.py` | — | 21 | `CareerRepository` against the real test database |
@@ -1432,11 +1515,30 @@ run](#what-has-not-been-run) records what has actually been executed.
 | `test_migrations.py` | — | 5 | Linear single-head chain (pinned to `["0009", …, "0001"]`), schema present, no drift |
 | `test_event_loop.py` | 3 | — | The factory survives a delegating policy, builds a `SelectorEventLoop` with `add_reader`, and yields a fresh loop each call |
 | `test_warnings.py` | 3 | — | The `filterwarnings` rules above |
-| **Total (55 files)** | **1011** | **1079** | |
+| `test_knowledge_api.py` | — | 30 | The Phase 5 knowledge surface end to end: notes, concepts, resources, links, bookmarks, categories and documents over HTTP |
+| `test_planner_api.py` | — | 19 | The Phase 4 surface end to end: availability, the planner, scheduling and the events a booked block writes |
+| `test_task_project_api.py` | — | 18 | The Phase 3 surface end to end, including the cascade rules that make deleting a task destroy the sessions and calendar events filed against it |
+| `test_analytics_feature_snapshot.py` | — | 16 | The Phase 10 ML hook: one exactly-derived feature row per task, `null` where nothing was observed, and `schema_version` beside the matrix rather than inside it |
+| `test_rate_limit.py` | — | 13 | The in-process fixed-window limiter: the credential budget, `OPTIONS` exemption, the store ceiling, and the 429 envelope |
+| `test_availability_atomicity.py` | — | 11 | `PUT /availability` replaces a week or changes nothing — checked from a second connection, because a rolled-back delete is invisible to the session that wrote it |
+| `test_task_integrity.py` | — | 8 | The Phase 3 invariants that used to be enforced only in prose: a subtask cannot move to another project, and neither can a card that already has subtasks |
+| `test_developer_features.py` | — | 8 | `developer_features.v1`: a repository that has never been scanned has no row at all, rather than a row of zeros |
+| `test_analytics_pagination.py` | — | 8 | `GET /analytics/projects` as the `Page[T]` envelope, counters under `meta` |
+| `test_migration_0010.py` | — | 7 | What `0010` changes, applied and read back: the partial `NULLS NOT DISTINCT` index, the `SET NULL` on `learning_activities.skill_id`, and the activity-feed index |
+| `test_career_query_efficiency.py` | — | 5 | The career aggregates read an index rather than a scan, asserted from the plan |
+| `test_documentation_claims.py` | — | — | The documentation is a claim surface too: every `Settings` field documented, the `Page[T]` count matching `app.openapi()`, and the superseded figures gone |
+| **Total (67 files)** | **1029** | **1241** | |
+
+Counts are from `pytest --collect-only -q` and `pytest --collect-only -q -m "not integration"`,
+run from `backend/` during the final remediation pass. They are a snapshot: a test file added
+after it was written will not be in the table. The first fifty-five rows are the suite as the
+Phase 9 report left it; the twelve below them are what the remediation wave added, and every
+one of those twelve exists because a real defect was found — the three blockers, the Phases 3–5
+coverage gap, and the honesty rules the Phase 10 contract depends on.
 
 The whole of `test_migrations.py` is `integration`-marked, so even the chain-shape
 assertion is deselected offline; `test_migration_ddl.py` is the database-free
-substitute for the *DDL agreement* half of it, and with 150 tests it is now the largest
+substitute for the *DDL agreement* half of it, and with 154 tests it is now the largest
 offline file in the suite.
 
 Two of these deserve a note on what they changed.
@@ -1496,20 +1598,25 @@ test that drives `lifespan_context` explicitly.
 
 ```bash
 # from frontend/
-npm test               # vitest run — 607 tests in 42 files
+npm test               # vitest run — 645 tests in 44 files, all passing
 npm run typecheck      # tsc -b
 npm run lint           # eslint .
 npm run build          # tsc -b && vite build
 ```
 
 Vitest runs in `jsdom` with `src/test/setup.ts`. The suite grew from 10 files in
-Phase 1 to **42 files** as each module landed, and its shape changed with them: the
+Phase 1 to **44 files / 645 tests**, and its shape changed with them: the
 hand-rolled primitives that carry real behaviour (`dialog`, `tabs`), the auth pages
 (`login`, `register`, the shared form-error flattening), the password rules and strength
 scoring, the toast store and an end-to-end smoke pass over the real routes, and then one
 `*.test.tsx` beside every live page — analytics, developer, developer-repository,
 learning, career, recommendations, risk-center — each of which pins the rules §17 states
 about levels, absences and server-named field errors.
+
+That frontend figure is a real pass count: `npm test` was run end to end during the final
+remediation pass and reports 44 files and 645 tests, all passing. It is the only number in
+this document that is a pass count rather than a collection count, because the frontend suite
+touches no database and does not contend for the `nexus_test` advisory lock.
 
 ### What is not covered
 
@@ -1520,19 +1627,19 @@ retention job to test.
 ### What has not been run
 
 Every number in the two command blocks above was produced on Windows against a **native
-PostgreSQL 16.2**. The suite creates and migrates `nexus_test` itself and runs all 2090
-tests, so the repository, session, account, RBAC, password-reset, migration, drift and
-detailed-health assertions are **verified**, not merely written. `alembic upgrade head` is
+PostgreSQL 16.2**. The suite creates and migrates `nexus_test` itself, so the repository,
+session, account, RBAC, password-reset, migration, drift and
+detailed-health assertions are **exercised**, not merely written. `alembic upgrade head` is
 applied by the `test_database_url` fixture on every integration session, and
 `test_autogenerate_reports_no_drift` asserts that the live schema and `Base.metadata`
-agree. The offline half of the claim is equally real: the 1011-test
-`-m "not integration"` subset passes with PostgreSQL stopped, so nothing that could run
+agree. The offline half of the claim is equally real: the 1029-test
+`-m "not integration"` subset runs with PostgreSQL stopped, so nothing that could run
 without a database has been quietly marked `integration` to go green.
 
 What is **not** verified is anything that needs a container. The Phase 2 text that used
 to sit here said the database-backed assertions were unverified; that was true of the
-document it replaced and is not true now — the 1079 `integration` tests exist, they run,
-and they pass against a real server. What it got right, and what still matters, is that
+document it replaced and is not true now — the 1241 `integration` tests exist and they run
+against a real server. What it got right, and what still matters, is that
 the offline subset alone says very little about a migration or a new query — which is why
 the full run is the one to read before trusting a change to a model, a repository or a
 revision.
@@ -1849,6 +1956,110 @@ Inside a training matrix a fabricated zero is indistinguishable from an observed
 | An identity column is not editable | `local_path`, `source` and the `*_id` pointers are absent from their `PATCH` payloads, because a re-pointed row becomes a second record |
 | The window ceiling belongs to the service | Only `ge=1` is declared on the route; a constant there would answer 422 against a limit the deployment has raised |
 | `analytics.read` guards the writes too | No `developer.write`, `learning.write` or `career.write` exists — the permission test asserts the complete member set, and a new one would be granted to exactly the roles `analytics.read` already covers |
+
+---
+
+## 18. Remediation pass over Phases 1–9
+
+Phase 9 shipped, and then an audit ran over everything built so far, and found things worth
+finding. Four engineers fixed them on disjoint files; this section records what actually
+changed in the architecture, because a reader of §3, §7, §8 and §17 above should not have to
+guess which of it was always true and which was repaired.
+
+### Three data-loss and correctness blockers
+
+| Defect | Root cause | What shipped instead |
+| --- | --- | --- |
+| **Deleting a project destroyed subtasks that belonged to another project.** A task could be re-parented out of its board and then left pointing at a project it was not on; deleting that project cascaded the card away with it, and the card's board — the thing the user filed it under — went with it | The `project_id` a task moved to was never checked against the task's own position in the tree | A subtask cannot be moved into another project at all, and a root card that already has subtasks cannot either. Detaching a subtask and then moving it, and moving a child card to another root card *in the same project*, both still work |
+| **`PUT /api/v1/availability` destroyed the user's week.** `replace_for_user` called `delete_for_user`, which **commits**, and only then inserted the submitted rules. The moment the table refused one row, the previous week was already gone and durable: two rules in, one duplicate on the way back, zero stored, and the caller told "conflict" about a change that had silently deleted their calendar. The audit measured exactly that, 2 → 0 | Delete-then-insert across two transactions, with the write already durable before the one that could fail | One transaction. A refused replace leaves the previous week completely intact — and the regression test proves it **from a second connection**, because a rolled-back delete is invisible to the session that wrote it |
+| **A deadline sentence named the wrong day.** The due phrase was rebuilt as `detected_at + deadline_in_hours`: a gap the detector measures at the *start* of its pass, added to the instant the row is *written*. Two clocks in one sum, so the answer is `due_date + (written_at - measured_at)` — right to the second on an ordinary pass, and a whole day late on any pass that begins before midnight and writes after it. The next pass repairs the text, which is why it survived: a reason is persisted, so the bad day is stored too | Summing a duration measured against one clock with a timestamp taken from another | The `due_date` **column**, read. The regression test moves `detected_at` a day later and fails on all three horizons, so it does not depend on the suite happening to run at 23:59 |
+
+### Phases 3–5 had no dedicated test modules at all
+
+The audit's other structural finding: projects, tasks, planner, calendar, work sessions and
+knowledge had been exercised only incidentally, through the analytics and risk suites that
+read their rows. Nothing tested those routers' own contracts.
+
+They do now. `test_task_project_api.py`, `test_planner_api.py` and `test_knowledge_api.py`
+were added, along with `test_task_integrity.py` for the tree invariants above and
+`test_availability_atomicity.py` for the transactional guarantee. That is where the
+cross-project subtask defect was found in the first place: it is a Phase 3 rule that Phase 3
+had never written down.
+
+### The versioned feature vector is the Phase 10 contract
+
+This is the rule ML training depends on, and the audit found two places breaking it.
+
+**`feature_snapshot` returned a bare mapping of feature columns with no version key.** It now
+returns `{schema_version: "analytics_features.v1", generated_at, task_id, features: {…}}`.
+
+The version sits **beside** the matrix, never inside it, and that placement is the whole
+point: `features` is a feature matrix — a positional row of numbers whose every column must be
+a feature. A string smuggled into that mapping is not a feature, it is a column a model is
+then asked to fit, and it would be fitted as readily as any other. `analytics_features.v1`
+is now the same shape of contract as `developer_features.v1`, `learning_features.v1` and
+`career_features.v1`, so a v2 cannot typecheck against v1 column meanings and a training row
+cannot be attributed to the extraction that did not produce it.
+
+**A repository that has never been scanned was published as a row of zeros.**
+`developer_features.v1` now omits those repositories entirely. A row that exists means the
+scan ran and found nothing, which is a measurement; an absent row means nobody has looked,
+which the schema has no `available` column to say. Publishing zeros told a model "this
+developer committed nothing" when the truth was "we have not looked". The same rule, on the
+career side, was already correct: `career_features.v1.project_activity` is `null` for an
+account with no repository ever scanned.
+
+### What else landed
+
+| Change | Where |
+| --- | --- |
+| `RateLimitMiddleware`: a fixed-window in-process limiter, 429 with the shared envelope and a `Retry-After` header, a separate budget shared by `/auth/login` and `/auth/password/forgot`, `OPTIONS` exempt, `X-Forwarded-For` off by default | §3, and `api-conventions.md` |
+| Migration `0010_learning_career_integrity`: the career-evidence dedup rebuilt as a *partial* unique index with `NULLS NOT DISTINCT`, `learning_activities.skill_id` changed from `CASCADE` to `SET NULL`, and an index on the activity feed | §7 |
+| Fifteen Phase 4 and Phase 6 settings documented, and the four productivity weights recorded as the start-up gate they are | §8, `development.md` §11.5 |
+
+### What this document got wrong, and now does not
+
+Stated plainly, because a corrected document that hides its own corrections is not a corrected
+document:
+
+- The backend table in §13 listed 55 test files and totalled 2090. The suite now collects
+  **2270 across 67 files** (1029 offline, 1241 `integration`), and the twelve missing rows are
+  the regression modules this pass added.
+- §13 and `development.md` §10 said the frontend ran 607 tests in 42 files. `npm test` reports
+  **645 tests in 44 files**, all passing — that one is a real pass count, run end to end.
+- §13 said "runs all 2090 tests" as though a full pass had happened. It had not, on this
+  machine, at the time it was written; the backend figures are **collection** counts and are
+  now labelled that way. The last full run before this pass was 2136 passed / 9 failed.
+- The chain was documented as nine revisions. It is ten; `0010` is the repair revision.
+- [`api-conventions.md`](api-conventions.md) told readers that `Page[T]` was served by no
+  endpoint, and that the frontend's `Paginated<T>` disagreed with it. Fifteen endpoints serve
+  `Page[T]`, and the TypeScript type has nested its counters under `meta` for some time and
+  is consumed by every knowledge, planner and work service. That sentence was the single most
+  misleading claim in the documentation set.
+
+`backend/tests/test_documentation_claims.py` now holds these documents to their own claims:
+every `Settings` field documented in `.env.example` and the README, the `Page[T]` count
+matching a live `app.openapi()`, the superseded figures gone, and `maintenance_activity` not
+described as reading low when the shipped path reads at its ceiling.
+
+### `maintenance_activity` reads at its ceiling, and three documents said it read low
+
+Worth separating, because it was the widest-reaching error and it was **inverted**.
+
+The metric answers "commits that reached a file this record had not seen touched recently",
+with a 90-day lookback. Migration `0008` stores no per-commit file rows — it would grow to
+millions on a mature codebase — so there is no file history to consult. The shipped path
+therefore reports a single placeholder path
+(`<file names are not stored per commit>`) for any commit that changed a file, and calls
+`metrics.maintenance_activity` with `last_touched_before=None`. With no history supplied,
+every touched file counts as quiet, so **every recorded commit that changed a file is
+counted**: the metric's maximum. Its own explanation says so — *"measured without the
+preceding 90 days of file history, so every touched file counts as quiet."*
+
+`development.md` and both phase reports said it "reads low". That was wrong twice over. The
+path before the repair would have reported a measured **zero** for every repository, which is
+the one outcome this codebase may never produce; the path that replaced it reports the
+ceiling. The only commits that do not count are those with `files_changed = 0`.
 
 ---
 

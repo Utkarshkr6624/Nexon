@@ -28,7 +28,7 @@ from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import install_exception_handlers
 from app.core.logging import configure_logging, get_logger, log_event
-from app.core.middleware import add_request_context_middleware
+from app.core.middleware import RateLimitMiddleware, add_request_context_middleware
 from app.db import session as db_session
 from app.db.session import check_database_connection
 
@@ -141,6 +141,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # `start_time` is deliberately absent: the lifespan stamps it when serving
     # begins, and `/api/v1/health` falls back to its own reference for an app
     # whose lifespan has not run (an in-process client, for instance).
+
+    # Added first so that it lands innermost among the user middleware: inside
+    # CORS, so a browser that is refused can read the 429 and its ``Retry-After``
+    # rather than see an opaque CORS failure, and immediately above the router,
+    # which is the only layer positioned to refuse a request before it runs.
+    application.add_middleware(RateLimitMiddleware, settings=settings)
 
     if settings.cors_origin_list:
         application.add_middleware(

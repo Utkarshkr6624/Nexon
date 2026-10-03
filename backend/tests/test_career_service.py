@@ -1060,12 +1060,22 @@ async def test_the_feature_vector_reports_null_for_project_activity_it_could_not
 
     Ada's ``relevant_skill_evidence`` is 2 and ``portfolio_evidence_count`` is 1:
     two rows point at a tracked skill, and one row was entered by hand against two
-    links on the profile.
+    links on the profile. The two skill rows name **different** skills, and that
+    is forced rather than incidental: ``uq_career_evidence_source_identity`` is
+    ``NULLS NOT DISTINCT``, so two rows identifying the same skill — same type,
+    same source, same ``skill_id``, the other two pointers null — are one row
+    twice, and the second is refused as a conflict. Under the table-level
+    ``UNIQUE`` that preceded it the pair inserted cleanly, which is precisely how
+    the same project could be "derived" into two identical evidence rows. The
+    figure under test is the *count of rows pointing at a tracked skill*, and two
+    skills are the honest way to reach it.
     """
     ada = await _owner(db_session, "ada")
     grace = await _owner(db_session, "grace")
     service = _service(db_session)
-    skill = await LearningRepository(db_session).create_skill(ada.id, name="Rust")
+    learning = LearningRepository(db_session)
+    rust = await learning.create_skill(ada.id, name="Rust")
+    typescript = await learning.create_skill(ada.id, name="TypeScript")
     await AnalyticsSeed(db_session, ada).project(
         name="Beacons", status=ProjectStatus.COMPLETED.value
     )
@@ -1080,12 +1090,12 @@ async def test_the_feature_vector_reports_null_for_project_activity_it_could_not
     )
     await service.upsert_profile(owner=ada, values={"links": ["https://ada.test"]})
     today = (await _db_now(db_session)).date()
-    for offset in (2, 4):
+    for skill, title in ((rust, "Rust session"), (typescript, "TypeScript session")):
         await service.create_evidence(
             owner=ada,
             evidence_type=CareerEvidenceType.SKILL_ACTIVITY.value,
-            title=f"Rust session on day -{offset}",
-            occurred_on=today - timedelta(days=offset),
+            title=title,
+            occurred_on=today - timedelta(days=2),
             skill_id=skill.id,
             source="skill",
         )

@@ -40,22 +40,33 @@ Why the tallies are swept rather than aggregated in SQL
 The list shapes promise that ``by_kind``, ``current_count``, ``by_type``,
 ``by_source`` and ``manual_count`` describe **every matching row**, not the page
 beside them. :class:`~app.repositories.career.CareerRepository` returns the page and
-its total and no tallies, so the tallies are computed by reading the matching rows
-through the very repository method that produces the page — same method, same
-filters, same owner predicate. The alternative was to restate the repository's
-filter construction here, and a second copy of a ``WHERE`` clause is a second answer
-that can silently disagree with the list above it.
+its total and no tallies, so the tallies are computed beside it — from the same
+filters, with the same owner predicate, over the same rows. The alternative was to
+restate the repository's filter construction here, and a second copy of a ``WHERE``
+clause is a second answer that can silently disagree with the list above it.
 
+**The evidence tallies are aggregates; only the timeline is swept.** A tally that
+counts the whole set by paging it costs one round trip per page, so the career page
+paid for the sweep three times over — the summary, the list and the feature vector
+each want the same figures — and every one of those reads grew with the account.
+:meth:`CareerRepository.evidence_tally` therefore counts in the database and returns
+a handful of rows: two statements whatever the account holds, instead of three per
+two hundred rows. It is exact at every size, where the swept version was bounded.
+
+What remains swept, and why
+---------------------------
+``career_experience`` has no cap of its own and its ``by_kind`` tally is the one
+figure still read by paging, because nothing about it needs a row in Python — but
+the timeline's shape counts are the smallest read on the page and a user with a
+decade of employment history is a legitimate, bounded case rather than an outage.
 The sweep is bounded on both ends, deliberately:
 
 * the page size matches the repository's own ceiling, so a page is a page the
   repository would have served anyway;
-* the row count is capped — at ``career_max_evidence`` for evidence (which the write
-  path enforces, so the cap *is* the table size) and at
-  :data:`_TIMELINE_SWEEP_ROW_LIMIT` for the timeline, which has no cap of its own. A
-  set larger than the sweep limit is **under-counted rather than guessed at**, and
-  the constant says so. A career timeline that long is a data-entry problem the user
-  should see, not a number NEXUS should invent the tail of.
+* the row count is capped at :data:`_TIMELINE_SWEEP_ROW_LIMIT`. A set larger than
+  the sweep limit is **under-counted rather than guessed at**, and the constant says
+  so. A career timeline that long is a data-entry problem the user should see, not a
+  number NEXUS should invent the tail of.
 
 Why the window is anchored on the database clock
 ------------------------------------------------
@@ -119,9 +130,10 @@ __all__ = ["CareerIntelligenceService"]
 #: :mod:`app.repositories.career`'s own default so the service's fallback and the
 #: repository's are the same number rather than two that can drift.
 _DEFAULT_PAGE_SIZE = 50
-#: The page size the internal tally sweep reads with. It matches the repository's own
+#: The page size the timeline tally sweep reads with. It matches the repository's own
 #: ceiling, which is the largest page the repository will serve — asking for more
-#: would return the same rows with a silent clamp.
+#: would return the same rows with a silent clamp. The evidence tallies are
+#: aggregates now and do not sweep at all.
 _SWEEP_PAGE_SIZE = 200
 #: How many timeline rows one sweep will read before it stops counting.
 #:
@@ -184,6 +196,11 @@ class _EvidenceTally:
     by_type: dict[str, int] = field(default_factory=dict)
     #: Counts keyed by the subsystem each row came from. Open vocabulary.
     by_source: dict[str, int] = field(default_factory=dict)
+    #: How many rows matched, all of them. The list route reads this from the page's
+    #: own window count; the summary and the feature vector read it from here,
+    #: because a tally that already counted the set should not be followed by a
+    #: second read asking how big the set was.
+    total: int = 0
     #: Rows the user entered by hand. The provenance figure: how much of the career
     #: page was written by the person rather than derived by the system.
     manual_count: int = 0
@@ -223,10 +240,11 @@ async def _sweep_rows(
 ) -> list[Any]:
     """Read every matching row through a repository's own page method.
 
-    The repository returns ``(page, total)``; this walks it to the end or to
-    ``row_limit``, whichever comes first. ``row_limit`` is a *bound*, not a filter:
-    a set larger than it is under-counted rather than invented, which is the honest
-    direction to be wrong in.
+    The timeline tally is the one figure still read this way; the evidence tallies are
+    aggregates in the database. The repository returns ``(page, total)``; this walks
+    it to the end or to ``row_limit``, whichever comes first. ``row_limit`` is a
+    *bound*, not a filter: a set larger than it is under-counted rather than invented,
+    which is the honest direction to be wrong in.
 
     Args:
         fetch: The repository's list method, called as ``fetch(limit, offset)``.
@@ -936,7 +954,6 @@ class CareerIntelligenceService:
         days, window_start, window_end = await self._resolve_window(window_days)
         profile = await self.repositories.get_profile(owner.id)
         _page, record_count = await self.repositories.list_experience(owner.id, limit=1)
-        evidence_count = await self.repositories.count_evidence(owner.id)
         _windowed, evidence_in_window = await self.repositories.list_evidence(
             owner.id,
             # ``occurred_on`` is a date, so the window's own instants are rounded to
@@ -948,6 +965,11 @@ class CareerIntelligenceService:
             limit=1,
         )
         tally = await self._evidence_tally(owner.id)
+        # The whole-set count comes out of the tally rather than from a separate
+        # ``count_evidence``: it counts the very rows the other figures below were
+        # drawn from, so it cannot disagree with them and it does not cost a read
+        # of its own.
+        evidence_count = tally.total
         project_stats = await self.projects.stats_for_user(owner.id)
         learning_totals = await self.learning.activity_totals(owner.id)
 
@@ -1097,11 +1119,26 @@ class CareerIntelligenceService:
     ) -> _EvidenceTally:
         """Whole-set counts over the matching evidence rows.
 
-        Read through :meth:`CareerRepository.list_evidence` — the same method, with
-        the same filters and the same owner predicate, that produced the page these
-        counts sit beside. A second copy of the filter construction in this module
-        would be a second answer that can disagree with the list above it, which is
-        the failure the list schemas warn about by name.
+        Read through :meth:`CareerRepository.evidence_tally`, which builds the same
+        filter clauses — from the same helper, with the same owner predicate — that
+        :meth:`CareerRepository.list_evidence` applies to the page these counts sit
+        beside. A second copy of the filter construction in this module would be a
+        second answer that can disagree with the list above it, which is the failure
+        the list schemas warn about by name.
+
+        **The counts are aggregates, not a walk.** This used to page the whole set
+        through ``list_evidence`` and count the rows in Python, one round trip per
+        :data:`_SWEEP_PAGE_SIZE` rows, so the career page paid for the sweep three
+        times over — once for the summary, once for the list and once for the
+        features vector — and every one of those reads grew with the account. The
+        database now does the counting and returns a handful of rows, which is what
+        makes the three reads cost the same two statements whatever the account
+        holds.
+
+        One consequence is worth stating because it is a *gain*: the walk stopped at
+        ``career_max_evidence`` rows and under-counted beyond it, while the
+        aggregates have no such ceiling and are exact at every size. The bound still
+        governs writes, which is where it belongs.
 
         Args:
             owner_id: Whose evidence to count.
@@ -1116,48 +1153,24 @@ class CareerIntelligenceService:
             The tally. Every field is zero or ``None`` when nothing matched, which is
             a real answer about a set that was searched and found empty.
         """
-        rows = await _sweep_rows(
-            lambda limit, offset: self.repositories.list_evidence(
-                owner_id,
-                evidence_type=evidence_type,
-                project_id=project_id,
-                skill_id=skill_id,
-                repository_id=repository_id,
-                since=since,
-                until=until,
-                limit=limit,
-                offset=offset,
-            ),
-            page_size=_SWEEP_PAGE_SIZE,
-            row_limit=max(1, self.settings.career_max_evidence),
+        counted = await self.repositories.evidence_tally(
+            owner_id,
+            evidence_type=evidence_type,
+            project_id=project_id,
+            skill_id=skill_id,
+            repository_id=repository_id,
+            since=since,
+            until=until,
         )
-        by_type: dict[str, int] = {}
-        by_source: dict[str, int] = {}
-        skills: set[uuid.UUID] = set()
-        projects: set[uuid.UUID] = set()
-        manual = 0
-        linked = 0
-        latest: date | None = None
-        for row in rows:
-            by_type[str(row.evidence_type)] = by_type.get(str(row.evidence_type), 0) + 1
-            by_source[str(row.source)] = by_source.get(str(row.source), 0) + 1
-            if row.source == DEFAULT_CAREER_EVIDENCE_SOURCE:
-                manual += 1
-            if row.skill_id is not None:
-                skills.add(row.skill_id)
-                linked += 1
-            if row.project_id is not None:
-                projects.add(row.project_id)
-            if latest is None or row.occurred_on > latest:
-                latest = row.occurred_on
         return _EvidenceTally(
-            by_type=by_type,
-            by_source=by_source,
-            manual_count=manual,
-            skill_linked_count=linked,
-            skills_with_evidence=len(skills),
-            linked_project_count=len(projects),
-            latest_evidence_on=latest,
+            by_type=dict(counted["by_type"]),
+            by_source=dict(counted["by_source"]),
+            total=int(counted["total"]),
+            manual_count=int(counted["manual_count"]),
+            skill_linked_count=int(counted["skill_linked_count"]),
+            skills_with_evidence=int(counted["skills_with_evidence"]),
+            linked_project_count=int(counted["linked_project_count"]),
+            latest_evidence_on=counted["latest_evidence_on"],
         )
 
     async def _experience_tally(

@@ -939,8 +939,24 @@ async def test_deleting_a_goal_keeps_the_recorded_evidence(client, account):
     assert body["items"][0]["goal_id"] is None, "the trail outlives the goal"
 
 
-async def test_deleting_a_skill_cascades_its_activities(client, account):
-    """An activity left pointing at a skill that no longer exists would show nowhere."""
+async def test_deleting_a_skill_keeps_the_activities_recorded_against_it(client, account):
+    """Deleting the subject must not delete the record of working on it.
+
+    ``learning_activities.skill_id`` is ``ON DELETE SET NULL``, and the activity
+    feed reads it exactly as it reads the goal pointer: the row survives the
+    thing it points at and reports ``null`` there. Deleting a skill used to
+    ``CASCADE``, which meant an edit to the skills table silently erased a
+    person's record that they had studied — from another table, without a word.
+
+    Both halves of the answer are asserted, because "shows nowhere" was the
+    stated reason for the old rule and it is not true of this one:
+
+    * The **account's** feed still lists the activity — ``total`` 1 — carrying its
+      title and a null ``skill_id``. Nothing was destroyed.
+    * The **skill-scoped** feed lists nothing, because there is no skill left to
+      scope to. That is a narrowing to a skill that does not exist, not a
+      deletion.
+    """
     skill = await _create_skill(client, account)
     await client.post(
         "/api/v1/learning/activities",
@@ -956,7 +972,17 @@ async def test_deleting_a_skill_cascades_its_activities(client, account):
     assert deleted.status_code == 204, deleted.text
 
     activities = await client.get("/api/v1/learning/activities", headers=account)
-    assert activities.json()["total"] == 0
+    assert activities.status_code == 200, activities.text
+    body = activities.json()
+    assert body["total"] == 1, "the record outlives the skill it was recorded against"
+    assert body["items"][0]["title"] == "Worked on it"
+    assert body["items"][0]["skill_id"] is None
+
+    scoped = await client.get(
+        f"/api/v1/learning/activities?skill_id={skill['id']}", headers=account
+    )
+    assert scoped.status_code == 200, scoped.text
+    assert scoped.json()["total"] == 0, "a filter naming a deleted skill matches nothing"
 
 
 # ---------------------------------------------------------------------------

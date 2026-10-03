@@ -862,7 +862,7 @@ def test_the_other_two_tables_declare_no_unique_constraint():
             LearningActivity,
             {
                 "user_id": ("users", "CASCADE"),
-                "skill_id": ("skills", "CASCADE"),
+                "skill_id": ("skills", "SET NULL"),
                 "goal_id": ("learning_goals", "SET NULL"),
             },
         ),
@@ -874,11 +874,24 @@ def test_the_deletion_rule_on_every_foreign_key_is_the_one_the_phase_intends(mod
     ``users`` is CASCADE everywhere: a deleted account leaves nothing to own.
     ``learning_goals.target_skill_id`` is SET NULL because a goal can name a
     topic before the skill exists and a goal the user wrote outlives the skill
-    row it referenced. ``learning_activities.skill_id`` is CASCADE, because an
-    activity that outlived its skill would sit in no skill's evidence count and
-    no page would ever show it again. ``learning_activities.goal_id`` is SET NULL,
-    the opposite on purpose: the trail outlives the goal, so abandoning a goal
-    cannot erase the record that the user once worked on it.
+    row it referenced. ``learning_goals`` and ``learning_activities`` are the
+    other half of the same argument.
+
+    ``learning_activities.skill_id`` is **SET NULL**, and it used to be CASCADE.
+    An activity row is an append-only record of a moment — that the person spent
+    forty minutes on this — and CASCADE made deleting a skill silently destroy
+    every one of those rows. The row was written down and then erased by an
+    unrelated edit to a different table, which is the one thing a record of
+    something that happened must not be. The surviving row keeps its timestamp,
+    minutes, title and source, and says "no skill was named" rather than carrying
+    a dangling id.
+
+    The old CASCADE was justified by the activity becoming invisible, and that
+    is no longer true: a null ``skill_id`` only excludes the row when a caller
+    *narrows to one skill* (``LearningRepository.list_activities`` documents it,
+    and ``skill_activities`` excludes them the same way). The owner's own
+    activity feed still lists it, because the feed is about the account rather
+    than about a skill page.
     """
     assert _foreign_keys(model) == expected
 

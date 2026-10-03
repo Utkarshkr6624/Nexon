@@ -1212,6 +1212,11 @@ class AnalyticsRepository:
         everything that is neither completed nor cancelled; ``overdue`` is the open
         subset whose due date has passed as of ``as_of``. All of them are conditional
         aggregates over the same rows, so they cannot disagree.
+
+        Ordered by name with ``id`` as a tiebreaker rather than by name alone. The
+        id is there because the caller pages this list: names are not unique, so a
+        name-only order lets two identically named projects swap places between two
+        requests and a row the client already holds reappear on the next page.
         """
         unfinished = Task.status.not_in((TaskStatus.COMPLETED.value, TaskStatus.CANCELLED.value))
         result = await self.session.execute(
@@ -1233,7 +1238,7 @@ class AnalyticsRepository:
             .outerjoin(Task, Task.project_id == Project.id)
             .where(Project.owner_id == owner_id)
             .group_by(Project.id, Project.name, Project.status)
-            .order_by(Project.name.asc())
+            .order_by(Project.name.asc(), Project.id.asc())
         )
         return [
             (
@@ -1324,38 +1329,53 @@ class AnalyticsRepository:
         )
         return [(row[0], int(row[1])) for row in result.all()]
 
-    async def project_completion_counts(
-        self, owner_id: uuid.UUID, project_id: uuid.UUID, *, start: date, end: date
-    ) -> tuple[int, int]:
-        """``(created, completed)`` inside a window for one project, in two queries.
+    async def project_completion_counts_in_range(
+        self,
+        owner_id: uuid.UUID,
+        *,
+        project_ids: Sequence[uuid.UUID],
+        start: date,
+        end: date,
+    ) -> dict[uuid.UUID, tuple[int, int]]:
+        """``{project_id: (created, completed)}`` for many projects in one query.
 
-        The historical completion rate's numerator and denominator. Both halves cover
-        the same window, so the rate describes that period rather than "everything
-        ever" divided by "this week".
+        The historical completion rate's numerator and denominator, for **every
+        named project at once**. Both halves cover the same window, so the rate
+        describes that period rather than "everything ever" divided by "this week".
+
+        **This is the batched form, and the batching is the point.** Asking per
+        project is the ``4 x N`` pattern: the roll-up over ``N`` projects issued four
+        statements each, because two counts per project were read twice — once for
+        the numerator and once for the denominator — so 60 projects cost 240 round
+        trips on one page load, and every routine risk evaluation paid it again
+        through :meth:`AnalyticsService.project_analytics`. Two conditional
+        aggregates over one ``GROUP BY project_id`` produce the same numbers for
+        every project at once, and the statement count stops depending on how many
+        projects the caller owns.
+
+        ``project_ids`` narrows the scan to the page being rendered, so a paged
+        roll-up does not count completions for projects it is about to leave out.
+        An empty sequence returns an empty mapping without touching the database:
+        there is nothing to count, and an ``IN ()`` would be a round trip spent to
+        learn that.
         """
+        if not project_ids:
+            return {}
         start_utc, end_utc = _utc_window(start, end)
-        created = await self.session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.owner_id == owner_id,
-                Task.project_id == project_id,
-                Task.created_at >= start_utc,
-                Task.created_at < end_utc,
+        result = await self.session.execute(
+            select(
+                Task.project_id,
+                func.count().filter(Task.created_at >= start_utc, Task.created_at < end_utc),
+                func.count().filter(
+                    Task.completed_at.is_not(None),
+                    Task.completed_at >= start_utc,
+                    Task.completed_at < end_utc,
+                ),
             )
+            .where(Task.owner_id == owner_id, Task.project_id.in_(list(project_ids)))
+            .group_by(Task.project_id)
         )
-        completed = await self.session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.owner_id == owner_id,
-                Task.project_id == project_id,
-                Task.completed_at.is_not(None),
-                Task.completed_at >= start_utc,
-                Task.completed_at < end_utc,
-            )
-        )
-        return int(created.scalar_one()), int(completed.scalar_one())
+        return {row[0]: (int(row[1]), int(row[2])) for row in result.all()}
 
     # ------------------------------------------------------------------
     # Availability, workload capacity, ML features

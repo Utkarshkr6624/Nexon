@@ -7,11 +7,15 @@ looks like once it is running.
 **Status.** The conventions below are the contract the whole API follows, and they were
 established by the Phase 2 identity slice — **16 paths and 17 operations** — which is
 described in full in the [Endpoint catalogue](#endpoint-catalogue). Phases 3 through 9
-added 166 further operations across 19 routers. The catalogue has **not** been extended
-to cover them; their per-module inventories live in the phase reports, and the
+added 170 further operations across 19 routers, for **140 paths and 187 operations** in
+total (`app.openapi()`, counted per path and method). The catalogue has **not** been
+extended to cover them; their per-module inventories live in the phase reports, and the
 conventions those phases established that were not already written down are in
 [Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9). Three
 modules — Search, AI Assistant and Experiments — still have no API at all.
+
+The last remediation pass over Phases 1–9 changed three of those numbers and closed four
+gaps; both are recorded in [Remediation pass over Phases 1–9](#remediation-pass-over-phases-19).
 
 ---
 
@@ -27,6 +31,7 @@ modules — Search, AI Assistant and Experiments — still have no API at all.
 - [Request correlation (`X-Request-ID`)](#request-correlation-x-request-id)
 - [Authentication](#authentication) | Tokens, sessions, the password policy, permissions, password reset |
 - [CORS and response headers](#cors-and-response-headers)
+- [Rate limiting](#rate-limiting) | The 429 envelope, the two credential routes, and why `X-Forwarded-For` is off by default
 - [Pagination](#pagination)
 - [Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9) | Route order, page-size caps as rejections, partial PATCH, one-producer stamps, unmodifiable identity columns, null-not-zero |
 - [Health semantics](#health-semantics)
@@ -34,6 +39,7 @@ modules — Search, AI Assistant and Experiments — still have no API at all.
 - [Checklist for a new endpoint](#checklist-for-a-new-endpoint) | The rules a new route must satisfy |
 - [Worked example — the shape a future endpoint takes](#worked-example--the-shape-a-future-endpoint-takes)
 - [Testing an endpoint](#testing-an-endpoint)
+- [Remediation pass over Phases 1–9](#remediation-pass-over-phases-19) | What the audit found, what shipped, and which numbers in this document moved because of it
 - [Known gaps](#known-gaps) | Deliberate omissions: what Phase 2 left open and what the later phases left open |
 
 ---
@@ -86,8 +92,8 @@ README's troubleshooting section.
 ## Endpoint catalogue
 
 **The Phase 2 slice.** Health, auth and users — 17 operations across 16 paths, and the
-part of the API this document inventories route by route. The API as a whole serves 136
-paths and 183 operations; the other 166 operations belong to the modules Phases 3 through 9
+part of the API this document inventories route by route. The API as a whole serves 140
+paths and 187 operations; the other 170 operations belong to the modules Phases 3 through 9
 added (projects, tasks, tags, activity, calendar, work sessions, planner, availability,
 knowledge, analytics, developer, risks, recommendations, intelligence, learning, career)
 and are catalogued in the phase reports. Everything here still applies to every one of
@@ -101,9 +107,9 @@ them unchanged.
 | `GET` | `/health` | no | 200 `{"status":"ok"}` | Liveness. Never touches the database |
 | `GET` | `/api/v1/health` | no | 200, `status: "healthy"\|"degraded"` | Metadata plus a timed `SELECT 1` probe |
 | `POST` | `/api/v1/auth/register` | no | 201, `UserRead` | 409 `conflict` if the email **or** the username is taken |
-| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` | 401 `unauthorized` for any credential failure. Opens a device session and returns its `session_id` |
+| `POST` | `/api/v1/auth/login` | no | 200, `TokenPair` | 401 `unauthorized` for any credential failure. Opens a device session and returns its `session_id`. 429 `rate_limited` once an address exhausts its credential budget — see [Rate limiting](#rate-limiting) |
 | `POST` | `/api/v1/auth/refresh` | no | 200, `TokenPair` | Single-use rotation **on the same session row** — the device stays the same device |
-| `POST` | `/api/v1/auth/password/forgot` | no | 202, `PasswordResetRequested` | The body is identical for a known and an unknown address. There is no 404 |
+| `POST` | `/api/v1/auth/password/forgot` | no | 202, `PasswordResetRequested` | The body is identical for a known and an unknown address. There is no 404. 429 `rate_limited` on the same credential budget as login |
 | `POST` | `/api/v1/auth/password/reset` | no | 204, empty body | 401 for a token that is unknown, spent, expired or not a reset token — all four answer identically. Ends **every** session |
 | `POST` | `/api/v1/auth/logout` | optional | 204, empty body | Revokes each token it is given. **Send the refresh token in the body** — the bearer header alone leaves it valid. See [Authentication](#authentication) |
 
@@ -347,13 +353,14 @@ rest resolve through `_status_code_to_code`:
 | `conflict` | 409 | `ConflictError` | Uniqueness violation, or a collision with current state |
 | `bad_request` | 400 | Fallback for any unmapped 4xx; reserved as a domain code | Malformed request that is not schema-invalid |
 | `method_not_allowed` | 405 | `StarletteHTTPException` | Wrong verb on a known path |
-| `rate_limited` | 429 | Reserved — no rate limiting is implemented | — |
+| `rate_limited` | 429 | `RateLimitMiddleware` | The client address exceeded its budget for this route inside the current window. See [Rate limiting](#rate-limiting) |
 | `internal_error` | 500 | `NexusError` default, `StarletteHTTPException` 5xx, the catch-all handler | Unexpected failure; the client is told nothing |
 
-The code table is unchanged by Phase 2 — and by Phases 3 through 9, which added 166
-operations without needing a tenth code. A new feature never needed a new code. What
-changed is **which situations produce the existing ones**, and one of them is a rule worth
-stating on its own:
+The code table is unchanged by Phase 2 — and by Phases 3 through 9, which added 170
+operations without needing a tenth code. The remediation pass did not add one either:
+`rate_limited` was already in the enum, and the limiter finally produces it. A new feature
+never needed a new code. What changed is **which situations produce the existing ones**, and
+one of them is a rule worth stating on its own:
 
 - **A resource the caller does not own is `not_found` (404), never `forbidden` (403).**
   `DELETE /auth/sessions/{session_id}` answers 404 when the id belongs to another account,
@@ -660,6 +667,13 @@ the response body instead of being emailed.
 Password reset tokens are stored the same way refresh tokens are: a SHA-256 digest,
 compared with `hmac.compare_digest`.
 
+`POST /auth/password/forgot` also shares the **credential rate-limit budget** with
+`/auth/login` — 120 requests per client address per 60-second window by default. An
+earlier revision of this document listed the endpoint's lack of throttling as a known gap; it
+is throttled now, and the identical-body rule above is the second of the two defences rather
+than the only one. Neither defence is a substitute for the other: an identical body stops a
+caller from *learning* which addresses exist, and the budget stops them from *trying* many.
+
 **Why SHA-256 and not bcrypt for tokens.** `hash_token()` in
 `app/core/security.py` digests refresh and reset tokens with SHA-256 rather than
 the bcrypt used for passwords, and the reason is the *input*, not the algorithm.
@@ -710,8 +724,9 @@ trailing slashes; default `http://localhost:5173,http://127.0.0.1:5173`):
 | `allow_methods` / `allow_headers` | `*` |
 | `expose_headers` | `["X-Request-ID"]` |
 
-There are no other custom response headers, and no rate-limit or retry-after
-headers, because there is no rate limiter.
+There is one other custom response header, and only on throttled requests:
+`Retry-After`, in whole seconds, on a 429. See
+[Rate limiting](#rate-limiting).
 
 ### Same-origin by default
 
@@ -726,6 +741,70 @@ path. Either works; set the variable to `/api/v1` to go through the proxy.
 
 ---
 
+## Rate limiting
+
+`RateLimitMiddleware` in `backend/app/core/middleware.py` throttles by client
+address and route, in a fixed window, held in process memory. It is the innermost
+user middleware, installed **inside** CORS so that a browser can read the 429 and
+its `Retry-After` rather than seeing an opaque CORS failure.
+
+This section did not exist before the final remediation pass. The document used
+to carry a "known gap" saying there was **no** rate limiter and that the
+`rate_limited` error code was therefore unreachable. That was true when it was
+written and is false now: the limiter exists, `429` is reachable, and the
+`rate_limited` code is the one it carries.
+
+| Property | Value |
+| --- | --- |
+| Enabled | `RATE_LIMIT_ENABLED` (default `true`) |
+| Window | `RATE_LIMIT_WINDOW_SECONDS` (default `60`), fixed, not sliding |
+| Bucket key | client address and the **concrete** request path. The two credential routes share one bucket; every other route gets its own |
+| General budget | `RATE_LIMIT_GENERAL_MAX_REQUESTS` (default `600`) per path per address |
+| Credential budget | `RATE_LIMIT_CREDENTIAL_MAX_REQUESTS` (default `120`) for `/auth/login` and `/auth/password/forgot`, counted together |
+| Exempt | `OPTIONS`, which is a preflight and reaches no handler |
+| Unknown address | Requests with no client address share one `unknown` bucket |
+| Store ceiling | `RATE_LIMIT_MAX_ENTRIES` (default `10000`) tracked pairs; past that, the oldest-inserted key is evicted |
+| Sweeping | Each entry is dropped once its window has elapsed, and the sweep runs at most once per window rather than per request |
+
+A throttled request answers **429** with the shared error envelope,
+`code: "rate_limited"`, and a **`Retry-After`** header in whole seconds, rounded **up** and
+never below `1`. It is still correlated and still access-logged: the limiter sits below
+`RequestContextMiddleware`, so the 429 carries an `X-Request-ID` and leaves the usual
+`rate_limited` WARNING line with the path, the client address and which budget refused it.
+
+Five properties a client should know:
+
+- **A refused request is not counted.** Counting it would extend the penalty past the window
+  that caused it: a caller who kept hammering would never see the budget return, and the
+  `Retry-After` it was handed would be a lie.
+- **The window is fixed, not sliding.** `Retry-After` is the remainder of the window that is
+  already running, not a rolling cooldown, so an immediate retry may still be refused.
+- **The limiter runs before the handler.** The 429 body is therefore identical whether or not
+  the account exists, the password was right or the caller was authorised — a caller cannot
+  tell "no such account" from "wrong password" from "you may not ask again this minute".
+- **General buckets are keyed on the concrete path.** An enumerator varying the last segment
+  (`/projects/1`, `/projects/2`, …) draws a fresh budget each time. That is acceptable here
+  because the generous bucket is the one that allows it; the two routes the limiter exists
+  for are fixed paths by construction.
+- **The store is per process.** A restart clears every counter, and N workers enforce N
+  budgets. See [Known gaps](#known-gaps).
+
+The two credential routes are the reason the limiter exists. Both answer an
+unauthenticated caller with exactly what an attacker wants to know, and bcrypt costs about
+a quarter of a second a try — which slows a guess down but never stops it. 120 a minute is
+two a second, below the ~4/s one verification already permits, so the limiter does not extend
+a patient attacker's timeline; it stops a *parallelised* flood and the address rotation an
+enumerator would otherwise use. They are counted **together**, so an attacker cannot spend
+the login budget and then try the reset route for free.
+
+> `RATE_LIMIT_TRUST_FORWARDED_FOR` is off by default, deliberately: `X-Forwarded-For`
+> is attacker-controlled on any path that does not terminate in a proxy you control, so
+> honouring it would let a caller mint a fresh bucket per request. Turn it on only behind
+> a trusted reverse proxy — and then every client shares the proxy's address, which is the
+> correct reading in that topology and a denial-of-service waiting to happen in any other.
+
+---
+
 ## Pagination
 
 `Page[T]` and `PageMeta` in `backend/app/schemas/common.py` are the reserved
@@ -734,17 +813,24 @@ envelope for the list endpoints.
 > **Two shapes are in use, and the field names are the same in both — only the nesting
 > differs.**
 >
-> - **`Page[T]`, the `meta`-nested shape below, is served by fourteen operations** across
->   the `calendar`, `knowledge`, `projects`, `tags`, `tasks` and `work_sessions` routers
->   (Phases 3–5).
+> - **`Page[T]`, the `meta`-nested shape below, is served by fifteen operations** across
+>   the `analytics`, `calendar`, `knowledge`, `projects`, `tags`, `tasks` and
+>   `work_sessions` routers.
 > - **A flat typed list response — `items`, `total`, `limit`, `offset` and a tally
->   beside them (`by_status`, `by_type`, `by_kind`, `by_level_source`) — is served by
->   twelve further operations** in the `developer`, `learning`, `career`, `risks` and
->   `recommendations` routers (Phases 7–9). Their schemas are named after the tally, not
->   after `Page`, and they carry no `meta` key.
+>   beside them (`by_status`, `by_type`, `by_kind`, `by_level_source`) — is served by the
+>   Phases 7–9 routers** (`developer`, `learning`, `career`, `risks`, `recommendations`).
+>   Their schemas are named after the tally, not after `Page`, and they carry no `meta`
+>   key.
 >
 > A client written against one shape will silently read `undefined` out of the other, so
 > check which shape the route returns before consuming it. The rules below govern both.
+>
+> **An earlier revision of this document carried a "known gap" claiming that `Page[T]`
+> was declared but unserved and that no endpoint spoke it yet. Fifteen do.** That claim
+> was the most misleading sentence in the file, and the
+> [Remediation pass](#remediation-pass-over-phases-19) removed it.
+> `backend/tests/test_documentation_claims.py` fails the build if it returns, and checks
+> the "fifteen" against a live count taken from `app.openapi()`.
 
 `GET /api/v1/users/` does return a bare array, precisely because it is a
 permission fixture and not a product surface.
@@ -784,7 +870,7 @@ returns `204` instead, which is the stronger signal. Prefer `204`.
 
 ## Conventions from Phase 8 and Phase 9
 
-Phases 3–9 added 166 operations that are **not** in the catalogue above, which was last
+Phases 3–9 added 170 operations that are **not** in the catalogue above, which was last
 revised for Phase 2. Rather than restate a catalogue that is already behind, this section
 records the conventions those phases established that are *not* already written down
 somewhere in this document. Everything else — the envelope, the code table, `404` over
@@ -797,15 +883,32 @@ somewhere in this document. Everything else — the envelope, the code table, `4
 | Knowledge (Phase 5) | `/knowledge/*` | — |
 | Analytics (Phase 6) | `/analytics/*` | — |
 | Risk and recommendations (Phase 7) | `/risks/*`, `/recommendations/*`, `/intelligence/*` | [`phase-7-report.md`](specifications/phase-7-report.md) |
-| Developer (Phase 8) | 15 under `/developer` | [`phase-8-developer-report.md`](specifications/phase-8-developer-report.md) |
-| Learning and career (Phase 9) | 20 under `/learning`, 13 under `/career` | [`phase-9-learning-career-report.md`](specifications/phase-9-learning-career-report.md) |
+| Developer (Phase 8) | 14 under `/developer` | [`phase-8-developer-report.md`](specifications/phase-8-developer-report.md) |
+| Learning and career (Phase 9) | 19 under `/learning`, 12 under `/career` | [`phase-9-learning-career-report.md`](specifications/phase-9-learning-career-report.md) |
 
-Operation counts for the Phases 3–7 rows were read off the generated OpenAPI document:
-11 under `/projects`, 15 under `/tasks`, 5 under `/tags`, 2 under `/activity`, 5 under
-`/planner`, 5 under `/calendar`, 7 under `/work-sessions`, 2 under `/availability`, 37
-under `/knowledge`, 18 under `/analytics`, 6 under `/risks`, 6 under `/recommendations`
-and 2 under `/intelligence`. The Phase 8 and 9 figures above are the ones their own phase
-reports state.
+Operation counts for every row — including the two Phase 8 and 9 figures, which the phase
+reports state as 15, 20 and 13 — were read off the generated OpenAPI document with
+`app.openapi()`, counting each path once per HTTP method:
+
+| Prefix | Operations | Prefix | Operations |
+| --- | --- | --- | --- |
+| `/` and `/health` | 2 | `/knowledge` | 37 |
+| `/api/v1/health` | 1 | `/analytics` | 18 |
+| `/auth` | 11 | `/risks` | 6 |
+| `/users` | 3 | `/recommendations` | 6 |
+| `/projects` | 14 | `/intelligence` | 2 |
+| `/tasks` | 16 | `/developer` | 14 |
+| `/tags` | 5 | `/learning` | 19 |
+| `/activity` | 2 | `/career` | 12 |
+| `/planner` | 5 | | |
+| `/calendar` | 5 | | |
+| `/work-sessions` | 7 | | |
+| `/availability` | 2 | | |
+
+That is **140 paths and 187 operations**, of which 16 paths and 17 operations are the Phase 2
+slice catalogued above. The 15-versus-20-versus-13 figures in the two phase reports were
+counted before the remediation pass and are superseded by this table; each report carries the
+correction in its own remediation section rather than being quietly edited.
 
 ### Route order is load-bearing
 
@@ -1186,10 +1289,10 @@ Note what the client receives on the duplicate: `409`,
 Backend tests live in `backend/tests/`. Run them from `backend/`:
 
 ```bash
-# all 2090 collected tests (needs the nexus_test database, created automatically)
+# the whole suite — 2270 collected (needs the nexus_test database, created automatically)
 python -m pytest
 
-# the 1011 database-free tests — 1079 deselected
+# the 1029 database-free tests — 1241 deselected
 python -m pytest -m "not integration"
 
 # one file
@@ -1250,25 +1353,82 @@ Conventions that the suite encodes:
   `pytest -m "not integration"` subset must pass with PostgreSQL stopped.
 - The schema under test comes from Alembic, never from `Base.metadata.create_all`
   — a schema built from the models would prove nothing about the migration.
-- Frontend: `npm test` from `frontend/` (607 tests, 42 files) runs Vitest with React
+- Frontend: `npm test` from `frontend/` (645 tests, 44 files) runs Vitest with React
   Testing Library; `npm run typecheck` and `npm run lint` must also be clean.
 
-**What is verified and what is not.** The 2090/1011 backend split and the frontend counts
-above were produced by running the suites in this repository against a **native
-PostgreSQL 16**, so the 1079 `integration` tests — repositories, sessions, RBAC,
-password reset, migrations, drift and the detailed-health endpoint — have all been
-executed rather than merely collected. `alembic upgrade head` runs as part of the
-integration fixtures, so the applied schema is exercised too. What has **not** been run
-here is `docker compose up`: Docker is not installed on this machine, so
-`docker-compose.yml` remains statically validated by `scripts/verify_compose.py` and
-nothing more. Nothing here claims otherwise.
+**What is verified and what is not.** The frontend figures above are a real pass count —
+`npm test` was run end to end during the final remediation pass and reports **44 files,
+645 tests, all passing**. The backend figures are **collection** counts, taken from
+`pytest --collect-only` in this repository, and are labelled that way on purpose: the last
+full run before this pass was 2136 passed / 9 failed, the nine were fixed by the engineers
+who own those files, and one full run is scheduled once the pass lands. Collection proves
+what the suite contains, not that it passes, and this document does not claim otherwise.
+
+What is **not** verified here is anything that needs a container. `docker compose up` has
+never been run: Docker is not installed in this environment, so `docker-compose.yml`
+remains statically validated by `scripts/verify_compose.py` and nothing more. The chain
+itself *is* exercised — `alembic upgrade head` is applied by the `test_database_url` fixture
+on every integration session and `test_migrations.py::test_autogenerate_reports_no_drift`
+compares the result with `Base.metadata`, which is the same comparison the `alembic check`
+command performs.
+
+---
+
+## Remediation pass over Phases 1–9
+
+The last thing that happened to this codebase before ML training was an audit, and it found
+real defects rather than cosmetic ones. Four engineers fixed them on disjoint files and the
+documentation was corrected to match. This section records what changed on the wire and in
+this document, so that a reader who trusts the rest of the file is not misled by an older
+paragraph they remember.
+
+### Wire changes a client can observe
+
+| Change | What it was | What it is now |
+| --- | --- | --- |
+| `GET /api/v1/analytics/projects` returns `Page[ProjectAnalyticsRead]` | A bare `ProjectAnalyticsRead[]` | The `meta`-nested envelope, joining the other fourteen `Page[T]` operations. A client that iterated the response directly must read `.items` |
+| `GET /api/v1/analytics/feature-snapshot` wraps its result | A bare mapping of feature columns, with no version key | `{schema_version: "analytics_features.v1", generated_at, task_id, features: {…}}` — the version sits **beside** the matrix, never inside it |
+| `GET /api/v1/developer/features` omits a never-scanned repository | A row of zeros for every registered repository | No row at all for a repository that has never been successfully scanned. A row that exists means the scan ran and found nothing, which is a measurement |
+| `PUT /api/v1/availability` is atomic | Delete-then-insert, committed separately: a payload the table refused left the user with **zero** rules | One transaction. A refused replace leaves the previous week completely intact |
+| A deadline sentence names the task's own `due_date` | `detected_at + deadline_in_hours`, two clocks summed, which lands a whole day late on any pass that begins before midnight and writes after it | The `due_date` column, read |
+| `429` is reachable | `rate_limited` was a reserved code with no implementation | `RateLimitMiddleware` answers 429 with the shared envelope. See [Rate limiting](#rate-limiting) |
+
+### Documentation corrections in this file
+
+- **`Page[T]` was documented as unserved.** It is served by fifteen operations, and the
+  frontend's `Paginated<T>` — which the file also called a mismatch — has carried the correct
+  `meta` nesting for some time and is consumed by every knowledge, planner and work service.
+  Both errors are gone.
+- **Operation counts were stale.** The file said 136 paths and 183 operations; the live
+  schema has **140 paths and 187 operations**. The per-prefix table under
+  [Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9) was rewritten
+  from `app.openapi()`.
+- **`rate_limited` was listed as a known gap.** It is implemented.
+- **The revocation-denylist bullet appeared twice**, identically, in the same list.
+- **Test counts were stale**: 2090/1011/1079 for the backend, 607 in 42 files for the
+  frontend. See [Testing an endpoint](#testing-an-endpoint).
+
+### Invariants this document now holds itself to
+
+`backend/tests/test_documentation_claims.py` reads these files and fails when a claim
+regresses: that every `Settings` field is documented in both `.env.example` and the README,
+that the stated `Page[T]` count matches a live count of `app.openapi()`, that the frontend
+`Paginated<T>` really does nest under `meta`, that `maintenance_activity` is not described
+as reading low when the shipped path reads at its ceiling, that the superseded figures above
+are absent, and that the four productivity weights are documented as a start-up gate. A
+number in prose with nothing checking it is a number that drifts; these are the ones that had
+drifted.
 
 ---
 
 ## Known gaps
 
-The first six of these are Phase 2 omissions and none of them was closed by Phases 3–9.
-Read them alongside [Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9),
+The first five of these are Phase 2 omissions, and none of them was closed by Phases 3–9.
+Two more that used to sit in this list — the claim that `rate_limited` had no producer, and
+the claim that the frontend's `Paginated<T>` disagreed with the backend's `Page[T]` — were
+**false**, not open, and the [Remediation pass](#remediation-pass-over-phases-19) removed
+them. Read what is left
+alongside [Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9),
 which records what the later phases added:
 
 - **Error responses are absent from the OpenAPI schema.** Operations declare only
@@ -1288,28 +1448,13 @@ which records what the later phases added:
   for exotic numeric characters (`\p{Nd}` vs Python's `str.isdigit()`). Documented
   in [Password policy](#password-policy); the divergence is one-way and harmless,
   because the server is the only authority.
-- **`rate_limited` is a reserved code with no implementation.** There is no rate
-  limiter, so nothing can return 429 — which also means the password-reset
-  endpoint is not rate-limited, and is protected from enumeration by returning an
-  identical body rather than by throttling. `bad_request` is likewise never
-  raised deliberately, but it is *reachable*: `_status_code_to_code` returns it
-  for any unmapped 4xx, so it is the code a 413 or 415 will carry.
+- **The rate limiter's counters are in-process** — a fixed window held in memory,
+  so a restart resets every budget and N workers each enforce their own. It is a
+  backstop against a runaway or parallelised client, not a distributed quota. See
+  [Rate limiting](#rate-limiting).
 - **`Message` is declared but unserved.** No endpoint returns it. (`Page[T]` *is*
-  served — by fourteen operations across the Phase 3–5 routers. The Phases 7–9 routers
-  return their own flat list envelopes instead; see the note under
-  [Pagination](#pagination).)
-- **`frontend/src/types/pagination.ts` disagrees with the backend envelope, and
-  the frontend type is the side that is wrong.** It still declares a flat
-  `Paginated<T>` — `{items, total, limit, offset}` — while `Page[T]` in
-  `backend/app/schemas/common.py` nests the counters under `meta`
-  (`{items, meta: {total, limit, offset}}`), as shown above. The backend shape
-  is the intended contract; the TypeScript interface needs the `meta` wrapper
-  before the first list endpoint exists. Nothing is broken today *only* because
-  no endpoint serves `Page[T]` yet — the two cannot be compared at runtime, so
-  the mismatch is invisible until the first paginated endpoint lands. Fix the
-  type then, or before, and re-check both sides against this section.
-- **The revocation denylist is in-process** — not restart-durable, not shared
-  between workers.
+  served — by fifteen operations. The Phases 7–9 routers return their own flat
+  list envelopes instead; see the note under [Pagination](#pagination).)
 - **No idempotency keys, no ETags, no cursor pagination, no bulk endpoints.** The
   first two phases do not need them; add them as real use cases appear rather than
   as speculative machinery.
@@ -1318,3 +1463,7 @@ which records what the later phases added:
   `environment`, `version` and uptime and nothing else.
 - **There is no audit-trail endpoint.** Rows are written and never read by the
   API. Nothing in the product surfaces them yet.
+
+> `bad_request` is never raised deliberately, but it is *reachable*:
+> `_status_code_to_code` returns it for any unmapped 4xx, so it is the code a 413 or
+> 415 will carry.
