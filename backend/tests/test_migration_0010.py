@@ -63,7 +63,7 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -436,11 +436,54 @@ async def test_the_activity_feed_read_is_served_by_the_owner_created_index(engin
     and the sort column has to be second, and it is *not* unique, because two
     events may share an instant. Second, the planner **reaches for it** on the
     feed's own statement, compiled from the same ORM expression the repository
-    uses. Sequential scans are disabled for that probe because the table is empty
-    in this session and the cost model would otherwise answer a question about the
-    fixture rather than about the schema: the claim is that an index scan is
-    *available* for this ordering, not that it is cheapest on a table of no rows.
+    uses. Sequential scans are disabled for that probe as well, so the claim is
+    about *which index* answers the ordering rather than about a table scan.
+
+    **The second claim is only meaningful over a table with some history in it.**
+    An earlier version of this test ran against a near-empty table and asserted
+    the planner picked the composite index; it did not, and it was right not to --
+    with one row the single-column index returns that row already in order, so the
+    composite ordering is worth nothing and the planner correctly prefers the
+    cheaper path. That is a fact about the fixture, not about the schema. The
+    table is therefore seeded with enough events for the sort the composite index
+    eliminates to actually cost something, which is the only regime in which "the
+    feed is served by this index" is a claim about the schema at all.
     """
+    account = uuid.UUID(int=1)
+    async with engine.begin() as seed:
+        # The feed is foreign-keyed to an account, so the history needs one.
+        await seed.execute(
+            text(
+                "INSERT INTO users (id, username, email, hashed_password, role, is_active)"
+                " VALUES (:id, :username, :email, :pw, :role, true)"
+            ),
+            {
+                "id": account,
+                "username": "indexprobe",
+                "email": "indexprobe@example.invalid",
+                "pw": "not-a-real-hash",
+                "role": "user",
+            },
+        )
+        await seed.execute(
+            insert(ActivityLog),
+            [
+                {
+                    "id": uuid.UUID(int=1_000_000 + offset),
+                    "user_id": account,
+                    "event_type": "task_created",
+                    "metadata": {},
+                    "created_at": datetime(2019, 1, 1, tzinfo=UTC) + timedelta(seconds=offset),
+                }
+                for offset in range(2_000)
+            ],
+        )
+        # Bulk-loaded rows leave the planner's statistics stale, so without this it
+        # still believes the table holds only the row the fixture made and keeps
+        # choosing on that belief. The EXPLAIN would then be a statement about the
+        # statistics rather than about the schema.
+        await seed.execute(text("ANALYZE activity_events"))
+
     async with engine.connect() as connection:
         definitions = (
             (
@@ -465,7 +508,7 @@ async def test_the_activity_feed_read_is_served_by_the_owner_created_index(engin
         # the repository's ordering shows up here as a failing name.
         page = (
             select(ActivityLog.id, ActivityLog.user_id, ActivityLog.created_at)
-            .where(ActivityLog.user_id == uuid.UUID(int=1))
+            .where(ActivityLog.user_id == account)
             .order_by(ActivityLog.created_at.desc(), ActivityLog.id.desc())
             .limit(20)
         )

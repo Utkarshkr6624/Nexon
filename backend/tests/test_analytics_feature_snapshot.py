@@ -183,15 +183,22 @@ async def test_a_bare_row_and_a_fully_measured_row_carry_the_same_version(db_ses
     )
     await seed.work_session(day=DAY, minutes=45, task_id=measured.id, start_hour=14)
 
-    bare_row = await service.feature_snapshot(owner=owner, task_id=bare.id)
-    measured_row = await service.feature_snapshot(owner=owner, task_id=measured.id)
+    bare_snapshot = await service.feature_snapshot(owner=owner, task_id=bare.id)
+    measured_snapshot = await service.feature_snapshot(owner=owner, task_id=measured.id)
 
     assert (
-        bare_row["schema_version"]
-        == measured_row["schema_version"]
+        bare_snapshot["schema_version"]
+        == measured_snapshot["schema_version"]
         == ANALYTICS_FEATURE_SCHEMA_VERSION
     )
+    # The *matrix* is what a feature row is built from, so its keys are what must
+    # be stable. The wrapper's metadata is compared separately below.
+    bare_row = bare_snapshot["features"]
+    measured_row = measured_snapshot["features"]
     assert list(bare_row) == list(measured_row)
+    assert bare_snapshot["task_id"] == str(bare.id)
+    assert measured_snapshot["task_id"] == str(measured.id)
+    assert bare_snapshot["generated_at"] == measured_snapshot["generated_at"]
     # The rows really are different, so the assertion above is not vacuous.
     assert bare_row["estimated_minutes"] is None
     assert measured_row["estimated_minutes"] == 60
@@ -220,7 +227,7 @@ async def test_a_task_with_no_due_date_reports_no_deadline_weekday(db_session):
     assert created.weekday() == 4, "the fixture must land on a Friday for this to prove anything"
     task = await seed.task(project_id=project.id, created_at=at(created))
 
-    snapshot = await service.feature_snapshot(owner=owner, task_id=task.id)
+    snapshot = (await service.feature_snapshot(owner=owner, task_id=task.id))["features"]
 
     assert snapshot["day_of_week"] is None
     # ...and the absence is a matched pair, not a hole in one column only.
@@ -243,7 +250,7 @@ async def test_a_task_with_a_due_date_reports_the_weekday_of_that_deadline(db_se
     assert DAY.weekday() == 0, "the anchor must be a Monday, or the two are indistinguishable"
     task = await seed.task(project_id=project.id, created_at=at(DAY), due_date=due)
 
-    snapshot = await service.feature_snapshot(owner=owner, task_id=task.id)
+    snapshot = (await service.feature_snapshot(owner=owner, task_id=task.id))["features"]
 
     assert snapshot["day_of_week"] == 2
     assert snapshot["deadline_distance_days"] == (due - await db_today(db_session)).days

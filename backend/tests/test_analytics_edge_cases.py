@@ -448,7 +448,7 @@ async def test_the_read_only_routes_report_the_empty_shape_not_a_zero_score(clie
 
     series = await _get(client, auth, "/api/v1/analytics/series")
     trends = await _get(client, auth, "/api/v1/analytics/trends")
-    projects = await _get(client, auth, "/api/v1/analytics/projects")
+    projects = (await _get(client, auth, "/api/v1/analytics/projects"))["items"]
 
     # "Never been aggregated" is not "aggregated and found nothing".
     assert series == []
@@ -856,7 +856,7 @@ async def test_a_project_with_no_tasks_leaves_the_whole_surface_unavailable(clie
     project = await seed.project(name="Vacant")
     await _rebuild(client, auth)
 
-    projects = await _get(client, auth, "/api/v1/analytics/projects")
+    projects = (await _get(client, auth, "/api/v1/analytics/projects"))["items"]
     assert [entry["project_id"] for entry in projects] == [str(project.id)]
     vacant = projects[0]
     assert vacant["total_tasks"] == 0
@@ -1453,7 +1453,7 @@ async def test_an_in_progress_task_with_tracked_time_still_counts_that_time(clie
     assert tasks["completion_rate"] == 0.0
     assert tasks["overdue_rate"] == 0.0
 
-    projects = await _get(client, auth, "/api/v1/analytics/projects")
+    projects = (await _get(client, auth, "/api/v1/analytics/projects"))["items"]
     entry = projects[0]
     assert entry["total_tasks"] == 1
     assert entry["completed_tasks"] == 0
@@ -1527,7 +1527,7 @@ async def test_task_minutes_with_no_session_are_never_counted_as_worked_time(cli
     assert focus["available"] is False
     assert focus["total_minutes"] == 0
 
-    projects = await _get(client, auth, "/api/v1/analytics/projects")
+    projects = (await _get(client, auth, "/api/v1/analytics/projects"))["items"]
     entry = projects[0]
     # The task's own total, and the time demonstrably spent, side by side.
     assert entry["actual_minutes"] == 90
@@ -1587,7 +1587,7 @@ async def test_deleting_a_project_mid_window_leaves_no_orphans_and_no_server_err
     # Before the delete the window really does carry both projects, so the
     # assertions after it cannot pass because the fixture was empty.
     before = await client.get("/api/v1/analytics/projects", params=window, headers=auth)
-    assert {entry["name"] for entry in before.json()} == {"Doomed", "Kept"}
+    assert {entry["name"] for entry in before.json()["items"]} == {"Doomed", "Kept"}
     before_totals = await client.get("/api/v1/analytics/overview", params=window, headers=auth)
     before_actual = {point["label"]: point["current"] for point in before_totals.json()["totals"]}
     assert before_actual["actual_minutes"] == 90.0
@@ -1602,9 +1602,9 @@ async def test_deleting_a_project_mid_window_leaves_no_orphans_and_no_server_err
         assert response.status_code in (200, 202), f"{path}: {response.text}"
 
     projects = await client.get("/api/v1/analytics/projects", params=window, headers=auth)
-    assert [entry["project_id"] for entry in projects.json()] == [str(kept.id)]
-    assert projects.json()[0]["name"] == "Kept"
-    assert projects.json()[0]["total_tasks"] == 1
+    assert [entry["project_id"] for entry in projects.json()["items"]] == [str(kept.id)]
+    assert projects.json()["items"][0]["name"] == "Kept"
+    assert projects.json()["items"][0]["total_tasks"] == 1
 
     tasks = await client.get("/api/v1/analytics/tasks", params=window, headers=auth)
     assert tasks.json()["total_tasks"] == 1
@@ -1708,7 +1708,7 @@ async def test_deleting_a_task_removes_it_from_every_figure_without_a_server_err
     assert time_view["available"] is False
     assert time_view["total_minutes"] == 0
 
-    projects = await _get(client, auth, "/api/v1/analytics/projects")
+    projects = (await _get(client, auth, "/api/v1/analytics/projects"))["items"]
     assert projects[0]["total_tasks"] == 1
     assert projects[0]["work_minutes"] == 0
 

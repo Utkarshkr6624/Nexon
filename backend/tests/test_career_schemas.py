@@ -599,9 +599,7 @@ def test_the_evidence_dedup_is_the_only_uniqueness_on_the_table():
     not enforce what its name promised, and the index that can is invisible to a
     reader scanning ``constraints`` for a ``UNIQUE``.
     """
-    uniques = {
-        index.name for index in CareerEvidence.__table__.indexes if index.unique
-    }
+    uniques = {index.name for index in CareerEvidence.__table__.indexes if index.unique}
 
     assert uniques == {"uq_career_evidence_source_identity"}
 
