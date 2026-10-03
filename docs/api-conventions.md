@@ -4,10 +4,14 @@ The contract every NEXUS endpoint follows, and the rules a new endpoint must obe
 `README.md` covers how to *start* the stack; this document covers what the API
 looks like once it is running.
 
-**Status.** Phase 2 (identity, sessions and security). **16 paths and 17 operations**
-exist, described in [Endpoint catalogue](#endpoint-catalogue). Everything about the modules
-(Projects, Planner, Knowledge, Search, Analytics, …) is still a frontend placeholder —
-there is no module API yet, and the conventions below are the shape it will take.
+**Status.** The conventions below are the contract the whole API follows, and they were
+established by the Phase 2 identity slice — **16 paths and 17 operations** — which is
+described in full in the [Endpoint catalogue](#endpoint-catalogue). Phases 3 through 9
+added 166 further operations across 19 routers. The catalogue has **not** been extended
+to cover them; their per-module inventories live in the phase reports, and the
+conventions those phases established that were not already written down are in
+[Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9). Three
+modules — Search, AI Assistant and Experiments — still have no API at all.
 
 ---
 
@@ -24,12 +28,13 @@ there is no module API yet, and the conventions below are the shape it will take
 - [Authentication](#authentication) | Tokens, sessions, the password policy, permissions, password reset |
 - [CORS and response headers](#cors-and-response-headers)
 - [Pagination](#pagination)
+- [Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9) | Route order, page-size caps as rejections, partial PATCH, one-producer stamps, unmodifiable identity columns, null-not-zero |
 - [Health semantics](#health-semantics)
 - [The client contract](#the-client-contract) | `ApiClient`, the services layer, the wire types, the codes only the client manufactures |
 - [Checklist for a new endpoint](#checklist-for-a-new-endpoint) | The rules a new route must satisfy |
 - [Worked example — the shape a future endpoint takes](#worked-example--the-shape-a-future-endpoint-takes)
 - [Testing an endpoint](#testing-an-endpoint)
-- [Known gaps](#known-gaps) | Deliberate omissions as of Phase 2 |
+- [Known gaps](#known-gaps) | Deliberate omissions: what Phase 2 left open and what the later phases left open |
 
 ---
 
@@ -80,7 +85,13 @@ README's troubleshooting section.
 
 ## Endpoint catalogue
 
-Everything the API serves today. Nothing else responds.
+**The Phase 2 slice.** Health, auth and users — 17 operations across 16 paths, and the
+part of the API this document inventories route by route. The API as a whole serves 136
+paths and 183 operations; the other 166 operations belong to the modules Phases 3 through 9
+added (projects, tasks, tags, activity, calendar, work sessions, planner, availability,
+knowledge, analytics, developer, risks, recommendations, intelligence, learning, career)
+and are catalogued in the phase reports. Everything here still applies to every one of
+them unchanged.
 
 ### Unauthenticated
 
@@ -160,10 +171,11 @@ exists to prevent.
 Taken from the generated OpenAPI document:
 
 - The security scheme is `HTTPBearer` (`type: http`, `scheme: bearer`,
-  description "JWT access token"), so Swagger UI offers an **Authorize** button. Every
-  route except `/`, `/health`, `/api/v1/health`, `register`, `login`, `refresh`,
-  `password/forgot` and `password/reset` carries `security: [{"HTTPBearer": []}]`;
-  `logout`'s parameter is optional.
+  description "JWT access token"), so Swagger UI offers an **Authorize** button. In the
+  Phase 2 slice every route except `/`, `/health`, `/api/v1/health`, `register`,
+  `login`, `refresh`, `password/forgot` and `password/reset` carries
+  `security: [{"HTTPBearer": []}]`; `logout`'s parameter is optional. Every module
+  router added in Phases 3–9 requires the bearer scheme on all of its routes.
 - **Error responses are not declared in the OpenAPI schema.** An operation lists
   only its 2xx (plus 422 where Pydantic validation applies). A 401/404/409 raised
   at runtime is documented here and in the Swagger description banner, not in the
@@ -338,7 +350,8 @@ rest resolve through `_status_code_to_code`:
 | `rate_limited` | 429 | Reserved — no rate limiting is implemented | — |
 | `internal_error` | 500 | `NexusError` default, `StarletteHTTPException` 5xx, the catch-all handler | Unexpected failure; the client is told nothing |
 
-The code table is unchanged by Phase 2 — a new feature never needed a new code. What
+The code table is unchanged by Phase 2 — and by Phases 3 through 9, which added 166
+operations without needing a tenth code. A new feature never needed a new code. What
 changed is **which situations produce the existing ones**, and one of them is a rule worth
 stating on its own:
 
@@ -609,10 +622,11 @@ error carries `WWW-Authenticate: Bearer`.
 
 ### Permissions
 
-`app/core/permissions.py` defines a `Permission` StrEnum — `users.read`,
-`users.write`, `projects.read`, `projects.write`, `tasks.read`, `tasks.write`,
-`analytics.read` — a `ROLE_PERMISSIONS` map, and a `require_permission()`
-dependency factory. A protected route declares the capability it is guarding:
+`app/core/permissions.py` defines a `Permission` StrEnum of **eleven** capabilities —
+`users.read`, `users.write`, `projects.read`, `projects.write`, `tasks.read`, `tasks.write`,
+`analytics.read`, `calendar.read`, `calendar.write`, `knowledge.read`, `knowledge.write` —
+a `ROLE_PERMISSIONS` map, and a `require_permission()` dependency factory. A protected
+route declares the capability it is guarding:
 
 ```python
 @router.patch(
@@ -715,9 +729,24 @@ path. Either works; set the variable to `/api/v1` to go through the proxy.
 ## Pagination
 
 `Page[T]` and `PageMeta` in `backend/app/schemas/common.py` are the reserved
-envelope for the list endpoints of later phases. **No endpoint serves it yet** —
-the catalogue above is the complete set, and none of it paginates. That includes
-`GET /api/v1/users/`, which returns a bare array precisely because it is a
+envelope for the list endpoints.
+
+> **Two shapes are in use, and the field names are the same in both — only the nesting
+> differs.**
+>
+> - **`Page[T]`, the `meta`-nested shape below, is served by fourteen operations** across
+>   the `calendar`, `knowledge`, `projects`, `tags`, `tasks` and `work_sessions` routers
+>   (Phases 3–5).
+> - **A flat typed list response — `items`, `total`, `limit`, `offset` and a tally
+>   beside them (`by_status`, `by_type`, `by_kind`, `by_level_source`) — is served by
+>   twelve further operations** in the `developer`, `learning`, `career`, `risks` and
+>   `recommendations` routers (Phases 7–9). Their schemas are named after the tally, not
+>   after `Page`, and they carry no `meta` key.
+>
+> A client written against one shape will silently read `undefined` out of the other, so
+> check which shape the route returns before consuming it. The rules below govern both.
+
+`GET /api/v1/users/` does return a bare array, precisely because it is a
 permission fixture and not a product surface.
 
 ```json
@@ -747,9 +776,192 @@ Rules for the endpoints that adopt it:
 
 `Message` (a `{"message": "…"}` acknowledgement body) is declared in the same
 module for endpoints that acknowledge an action and have nothing else to return.
-It is unused: every action-only endpoint in the catalogue — `logout`,
+It is still unused: every action-only endpoint in the catalogue — `logout`,
 `logout-all`, session revoke, password change, password reset, account deletion —
 returns `204` instead, which is the stronger signal. Prefer `204`.
+
+---
+
+## Conventions from Phase 8 and Phase 9
+
+Phases 3–9 added 166 operations that are **not** in the catalogue above, which was last
+revised for Phase 2. Rather than restate a catalogue that is already behind, this section
+records the conventions those phases established that are *not* already written down
+somewhere in this document. Everything else — the envelope, the code table, `404` over
+`403` — still applies unchanged.
+
+| Subsystem | Routes | Report |
+| --- | --- | --- |
+| Projects, tasks, tags, activity (Phase 3) | `/projects/*`, `/tasks/*`, `/tags/*`, `/activity/*` | — |
+| Planner, calendar, work sessions, availability (Phase 4) | `/planner/*`, `/calendar/*`, `/work-sessions/*`, `/availability/*` | — |
+| Knowledge (Phase 5) | `/knowledge/*` | — |
+| Analytics (Phase 6) | `/analytics/*` | — |
+| Risk and recommendations (Phase 7) | `/risks/*`, `/recommendations/*`, `/intelligence/*` | [`phase-7-report.md`](specifications/phase-7-report.md) |
+| Developer (Phase 8) | 15 under `/developer` | [`phase-8-developer-report.md`](specifications/phase-8-developer-report.md) |
+| Learning and career (Phase 9) | 20 under `/learning`, 13 under `/career` | [`phase-9-learning-career-report.md`](specifications/phase-9-learning-career-report.md) |
+
+Operation counts for the Phases 3–7 rows were read off the generated OpenAPI document:
+11 under `/projects`, 15 under `/tasks`, 5 under `/tags`, 2 under `/activity`, 5 under
+`/planner`, 5 under `/calendar`, 7 under `/work-sessions`, 2 under `/availability`, 37
+under `/knowledge`, 18 under `/analytics`, 6 under `/risks`, 6 under `/recommendations`
+and 2 under `/intelligence`. The Phase 8 and 9 figures above are the ones their own phase
+reports state.
+
+### Route order is load-bearing
+
+**Declare every literal sub-path above every parameterised one.** Starlette matches routes
+in registration order and does not prefer a literal segment over a parameter. Were
+`GET /developer/repositories/{repository_id}` registered above `/developer/summary`, the
+literal string `summary` would bind to the path parameter, fail its uuid conversion, and
+answer with a 422 about an id that never existed — while the dashboard tile quietly lost its
+data.
+
+There is no `Path` annotation that fixes this and no path-conversion trick; the order is
+the entire mechanism. A test asserts it by hitting the literal route and checking for a
+field only it returns.
+
+The literal sub-paths today: `/summary`, `/metrics`, `/gaps`, `/activity`, `/features`,
+`/goals`, `/skills`, `/profile`, `/experience`, `/evidence`, `/recommendations`,
+`/repositories`, `/projects`, `/commits`.
+
+### A page-size cap is a rejection, not a truncation
+
+`?limit=500` is a **422**, not a silent 200 carrying 200 rows. A caller that asked for 500
+and received 200 cannot tell a truncated page from a page that was always 200 rows long,
+and a silent clip is the failure the [Pagination](#pagination) section exists to prevent.
+
+The ceiling is `MAX_PAGE_SIZE = 200` and it is **the same number the repository clamps to**.
+A smaller constant on the route would make a legal request look refused for a reason the
+client cannot discover; a larger one would only be clipped silently further down.
+
+`limit` and `offset` are `ge=1` / `ge=0`, and every filter narrows `total` as well as
+`items` — which is why filtering lives on the server. A client-side filter can only see the
+rows the current page happens to carry, so it can neither count a band nor offer a pager for
+one.
+
+### PATCH is a partial edit, applied with `exclude_unset=True`
+
+Every `PATCH` in these phases applies its body as
+`payload.model_dump(exclude_unset=True)`. `None` means "write SQL NULL" downstream, so
+dumping the whole model would clear the description, the project link and the target skill
+of any caller who only meant to rename something.
+
+An omitted key leaves the column alone; an explicit `null` clears it. That is the only
+reading under which a PATCH can both leave a description alone and blank it.
+
+### An immutable stamp has exactly one producer
+
+`LearningGoal.completed_at` is absent from `LearningGoalUpdate` and is written only by
+`POST /learning/goals/{id}/complete`, which sets the status, stamps the timestamp and raises
+progress to 100 in one call **because they are one fact**. The instant comes from the
+**database** clock (`SELECT now()`), not from the request body, because the server's clock is
+not evidence of when the user finished and a body could carry any instant at all.
+
+`CareerEvidence.occurred_on` is the same idea from the other direction: it is required on
+create, and an explicit `occurred_on: null` on patch is **refused** rather than stored. The
+placeholder that would make undated evidence renderable would be a date the user never gave.
+
+### An identity column is not editable
+
+Fields that are part of a row's identity, or that only the system can measure, are **absent
+from the `PATCH` payload**, and each absence is a rule:
+
+| Field | Route that omits it | Why |
+| --- | --- | --- |
+| `local_path` | `PATCH /developer/repositories/{id}` | the row's identity, and the one field checked against the filesystem. Moving it would leave the counters, the commit range and the recorded history describing a directory this account never scanned |
+| `primary_language` | same | measured by the scan, not typed by a person |
+| `source`, `project_id`, `skill_id`, `repository_id` | `PATCH /career/evidence/{id}` | provenance is part of the row's uniqueness key. Re-pointing it would let a rename become a second record. The person is allowed to be wrong about *what* they wrote, and not about *where it came from* |
+| `evidence_count`, `last_activity_at`, `confidence`, `level_source` | `PATCH /learning/skills/{id}` | the first two are NEXUS's own observations — a PATCH that could move them would let a skill claim six recorded sessions that do not exist, which the gap read would then quote as the evidence behind a level. The last two would let a client file its own inference as a self-assessment |
+| `completed_at` | `PATCH /learning/goals/{id}` | see the one-producer rule above |
+
+Unknown fields are **refused rather than dropped**, so "that field is not editable here" is a
+422 naming the field rather than a cheerful 200 that discarded it.
+
+### A write route returns the field the user must not set
+
+Where a value is only ever derived by the system, the route sets it server-side and the
+payload cannot override it. `POST /learning/skills` writes `level_source='user_defined'`
+**unconditionally**, so a client cannot create a skill already carrying a `system_estimate`
+whose evidence has not been recorded yet. Sending `current_level` on a `PATCH`
+re-records the source as `user_defined`, because the person is the one making the claim now.
+
+### Null, not zero — and a measured zero is a different answer
+
+This is the rule these two phases add to the rest of the document, and it applies to every
+figure that could not be computed:
+
+| Situation | Wire | Screen |
+| --- | --- | --- |
+| A real measured zero | `0` | `0` |
+| Could not be computed | `null`, with a reason where one exists | `—` |
+| Insufficient data | `available: false`, `value: null`, a sentence saying why | *"Not enough data yet."* |
+
+Applies to `/learning/features`, `/career/features`, `/developer/features` (the schema
+versions `learning_features.v1`, `career_features.v1`, `developer_features.v1`),
+`learning_minutes` on `/learning/summary`, `project_activity` on `/career/features` (null
+until a repository has been scanned), and `repository_age_days` / `inactivity_days` on
+`/developer/features`.
+
+The rationale is the same in both directions: inside a training matrix a fabricated zero is
+indistinguishable from an observed one once it reaches a trainer, and a `0` on screen reads
+as a finding about the account rather than as an absence to explain.
+
+### A read that can answer "I have none" is a 200
+
+`GET /career/profile` answers **200 with a `null` body** for an account that has never written
+one. Every other row in the API is addressed by an id the caller supplied, so a miss is a
+404; the profile is addressed by nothing, and "you have not written one yet" is a state the
+UI has to render rather than an absence it has to explain.
+
+The service is never asked to fill the gap. A generated profile, a stub headline or a
+placeholder summary would be the first career row NEXUS wrote.
+
+Contrast: `/learning/summary`, `/career/summary` and `/developer/summary` answer 200 with
+zeroes and `has_data: false` for an empty account. The flag is what tells a client to explain
+an absence instead of rendering a dashboard of zeroes as a finding.
+
+### A failed read is 200 with a status, not an exception
+
+`POST /developer/repositories/{id}/scan` answers **200 whether the read worked or not**, with
+`status: 'error'` and a human sentence in `error`. There is no background scheduler in NEXUS,
+so this call *is* the scan; a repository that cannot be read is a completed attempt that
+failed. No code path on that router produces a 500 for a bad directory.
+
+### Dense series, and a service-owned window ceiling
+
+- **Activity series are dense.** A quiet Tuesday arrives carrying `commits: 0` rather than
+  being skipped, because a series that omits empty buckets compresses the timeline and makes
+  a sparse fortnight read as dense as a busy one — a misreading of the data, not a
+  presentational choice, and one a reader counting the bars cannot detect.
+- **Only the lower bound of `window_days` is declared on the route.** The ceiling is a
+  setting the service owns (`developer_max_window_days`, `learning_max_window_days`), and a
+  constant in the router would answer 422 against a limit the deployment has raised.
+- **`window_days` omitted is not the same request as a default one.** It asks the server for
+  `*_default_window_days` rather than for a figure the router invented, and the response
+  carries `window_days` back so any sentence a client writes about the figures can name the
+  range.
+- **Granularity omitted asks the server** for its configured default, and an unrecognised
+  value is refused rather than guessed at.
+
+### `analytics.read` guards the writes too
+
+`analytics.read` is what the later module routers use for writes too. Developer, Learning
+and Career take no capability of their own, and `Permission` gained no member in Phases 8
+or 9 — `tests/test_permissions.py` asserts the complete set. Registering a repository,
+writing a goal and entering a certification are all the caller answering a question about
+rows derived from their own record, so the capability that admits the reading already
+admits the answering. A new permission would be granted to exactly the roles
+`analytics.read` already covers — the role table has no entry for either — while adding a
+member the permission test asserts the complete set of.
+
+This is a deliberate decision, not an oversight, and it is worth stating as one.
+
+### Everything stays 404 over 403
+
+No route in either phase takes a user id — not as a path segment, not as a query parameter,
+not in a body. Every read and write resolves its row through an owner-scoped lookup, so
+another account's row is **404, never 403**, identically to an id nobody ever issued. See
+[Ownership answers 404](#ownership-answers-404-not-403).
 
 ---
 
@@ -862,7 +1074,10 @@ Schemas (`app/schemas/<module>.py`):
 - [ ] `…Read` uses `ConfigDict(from_attributes=True)`; no secret field appears.
 - [ ] Constraints live here, so an invalid payload is a 422 with field details.
 - [ ] Nullable fields default to `None` and are always serialised.
-- [ ] List endpoints return `Page[ItemRead]`, not a bare array.
+- [ ] List endpoints return a list envelope, not a bare array — and the one they
+      return is the one that router's neighbours return. Phases 3–5 return
+      `Page[ItemRead]` (counters nested under `meta`); Phases 7–9 return a flat typed
+      list response. See [Pagination](#pagination).
 
 Cross-cutting:
 
@@ -891,10 +1106,12 @@ Cross-cutting:
 
 ## Worked example — the shape a future endpoint takes
 
-**Not implemented.** Projects are the next module to arrive; this is the pattern a
-first list/create pair would follow, written against the real imports and the real
-conventions. A route that gates on a capability adds one line to the decorator —
-`dependencies=[Depends(require_permission(Permission.PROJECTS_WRITE))]` — and
+**Written before Projects shipped, and kept as the pattern rather than as a claim.** The
+code below is a worked slice — model, schema, repository, service, provider, router —
+written against the real imports and the real conventions. Projects exists today, so read
+this as the shape of the *next* module: the three still without a backend are Search, AI
+Assistant and Experiments. A route that gates on a capability adds one line to the
+decorator — `dependencies=[Depends(require_permission(Permission.PROJECTS_WRITE))]` — and
 nothing else in the slice changes.
 
 Router:
@@ -969,10 +1186,10 @@ Note what the client receives on the duplicate: `409`,
 Backend tests live in `backend/tests/`. Run them from `backend/`:
 
 ```bash
-# all 499 collected tests (needs the nexus_test database, created automatically)
+# all 2090 collected tests (needs the nexus_test database, created automatically)
 python -m pytest
 
-# the 366 database-free tests — 133 deselected
+# the 1011 database-free tests — 1079 deselected
 python -m pytest -m "not integration"
 
 # one file
@@ -1033,21 +1250,26 @@ Conventions that the suite encodes:
   `pytest -m "not integration"` subset must pass with PostgreSQL stopped.
 - The schema under test comes from Alembic, never from `Base.metadata.create_all`
   — a schema built from the models would prove nothing about the migration.
-- Frontend: `npm test` from `frontend/` (134 tests, 22 files) runs Vitest with React
+- Frontend: `npm test` from `frontend/` (607 tests, 42 files) runs Vitest with React
   Testing Library; `npm run typecheck` and `npm run lint` must also be clean.
 
-**What is verified and what is not.** The 366/499 backend split and the frontend
-counts above were produced by running the suites; PostgreSQL was not available in
-that environment, so the 133 deselected `integration` tests have **not** been
-executed, and nothing in this document that requires a live database — the
-`nexus_test` creation path, the Alembic upgrade, or `docker-compose.yml` itself —
-has been run against a running server. Nothing here claims otherwise.
+**What is verified and what is not.** The 2090/1011 backend split and the frontend counts
+above were produced by running the suites in this repository against a **native
+PostgreSQL 16**, so the 1079 `integration` tests — repositories, sessions, RBAC,
+password reset, migrations, drift and the detailed-health endpoint — have all been
+executed rather than merely collected. `alembic upgrade head` runs as part of the
+integration fixtures, so the applied schema is exercised too. What has **not** been run
+here is `docker compose up`: Docker is not installed on this machine, so
+`docker-compose.yml` remains statically validated by `scripts/verify_compose.py` and
+nothing more. Nothing here claims otherwise.
 
 ---
 
 ## Known gaps
 
-Accurate as of Phase 2. Each is a deliberate omission, not a bug to route around:
+The first six of these are Phase 2 omissions and none of them was closed by Phases 3–9.
+Read them alongside [Conventions from Phase 8 and Phase 9](#conventions-from-phase-8-and-phase-9),
+which records what the later phases added:
 
 - **Error responses are absent from the OpenAPI schema.** Operations declare only
   their success codes, so Swagger UI does not render the envelope. Fix by adding
@@ -1072,8 +1294,10 @@ Accurate as of Phase 2. Each is a deliberate omission, not a bug to route around
   identical body rather than by throttling. `bad_request` is likewise never
   raised deliberately, but it is *reachable*: `_status_code_to_code` returns it
   for any unmapped 4xx, so it is the code a 413 or 415 will carry.
-- **`Page` and `Message` are declared but unserved.** No endpoint returns either
-  shape today.
+- **`Message` is declared but unserved.** No endpoint returns it. (`Page[T]` *is*
+  served — by fourteen operations across the Phase 3–5 routers. The Phases 7–9 routers
+  return their own flat list envelopes instead; see the note under
+  [Pagination](#pagination).)
 - **`frontend/src/types/pagination.ts` disagrees with the backend envelope, and
   the frontend type is the side that is wrong.** It still declares a flat
   `Paginated<T>` — `{items, total, limit, offset}` — while `Page[T]` in

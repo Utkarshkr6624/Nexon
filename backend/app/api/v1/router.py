@@ -10,9 +10,12 @@ from app.api.v1 import (
     auth,
     availability,
     calendar,
+    career,
+    developer,
     health,
     intelligence,
     knowledge,
+    learning,
     planner,
     projects,
     recommendations,
@@ -37,8 +40,11 @@ api_v1_router.include_router(planner.router)
 api_v1_router.include_router(availability.router)
 api_v1_router.include_router(knowledge.router)
 api_v1_router.include_router(analytics.router)
+api_v1_router.include_router(developer.router)
 api_v1_router.include_router(risks.router)
 api_v1_router.include_router(recommendations.router)
 api_v1_router.include_router(intelligence.router)
+api_v1_router.include_router(learning.router)
+api_v1_router.include_router(career.router)
 
 __all__ = ["api_v1_router"]

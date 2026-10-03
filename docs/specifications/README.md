@@ -14,7 +14,19 @@ fixed in one direction or the other, never left ambiguous.
 | [`phase-5-knowledge.md`](./phase-5-knowledge.md) | 5 | Knowledge Base, Notes, Resources & Knowledge Graph | ✅ Complete |
 | [`phase-6-analytics.md`](./phase-6-analytics.md) | 6 | Analytics & Intelligence Data Engine | ✅ Complete — [report](./phase-6-report.md) |
 | [`phase-7-risk-recommendations.md`](./phase-7-risk-recommendations.md) | 7 | Risk Detection & Recommendation Engine | ✅ Complete — [report](./phase-7-report.md) |
-| [`phase-8-9-developer-learning-career.md`](phase-8-9-developer-learning-career.md) | 8 + 9 | Developer Intelligence + Learning & Career Intelligence | 🔴 Not started |
+| [`phase-8-9-developer-learning-career.md`](phase-8-9-developer-learning-career.md) | 8 + 9 | Developer Intelligence + Learning & Career Intelligence | ✅ Complete — [Phase 8 report](./phase-8-developer-report.md) · [Phase 9 report](./phase-9-learning-career-report.md) |
+
+### Internal contracts
+
+These are the working contracts each phase was built against in parallel, one per
+implementation swarm. They are **superseded by the corresponding report** wherever the two
+disagree, and each disagreement is recorded in that report.
+
+| Contract | Phase | Covers |
+| --- | --- | --- |
+| [`phase-7-contracts.md`](./phase-7-contracts.md) | 7 | Scoring functions, the risk and recommendation schemas, the recommendation rules |
+| [`phase-8-developer-contracts.md`](./phase-8-developer-contracts.md) | 8 | The git engine boundary, the four git tables, the eight metrics, the feature vector |
+| [`phase-9-learning-career-contracts.md`](./phase-9-learning-career-contracts.md) | 9 | 🔴 The five enums, the six tables, `SkillGap`, the routers, the feature vectors |
 
 A phase is marked complete when its brief is implemented, the full suite is green, and the
 mandatory regression check in that brief has been run. Each completed phase has a report
@@ -55,9 +67,18 @@ Phases 8 and 9 branch from the trunk rather than following it:
 
 ```text
 Phase 8  Developer Intelligence ──┐
+   │      (local git history: commits, branches, changed lines)
+   │      → developer_features.v1
                                    ├──> Phase 10 (ML training)
 Phase 9  Learning & Career Int. ──┘
+          (goals, skills, gaps, career profile and evidence)
+          → learning_features.v1, career_features.v1
 ```
+
+Both phases produce **features**, not models: nothing is trained, loaded, served or
+registered. Each feature row is stamped with a schema version
+(`developer_features.v1`, `learning_features.v1`, `career_features.v1`) so a Phase 10
+trainer knows what every column meant without having to trust the client that ordered them.
 
 ## Standing rules that apply to every phase
 

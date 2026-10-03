@@ -1,21 +1,24 @@
 # NEXUS — Architecture
 
-Reference for the Phase 2 platform: the Phase 1 technical foundation plus identity,
-sessions and security. This document explains *how the system is put together and why*,
-and defers to [`../README.md`](../README.md) for installation, day-to-day commands and
-troubleshooting. Everything below was read from the code; where a number appears it came
-from the repository, not from intention. Where something could **not** be exercised here —
-which currently means anything needing a live PostgreSQL or a running container — that is
-said explicitly rather than glossed: see [What has not been run](#what-has-not-been-run).
+Reference for the platform: the Phase 1 technical foundation, the Phase 2 identity slice,
+and the modules Phases 3 through 9 put on top of them. This document explains *how the
+system is put together and why*, and defers to [`../README.md`](../README.md) for
+installation, day-to-day commands and troubleshooting. Everything below was read from the
+code; where a number appears it came from the repository, not from intention. Where
+something could **not** be exercised here — which currently means anything needing
+Docker — that is said explicitly rather than glossed: see
+[What has not been run](#what-has-not-been-run).
 
 **Scope.** Phase 1 delivered the platform skeleton and one working vertical slice
 (auth + `users` table). Phase 2 grew that slice into a real account system: persistent
 device sessions, a password policy, password recovery, role-based permissions, an audit
-trail, and the settings surface to drive them. Projects, Tasks, Planner, Knowledge, Search,
-Analytics, Developer, Learning, Career, AI Assistant and Experiments remain placeholder
-pages, and there is still **no module API at all** — every operation the backend serves
-belongs to auth, users or health. The modules are described here only as *seams* — see
-[Extension roadmap](#15-extension-roadmap).
+trail, and the settings surface to drive them. Phases 3 through 9 then made the module
+surface real — Projects and Tasks, Planner, Knowledge, Analytics, Risks and
+Recommendations, Developer, Learning and Career. Each has a router, a repository, a
+service, a migration and pages that read real rows. **Search, AI Assistant and
+Experiments remain placeholder pages** and have no API at all. Sections 1–16 were written
+against Phase 2 and still describe that slice where the text is phase-specific;
+§17 covers what the later phases added.
 
 ---
 
@@ -39,6 +42,7 @@ belongs to auth, users or health. The modules are described here only as *seams*
 | [14. Container topology](#14-container-topology) | Compose services and why they are wired that way |
 | [15. Extension roadmap](#15-extension-roadmap) | Named seams for later phases |
 | [16. Design decisions](#16-design-decisions) | Decision → rationale → cost |
+| [17. Developer, Learning and Career](#17-developer-learning-and-career) | The three subsystems Phase 8 and 9 added: git scanning, and two surfaces that describe a person |
 
 ---
 
@@ -158,7 +162,7 @@ outermost first.
 | 2 | `BodyCaptureMiddleware` | `app.add_middleware` — only when `LOG_REQUEST_BODY=true` | Buffers the ASGI body messages, publishes a capped copy on `scope["state"]`, replays them verbatim. |
 | 3 | `CORSMiddleware` | `app.add_middleware`, first | Preflight and header work. `X-Request-ID` is in `expose_headers`; credentials are allowed. |
 | 4 | `ServerErrorMiddleware` | Starlette, in `build_middleware_stack` | Catches anything escaping layer 5 and renders it through the catch-all handler. |
-| 5 | `ExceptionMiddleware` → router → dependencies | Starlette, in `build_middleware_stack` | Registered handlers, routing, `app/api/v1/router.py` (`health` + `auth` + `users`), mounted at `settings.api_v1_prefix`. |
+| 5 | `ExceptionMiddleware` → router → dependencies | Starlette, in `build_middleware_stack` | Registered handlers, routing, `app/api/v1/router.py` — which now mounts nineteen routers (`health`, `auth`, `users`, `projects`, `tasks`, `tags`, `activity`, `calendar`, `work_sessions`, `planner`, `availability`, `knowledge`, `analytics`, `developer`, `risks`, `recommendations`, `intelligence`, `learning`, `career`) — mounted at `settings.api_v1_prefix`. |
 
 `add_middleware` inserts outermost-last, which is why body capture ends up
 *outside* CORS: `create_app` adds CORS first and then, from inside
@@ -325,7 +329,9 @@ The Dashboard health card on the frontend polls `/api/v1/health` every 30 s with
 a 5 s `staleTime` (`frontend/src/features/health/use-health.ts`). In Phase 1 it
 was the only live data dependency in the shell; Phase 2 added the settings
 Sessions tab, which queries `/auth/sessions` on mount and after every mutation,
-and the account forms, which are mutation-only.
+and the account forms, which are mutation-only. Phases 3 through 9 made it one
+data dependency among many — every live module page now queries its own routes,
+and the health card is the only reader of `/api/v1/health`.
 
 ---
 
@@ -487,15 +493,23 @@ apart has learned something an attacker wants.
 
 ### Role-based access control
 
-`app/core/permissions.py` is the whole authorisation system: a `Permission` StrEnum,
-a `ROLE_PERMISSIONS` map, and a `require_permission()` factory.
+`app/core/permissions.py` is the whole authorisation system: a `Permission` StrEnum
+of **eleven** capabilities, a `ROLE_PERMISSIONS` map, and a `require_permission()`
+factory.
 
 ```python
 USERS_READ, USERS_WRITE,
 PROJECTS_READ, PROJECTS_WRITE,
 TASKS_READ, TASKS_WRITE,
-ANALYTICS_READ
+ANALYTICS_READ,
+CALENDAR_READ, CALENDAR_WRITE,      # Phase 4
+KNOWLEDGE_READ, KNOWLEDGE_WRITE,    # Phase 5
 ```
+
+Phases 8 and 9 added no member: Developer, Learning and Career are guarded by
+`analytics.read`, so there is no `developer.write`, `learning.write` or `career.write`
+whose grant would duplicate it. `tests/test_permissions.py` asserts the complete member
+set, so a new capability cannot be added without extending that test.
 
 A route names the **capability** it guards, never a role:
 
@@ -768,6 +782,16 @@ does the same.
 | `password_reset_tokens` | One row per outstanding reset request, single-use via `used_at` | `ON DELETE CASCADE` from `users` |
 | `audit_logs` | Append-only security trail, twelve event types | `ON DELETE SET NULL` from `users` — **the trail outlives the account** |
 
+Those four are the whole of the Phase 2 schema. Phases 3–9 added the module tables on
+top of them — `projects`, `tasks`, `tags`, `activities`, `planner_*`, `calendar_events`,
+`work_sessions`, `availability_*`, the `knowledge_*` family, the `analytics_*` family,
+`risks`, `recommendations`, the four `git_*` tables of `0008`, and the six
+learning/career tables of `0009`. Each revision's own docstring states its delete
+semantics; §17 covers the two that are product decisions rather than defaults.
+`tests/test_migrations.py::test_the_migration_built_every_table_in_the_metadata` asserts
+that every table in `Base.metadata` exists in the migrated schema, and
+`test_autogenerate_reports_no_drift` asserts the two agree completely.
+
 Two index decisions are worth stating because both are cases where the obvious
 index is the wrong one. `ix_sessions_user_id` is deliberately the *only* index on
 the session lookup path: both real queries — "list this user's live sessions" and
@@ -794,7 +818,10 @@ the column.
 | Scope | `include_object` restricts autogenerate to the `public` schema and excludes `alembic_version`, `spatial_ref_sys` |
 | Rendering | `render_item` emits `postgresql.UUID(as_uuid=True)` so generated migrations state the dialect explicitly |
 
-Current chain: two revisions, `0001_initial_create_users` → `0002_phase2_identity_sessions`.
+Current chain: **nine revisions**, one linear head, `0001_initial_create_users` →
+`0002_phase2_identity_sessions` → `0003_phase3_projects_tasks` → `0004_phase4_planner` →
+`0005_phase5_knowledge` → `0006_phase6_analytics` → `0007_phase7_intelligence` →
+`0008_phase8_developer_intelligence` → `0009_phase9_learning_career`.
 Models are deliberately **not** imported by migration files, so editing `app/models/`
 cannot rewrite history.
 
@@ -820,22 +847,22 @@ python -m alembic check                   # autogenerate drift check
 `alembic check` is the command for drift, and
 `backend/tests/test_migrations.py::test_autogenerate_reports_no_drift` asserts the
 same thing with `compare_type` and `compare_server_default` enabled, so drift is a
-test failure rather than a discovery. Neither can be *run* without a live
-PostgreSQL.
+test failure rather than a discovery. Both need a live PostgreSQL — `nexus_test` — and
+both now run against one: `alembic upgrade head` is applied by the `test_database_url`
+fixture on every integration session, and the whole suite is green.
 
 Two database-free checks exist, and they are not the same claim:
 
 - `test_migrations.py::test_the_migration_chain_is_linear_and_has_a_single_head`
   parses the version files and asserts the literal chain
-  `["0002", "0001"]` with head `0002`. It needs no database, and it does mean a new
-  revision comes with a one-line test update — a deliberate pin, not an oversight.
-- `tests/test_migration_ddl.py` renders `0001` and `0002` **offline** (`as_sql=True`
-  into a buffer), parses the emitted SQL and compares every `CREATE TABLE` column,
-  foreign key and index against `Base.metadata`. That is real evidence that *the DDL
-  the migrations emit and the DDL the models describe are the same schema* — and it
-  is **not** the same as having applied them. Nothing about the live schema is
-  asserted, and `alembic upgrade head` has never been run against a database in the
-  environment this document was written in.
+  `["0009", "0008", …, "0001"]` with head `0009`. It needs no database, and it does mean
+  a new revision comes with a one-line test update — a deliberate pin, not an oversight.
+- `tests/test_migration_ddl.py` renders the chain **offline** (`as_sql=True` into a
+  buffer), parses the emitted SQL and compares every `CREATE TABLE` column, foreign key
+  and index against `Base.metadata`. That is real evidence that *the DDL the migrations
+  emit and the DDL the models describe are the same schema* — and it is **not** the same
+  as having applied them. It is the cheaper check, and it now runs alongside the applied
+  migration rather than in place of it.
 
 ### Extensions
 
@@ -1125,7 +1152,7 @@ declared in `routes/lazy-pages.ts` so the router file stays a pure route table.
 | Route group | Guard | Elements |
 | --- | --- | --- |
 | `/` | — | Redirects to `/dashboard` |
-| `AppLayout` children | `RequireAuth` | dashboard, projects, tasks, planner, knowledge, search, analytics, developer, learning, career, assistant, experiments, settings, `*` → not found |
+| `AppLayout` children | `RequireAuth` | dashboard, projects, project detail, tasks, planner, planner-month, knowledge, note detail, concept detail, search, analytics, risks, recommendations, developer, developer repository detail, learning, career, assistant, experiments, settings, `*` → not found |
 | `RequireAnonymous` children | `RequireAnonymous` | `/login`, `/register`, `/forgot-password`, `/reset-password` |
 
 Password recovery sits on the anonymous branch deliberately: there is no session
@@ -1149,16 +1176,18 @@ and the placeholder bodies all render from it, and `getModule()` throws on an
 unknown path, so a route that drifts from the registry fails loudly. Adding a
 module is a single-file change plus a route entry.
 
-`ALL_NAV_ITEMS` — twelve modules plus Settings — is the palette's destination
-list: 13 entries, filtered with a 120 ms debounce and driven by ArrowUp/ArrowDown,
-Enter and Escape.
+`ALL_NAV_ITEMS` — fourteen modules plus Settings — is the palette's destination
+list: 15 entries, filtered with a 120 ms debounce and driven by ArrowUp/ArrowDown,
+Enter and Escape. `NAV_GROUPS` arranges them into five groups — Overview, Work,
+Intelligence, Growth and Platform — so a module added in Phase 9 did not have to invent
+a sixth.
 
 ### Data access
 
 | Layer | File | Rule |
 | --- | --- | --- |
 | Transport | `lib/api-client.ts` | Framework-agnostic typed `fetch` wrapper: base URL, bearer injection, timeout (`DEFAULT_TIMEOUT_MS` = 30 000), `AbortSignal` support, and a single `ApiError` type. No React, no React Query. |
-| Endpoints | `services/*.ts` | One exported function per endpoint. `auth.ts`, `sessions.ts`, `users.ts` and `health.ts` are the four endpoint files today; `errors.ts` holds the single `unknown → ApiError` conversion every caller shares. |
+| Endpoints | `services/*.ts` | One exported function per endpoint. `errors.ts` holds the single `unknown → ApiError` conversion every caller shares; the endpoint files are `auth.ts`, `sessions.ts`, `users.ts`, `health.ts`, `work.ts` (projects, tasks, tags, activity), `planner.ts`, `knowledge.ts`, `analytics.ts`, `risk.ts`, `developer.ts` and `learning.ts`. No module imports `fetch` — everything goes through `lib/api-client.ts`. |
 | Server state | `app/query-client.ts` | Retries suppressed for 4xx (a rejected request does not become accepted by asking again); transport failures get two attempts, which covers "the backend is still starting". |
 | Client state | `stores/*.ts` | Zustand: `auth-store` (persisted to `nexus.auth`, `status` deliberately not persisted), `theme-store`, and `toast-store` (ephemeral, deliberately not persisted). |
 
@@ -1272,31 +1301,36 @@ rules before broad ones: `charts`, `icons`, `radix`, `router`, `data`, `react`.
 Routes are additionally split by the `lazy()` calls above.
 
 Exact byte sizes of the current `frontend/dist/assets/*.js`, uncompressed, as
-built by `npm run build`:
+built by `npx vite build`:
 
 | Chunk | Bytes |
 | --- | --- |
-| `react` (largest vendor) | 222 295 |
+| `charts` (largest vendor) | 432 148 |
+| `react` | 222 425 |
 | `radix` | 113 444 |
-| `router` | 92 153 |
-| `index` (entry) | 91 633 |
-| `settings-page` | 39 952 |
-| `data` | 37 974 |
-| `icons` | 19 199 |
-| `dashboard-page` | 11 760 |
-| `forgot-password-page` | 5 587 |
-| `register-page` | 5 812 |
-| per-page placeholders | ~0.40 kB each |
+| `index` (entry) | 104 155 |
+| `router` | 92 238 |
+| `learning-page` (largest route) | 67 842 |
+| `career-page` | 52 538 |
+| `icons` | 46 668 |
+| `data` | 37 965 |
+| `developer-page` | 35 303 |
+| `knowledge-page` | 34 610 |
+| `planner-page` | 32 662 |
+| `quick-add` | 32 220 |
+| `settings-page` | 31 313 |
+| `developer-repository-page` | 22 140 |
+| `dashboard-page` | 17 530 |
+| `module-page` (the three placeholders) | 2 754 |
+| `not-found-page` | 2 314 |
 
-Ten of the eleven placeholder routes render the shared `ModulePage` and cost
-396–404 bytes each; the eleventh, `/search`, adds a small card for its shortcut
-hint and lands at 1 269. `settings-page` is the largest route chunk by a wide
-margin — 4.8 kB in Phase 1, 39.9 kB now — because it carries five panels, the
-session list, the password checklist, the strength meter and two dialogs. That is
-route splitting working as intended: the page that grew got its own chunk, and the
-stub pages stayed at a few hundred bytes because the code lives in `ModulePage` and
-the registry. A placeholder chunk growing by kilobytes would be the signal that
-something page-specific had crept into it.
+The `charts` group is now the largest chunk because Analytics shipped and pulls in
+recharts; it was reserved for a module that did not exist when this list was first
+written. Route splitting is still doing its job: every live module page has its own
+chunk, and the three remaining placeholder routes all share the single 2,754 B
+`module-page` chunk because their code lives in `ModulePage` and the registry. A
+placeholder chunk growing by kilobytes would be the signal that something page-specific
+had crept into it.
 
 The dev server and `vite preview` (4173) share the same proxy configuration, so a
 previewed production bundle behaves like the reverse proxy that will eventually
@@ -1310,8 +1344,8 @@ front the API.
 
 ```bash
 # from backend/
-python -m pytest                        # 499 collected, needs nexus_test
-python -m pytest -m "not integration"   # 366 pass, 133 deselected, no database required
+python -m pytest                        # 2090 collected and passing, needs nexus_test
+python -m pytest -m "not integration"   # 1011 pass, 1079 deselected, no database required
 ```
 
 `pytest.ini` sets `testpaths = tests`, `pythonpath = .`, `asyncio_mode = auto`,
@@ -1337,34 +1371,73 @@ app-scoped rule really does precede the blanket ignore in `warnings.filters`.
 That last assertion is the one that catches someone reordering the file into a
 rule that looks right and does nothing.
 
+Counts below are from `pytest --collect-only` and `pytest --collect-only -m integration`
+run against this tree, so they are what the suite *collects*; §[What has not been
+run](#what-has-not-been-run) records what has actually been executed.
+
 | File | Offline | Integration | Covers |
 | --- | --- | --- | --- |
-| `test_migration_ddl.py` | 59 | — | Renders both migrations to SQL offline and compares the emitted DDL against `Base.metadata` |
+| `test_migration_ddl.py` | 150 | — | Renders the whole migration chain to SQL offline and compares every emitted `CREATE TABLE` column, foreign key and index against `Base.metadata` |
+| `test_learning_schemas.py` | 146 | — | Phase 9's learning domain at both ends of its surface: schemas and routers' contracts, with no database |
+| `test_learning_career_routers.py` | — | 124 | The Phase 9 HTTP surface end to end: two routers |
+| `test_risk_recommendation.py` | — | 112 | What a stored risk turns into: a suggestion with a stated reason, raised once |
+| `test_career_schemas.py` | 87 | — | Phase 9's career domain at both ends of its surface |
+| `test_risk_scoring.py` | 76 | — | The risk scoring formulas as pure arithmetic |
+| `test_risk_api.py` | — | 75 | The Phase 7 surface end to end: risks, recommendations, detection |
+| `test_learning_api.py` | — | 70 | The Phase 9 learning HTTP surface end to end |
+| `test_developer_git.py` | — | 66 | The git engine, against real repositories built in the test |
+| `test_analytics_scoring.py` | 63 | — | The analytics scoring formulas as pure arithmetic |
+| `test_developer_api.py` | — | 60 | The Phase 8 HTTP surface end to end |
 | `test_password_policy.py` | 55 | — | Each rule in isolation, the length bound, and that the message states the actual configured number |
-| `test_permissions.py` | 42 | — | The `Permission` enum, `ROLE_PERMISSIONS`, the fail-closed unknown-role path, `has_all` / `has_any` |
+| `test_career_api.py` | — | 46 | The Phase 9 career HTTP surface end to end |
+| `test_developer_metrics.py` | 45 | — | The developer metric formulas as pure arithmetic — no database and no `.git` directory |
+| `test_auth_phase2.py` | — | 42 | The Phase 2 auth surface end to end: sessions, password change, reset, logout-all |
+| `test_permissions.py` | 42 | — | The eleven-member `Permission` enum, `ROLE_PERMISSIONS`, the fail-closed unknown-role path, `has_all` / `has_any` |
 | `test_logging.py` | 41 | — | JSON and human formatter shape, `REDACTED_KEYS` folding, hyphenated keys, `ContextFilter` request-id propagation |
-| `test_middleware.py` | 40 | — | Access-log fields, body-preview redaction, query redaction, capture cap vs. verbatim replay, non-default `create_app(settings=…)` wiring (CORS, OpenAPI/docs/redoc URLs) |
+| `test_middleware.py` | 40 | — | Access-log fields, body-preview redaction, query redaction, capture cap vs. verbatim replay, non-default `create_app(settings=…)` wiring |
 | `test_security.py` | 39 | — | JWT issue/verify, `type` enforcement, tamper and expiry rejection, bcrypt behaviour, `hash_token` / `token_fingerprint_matches` |
 | `test_models.py` | 37 | — | Model-level invariants that need no database |
-| `test_error_handling.py` | 16 | — | The 5xx path: what a client may see, `X-Request-ID` on a 500, the no-echo rule for a 5xx `detail`, unmapped statuses as 4xx |
-| `test_config.py` | 14 | — | Settings assembly, derived URLs, production guards, the `get_settings` cache |
-| `test_password_reset.py` | 12 | — | The reset *policy* — token issuance shape, digest comparison, single-use — without touching the database. The end-to-end flow is in `test_auth_phase2.py` |
-| `test_health.py` | 5 | 3 | Liveness never touching the database, header propagation, and the **degraded** path; the detailed endpoint and the lifespan are integration |
-| `test_warnings.py` | 3 | — | The `filterwarnings` rules above |
-| `test_event_loop.py` | 3 | — | The factory survives a delegating policy, builds a `SelectorEventLoop` with `add_reader`, and yields a fresh loop each call |
-| `test_auth_phase2.py` | — | 41 | The Phase 2 auth surface end to end: sessions, password change, reset, logout-all |
+| `test_regressions_security.py` | 32 | 5 | The security fixes, with the evidence each one rests on |
+| `test_developer_repository.py` | — | 36 | `DeveloperRepository` against the real test database |
+| `test_learning_repository.py` | — | 36 | `LearningRepository` against the real test database |
+| `test_analytics_scores_api.py` | — | 35 | The five analytics score endpoints, end to end over HTTP |
+| `test_learning_metrics.py` | 35 | — | The learning metric formulas as pure arithmetic |
+| `test_analytics_edge_cases.py` | — | 27 | What analytics says when the data is thin, wrong-shaped or gone |
+| `test_analytics_export_api.py` | — | 27 | CSV export over HTTP: the manifest, the download, and what the file promises |
+| `test_developer_schema.py` | 26 | — | Model/migration agreement for Phase 8, rendering `0008` offline |
+| `test_analytics_daily_metrics.py` | — | 25 | The `daily_metrics` tier: one row per user per UTC day, and nothing else |
+| `test_analytics_learning_api.py` | — | 25 | The learning, knowledge and ML-feature reads, end to end over HTTP |
+| `test_learning_gaps.py` | 24 | — | The skill-gap formulas as pure arithmetic — the module that cannot lie about a level |
+| `test_risk_detection.py` | — | 24 | One detection pass: what it writes, what it refuses, what it closes |
+| `test_analytics_overview_api.py` | — | 23 | The analytics dashboard surface, end to end through HTTP |
+| `test_analytics_projects_api.py` | — | 23 | Per-project and task-level analytics through the HTTP layer |
+| `test_career_repository.py` | — | 21 | `CareerRepository` against the real test database |
+| `test_learning_service.py` | — | 20 | The Phase 9 learning service end to end: what it stores, refuses, says |
+| `test_regressions_users.py` | 20 | — | The user-account fixes |
+| `test_analytics_privacy.py` | — | 19 | User isolation on the analytics surface, end to end over HTTP |
 | `test_sessions.py` | — | 19 | Session issue, rotation, the session cap, listing and revocation |
-| `test_errors.py` | — | 15 | The envelope, the code table, `FORBIDDEN_FRAGMENTS` — the shared leak assertions other files import |
+| `test_developer_service.py` | — | 16 | The Phase 8 service end to end: what it stores, refuses, repeats |
+| `test_error_handling.py` | 16 | — | The 5xx path: what a client may see, `X-Request-ID` on a 500, the no-echo rule for a 5xx `detail`, unmapped statuses as 4xx |
 | `test_account.py` | — | 15 | Profile update, account deletion, the cascade and `SET NULL` behaviour |
+| `test_errors.py` | — | 15 | The envelope, the code table, `FORBIDDEN_FRAGMENTS` — the shared leak assertions other files import |
 | `test_auth.py` | — | 14 | Register / login / refresh / logout / me end to end |
+| `test_career_service.py` | — | 14 | The Phase 9 career service end to end: what it writes, refuses, hides |
+| `test_config.py` | 14 | — | Settings assembly, derived URLs, production guards, the `get_settings` cache |
+| `test_password_reset.py` | 12 | — | The reset *policy* — issuance shape, digest comparison, single-use — without touching the database |
 | `test_rbac.py` | — | 12 | The permission gate end to end, including the admin listing fixture |
 | `test_repositories.py` | — | 9 | SQL against the real test database |
-| `test_migrations.py` | — | 5 | Linear single-head chain (pinned to `["0002", "0001"]`), schema present, no drift |
-| **Total** | **366** | **133** | |
+| `test_session_database_lock.py` | — | 9 | The guard that keeps two pytest sessions out of one test database |
+| `test_health.py` | 5 | 3 | Liveness never touching the database, header propagation, and the **degraded** path; the detailed endpoint and the lifespan are integration |
+| `test_developer_git_integration.py` | — | 7 | Phase 8 against **real git repositories**: the five shapes that break a scanner |
+| `test_migrations.py` | — | 5 | Linear single-head chain (pinned to `["0009", …, "0001"]`), schema present, no drift |
+| `test_event_loop.py` | 3 | — | The factory survives a delegating policy, builds a `SelectorEventLoop` with `add_reader`, and yields a fresh loop each call |
+| `test_warnings.py` | 3 | — | The `filterwarnings` rules above |
+| **Total (55 files)** | **1011** | **1079** | |
 
 The whole of `test_migrations.py` is `integration`-marked, so even the chain-shape
 assertion is deselected offline; `test_migration_ddl.py` is the database-free
-substitute for the *DDL agreement* half of it.
+substitute for the *DDL agreement* half of it, and with 150 tests it is now the largest
+offline file in the suite.
 
 Two of these deserve a note on what they changed.
 
@@ -1423,19 +1496,20 @@ test that drives `lifespan_context` explicitly.
 
 ```bash
 # from frontend/
-npm test               # vitest run — 134 tests in 22 files
+npm test               # vitest run — 607 tests in 42 files
 npm run typecheck      # tsc -b
 npm run lint           # eslint .
 npm run build          # tsc -b && vite build
 ```
 
 Vitest runs in `jsdom` with `src/test/setup.ts`. The suite grew from 10 files in
-Phase 1 to 22; the additions are the hand-rolled primitives that carry real
-behaviour (`dialog`, `tabs`), the auth pages (`login`, `register`, the shared
-form-error flattening), the password rules and strength scoring, the toast store,
-and an end-to-end smoke pass over the real routes — sign-in through the actual auth
-endpoints, Ctrl+K palette navigation, and the retryable error state when the
-backend is down.
+Phase 1 to **42 files** as each module landed, and its shape changed with them: the
+hand-rolled primitives that carry real behaviour (`dialog`, `tabs`), the auth pages
+(`login`, `register`, the shared form-error flattening), the password rules and strength
+scoring, the toast store and an end-to-end smoke pass over the real routes, and then one
+`*.test.tsx` beside every live page — analytics, developer, developer-repository,
+learning, career, recommendations, risk-center — each of which pins the rules §17 states
+about levels, absences and server-named field errors.
 
 ### What is not covered
 
@@ -1445,32 +1519,39 @@ retention job to test.
 
 ### What has not been run
 
-Every number in the two command blocks above was produced on Windows. The 133
-`integration` tests have **never been executed** — there is no PostgreSQL and no
-Docker in the environment this document was last revised in, so `nexus_test` is
-never created, and the repository, session, account, RBAC, password-reset,
-migration and detailed-health assertions are unverified. They are written against
-the schema and the endpoints described here, but "the suite collects 499 tests" is
-not "the suite passes 499 tests", and nothing in this document claims otherwise.
+Every number in the two command blocks above was produced on Windows against a **native
+PostgreSQL 16.2**. The suite creates and migrates `nexus_test` itself and runs all 2090
+tests, so the repository, session, account, RBAC, password-reset, migration, drift and
+detailed-health assertions are **verified**, not merely written. `alembic upgrade head` is
+applied by the `test_database_url` fixture on every integration session, and
+`test_autogenerate_reports_no_drift` asserts that the live schema and `Base.metadata`
+agree. The offline half of the claim is equally real: the 1011-test
+`-m "not integration"` subset passes with PostgreSQL stopped, so nothing that could run
+without a database has been quietly marked `integration` to go green.
 
-That matters more in Phase 2 than it did in Phase 1. Phase 2 changed the shape of
-the `users` table, added three tables, and made almost every auth path depend on a
-session row — all of which lives on the database side, which is exactly the side
-that has never been exercised here. The 366 tests that pass need no database and
-therefore say very little about the migration or the new queries.
+What is **not** verified is anything that needs a container. The Phase 2 text that used
+to sit here said the database-backed assertions were unverified; that was true of the
+document it replaced and is not true now — the 1079 `integration` tests exist, they run,
+and they pass against a real server. What it got right, and what still matters, is that
+the offline subset alone says very little about a migration or a new query — which is why
+the full run is the one to read before trusting a change to a model, a repository or a
+revision.
 
-Likewise:
-
-- **`alembic upgrade head` has never been run against a live database.**
-  `tests/test_migration_ddl.py` renders `0001` and `0002` offline and compares the
-  emitted DDL against the models. That is real evidence about the DDL, and it is
-  **not** the same as having applied it — a migration can render correctly and
-  still fail on a real server (locks, permissions, a constraint that already
-  exists).
-- **`docker-compose.yml` has never been executed by `docker compose`** — it is
-  structurally validated by `scripts/verify_compose.py`, which confirms that all
-  14 interpolated variables are documented in `.env.example`, and which cannot tell
-  you that the stack actually starts.
+- **`alembic upgrade head` used to be render-only evidence, and no longer is.**
+  `tests/test_migration_ddl.py` renders the chain offline and compares the emitted DDL
+  against the models. That is real evidence about the DDL, and it is still **not** the
+  same as having applied it — a migration can render correctly and still fail on a real
+  server (locks, permissions, a constraint that already exists). The difference is that
+  the applied case is now covered too: the fixture upgrades `nexus_test` to `head` and
+  `test_autogenerate_reports_no_drift` compares the result.
+- **`docker-compose.yml` has never been executed by `docker compose`**, and Docker is not
+  installed in this development environment at all — so the three images have never been
+  built either. The file is structurally validated by `scripts/verify_compose.py`, which
+  confirms that all 14 interpolated variables are documented in `.env.example`, and which
+  cannot tell you the stack actually starts. The `postgres:16-alpine` image and the
+  `docker/postgres/init/` extension script have not run either; the suite provisions
+  `pg_trgm` and `unaccent` itself in `conftest.py`, which is precisely why a native-server
+  run is green even though the container's first-init script never executed.
 
 And the Linux/macOS behaviour of the event-loop factory is asserted by a unit
 test that reproduces the recursion, not by having run the suite on either
@@ -1520,12 +1601,12 @@ The seams below exist today. None of the *destinations* is implemented; the
 | Audit retention | `audit_log_retention_days` declared; **no pruning job** | a scheduled delete of rows older than the window | `AuditRepository`; the job must not delete `account_deleted` rows before the account is gone |
 | Horizontal scaling | one worker per container | more containers behind a load balancer | sessions and reset tokens are already database-backed and shared; the access-token denylist is what still forces the single worker |
 | Background work | none | worker process | `scripts/` for process orchestration; jobs need the same event-loop factory |
-| Search | `pg_trgm` + `unaccent` enabled | retrieval index over Knowledge | extension availability is already a prerequisite |
+| Search | `pg_trgm` + `unaccent` enabled | retrieval index over Knowledge — **Phase 5 shipped the knowledge tables, the retrieval index itself did not** | extension availability is already a prerequisite, and the extensions are already installed |
 | Local LLM | none | Ollama-backed assistant | never leaves the machine; the catalog already fixes the Phase 9 contract |
-| Repository analysis | none | local git history scan | read-only, from disk |
-| Module data | `catalog.ts` registry | per-module routers and pages | add a route entry and a catalog entry; nothing else |
+| Repository analysis | **live since Phase 8** — see [§17](#17-developer-learning-and-career) | background rescans | read-only, from disk; `git_scan_runs` is the seam a scheduler writes to |
+| Module data | `catalog.ts` registry | the remaining placeholder modules (Search, AI Assistant, Experiments) | add a route entry and a catalog entry; nothing else |
 | Role set | `user` / `admin` in a Python map | custom roles, per-tenant roles, delegated scopes | call sites ask for a `Permission`, never a role, so only `ROLE_PERMISSIONS` and the duplicated role constants change |
-| Module permissions | `projects.*` / `tasks.*` / `analytics.read` declared, nothing guards them | Projects and Tasks arrive and consume them | `require_permission()` is the only place a capability is checked |
+| Module permissions | eleven capabilities, all granted to `user`; every module router guards its reads and writes | none outstanding | `require_permission()` is the only place a capability is checked |
 
 Phase numbering is not invented here — it is the `phase` field in
 `frontend/src/features/modules/catalog.ts`, and the module list it drives is the
@@ -1591,6 +1672,186 @@ table, which is why both are called "Phase 2".
 
 ---
 
+## 17. Developer, Learning and Career
+
+Phases 8 and 9 added three subsystems on top of the layering above. They are described here
+because each one introduced something structural the rest of this document does not cover:
+a subprocess boundary, a module that cannot touch the database, and two surfaces whose
+subject is a *person's self-description* rather than their activity.
+
+> Sections 1–16 were written against Phase 2. The claims that Phases 3–9 falsified —
+> the migration chain, the test counts, the route inventory, the permission set, the
+> extension roadmap, and the "no PostgreSQL in this environment" note — have since been
+> corrected in place. What remains Phase-2-shaped is the *narrative*: several sections
+> still explain a decision in the terms it was made in, and a module that arrived later
+> is described by §17 and the two phase reports rather than woven back through them.
+
+### 17.1 Where the code lives
+
+```text
+app/services/developer/          git.py (subprocess) · metrics.py (pure) · service.py
+app/services/learning/           gaps.py (pure)   · metrics.py (pure)   · service.py
+app/services/career/                                    service.py
+app/repositories/developer.py  learning.py  career.py
+app/api/v1/developer.py       learning.py    career.py
+migrations/versions/0008_phase8_developer_intelligence.py
+migrations/versions/0009_phase9_learning_career.py
+```
+
+All three services follow the layering rule in §2: the routers compute no figure and
+compose no sentence, and the repositories never raise a domain error.
+
+### 17.2 Developer Intelligence — the subprocess boundary
+
+`app/services/developer/git.py` is the **only** module in NEXUS that starts another
+program. Four properties are structural rather than stylistic:
+
+| Property | Rule |
+| --- | --- |
+| **No `shell=True`, no GitPython, no network** | Every invocation is `asyncio.create_subprocess_exec`, so the arguments never reach a shell parser and there is nothing to inject. The git CLI is a dependency the machine already has, not a package this project vendors |
+| **A wall-clock timeout with a kill** | `DEVELOPER_GIT_TIMEOUT_SECONDS` (30). A network-mounted work tree or a filter process waiting on a prompt must come back as an error row with a human sentence, not as a request that never returns |
+| **An output byte ceiling** | A pathological repository cannot exhaust memory through a pipe |
+| **A stderr sanitiser** | Whatever git puts on stderr is a *sentence* about the repository, never a traceback and never an absolute path from inside the user's home directory |
+
+**Every scan is wrapped, and a failed scan is a row.** `POST
+/developer/repositories/{id}/scan` answers **200 whether the read worked or not** — a deleted
+directory, a corrupt `.git`, an unreadable network share and a timeout are all
+`status='error'` with a sentence. There is no code path on that router where a bad directory
+produces a 500. This is the concrete form of the phase's rule that a broken repository must
+never break NEXUS.
+
+**The Windows collision.** Two of this codebase's own architectural rules meet here. NEXUS
+runs a `SelectorEventLoop` on every platform, because psycopg's async driver needs
+`loop.add_reader` and asyncio's Windows default (`ProactorEventLoop`) does not provide it
+(§10). But on Windows a `SelectorEventLoop` raises `NotImplementedError` from
+`subprocess_exec` — it has no subprocess transport at all. So:
+
+- `_running_loop_can_spawn()` detects the condition as a **class** test rather than a trial
+  call, so no exception from an unrelated cause is caught here and mistaken for a
+  repository problem.
+- `_run_git_on_worker_loop()` runs the **same** `_run_git_here` on a private
+  `ProactorEventLoop` from a worker thread. Same function, so the timeout, the ceiling, the
+  kill and the sanitiser all still apply — the fallback cannot become a laxer scan.
+- The private loop is constructed **directly**, not through the active policy, because the
+  policy is `nexus_loop_factory`, which hands back the very loop being worked around.
+
+Cost: one thread hop per git invocation on Windows. On POSIX none of it runs.
+
+**Idempotency is a unique constraint, not a convention.** `uq_git_commits_repo_hash` over
+`(repository_id, commit_hash)` is what makes pressing the scan button twice safe. It is a
+*full* unique constraint rather than Phase 7's partial one because a commit is not an
+episode: the same commit is the same commit forever and there is no "resolved" version of
+one. The consequence is visible and correct — a rescan of an unchanged repository reports
+`commits_discovered` equal to what git returned and `commits_added` of 0, and that gap is
+the proof the upsert worked.
+
+**Two ordering rules inside one method, both load-bearing.** `_record_scan_findings` emits
+`COMMIT_DETECTED` only for commits strictly after the stored `latest_commit_at`, so the
+high-water mark must be read **before** any write: `update_scan_state` is an
+`UPDATE ... RETURNING` with `populate_existing=True` against the same identity-mapped
+instance, and reading it afterwards yields *this* scan's newest timestamp, making
+`committed_at > high_water_mark` impossible and the event permanently silent. And
+`commit_count` accumulates `repository.commit_count + inserted` rather than being assigned
+what the scan returned, because an incremental scan returns only the commits after the mark
+— assigning it directly would make a repository's commit count *fall* on every rescan.
+
+**No table here could be summed into a measure of time.** There is no `hours`,
+`minutes_spent`, `effort` or `focus` column anywhere in `0008`. The counts are commit
+objects, days that carried a commit, and lines git counted from a diff.
+
+### 17.3 Learning and Career — two surfaces about a person
+
+Phase 9 is the first phase whose subject is a person's *self-description*. Every decision in
+migration `0009` follows from one rule: **NEXUS may never be the author of it.**
+
+#### The honesty control
+
+`skills.level_source` (`user_defined` | `system_estimate`) decides which words the
+explanation is *allowed* to use:
+
+```python
+LEVEL_SOURCE_PHRASES = {USER_DEFINED: "self-assessed", SYSTEM_ESTIMATE: "system estimate"}
+```
+
+`SkillGap.__post_init__` **rejects an explanation that omits the phrase its source requires**
+and an explanation carrying no digit — the same technique `RecommendationDraft.__post_init__`
+already used in Phase 7. So *"current self-assessed 2/5"* and *"current NEXUS system estimate
+of 2/5"* are constructible and *"current 2/5"* is not. The routers close the other door: a
+level sent by a client is always stored as `user_defined`, and `PATCH /learning/skills/{id}`
+cannot write `evidence_count`, `last_activity_at`, `confidence` or `level_source`.
+
+The neutral gap sentence is *"Target 4/5, current self-assessed 2/5. NEXUS recorded 6 related
+learning activities in the last 30 days."* Never *"You are not good at X."*
+
+#### The pure module that cannot lie about a level
+
+`app/services/learning/gaps.py` touches no database, no ORM model, no clock and no request.
+It imports exactly one thing from outside — the read-only `SkillLevelSource` vocabulary — and
+"Now" is a parameter rather than a call to the clock. So the gap arithmetic is assertable to
+the exact value with no PostgreSQL in the picture.
+
+**A gap is computed on read and never stored**, for the reason `app/models/analytics.py`
+keeps weekly and monthly metrics derived: a stored copy is a *second answer* to "how far from
+my target is this skill?" that could disagree with the dashboard the moment a level was
+edited, and the disagreement is always resolved by whichever page the user opened first.
+
+**A measured zero and an absent measurement are two different answers**, and something that
+caches them has already thrown one away. `gap=0, available=True` means the target is met — a
+real measurement. `gap=0, available=False` means NEXUS has nothing recorded and therefore no
+business saying anything. `SkillGap.gap` is typed `int` because the frozen contract freezes
+that type, so **the `available` flag is the whole safety mechanism** and `__post_init__`
+guarantees it is `False` exactly when a reason is attached.
+
+#### Delete semantics as a product decision
+
+In `0009` every `ondelete` is argued in the migration's own docstring, and the split is the
+interesting part:
+
+| Reference | Rule | Why |
+| --- | --- | --- |
+| `user_id`, all six tables | CASCADE | a row nobody can reach is a row nothing can read |
+| `learning_activities.skill_id` | **CASCADE** | the one context reference that cascades. An activity whose only subject is gone is not evidence of anything |
+| goal → project / note / skill; activity → goal; evidence → project / skill / repository | **SET NULL** | the recorded trail outlives the intention it was recorded against. Deleting a project must not delete the evidence, and deleting a repository must not delete the user's record that they shipped something |
+
+`DELETE /learning/skills/{id}` therefore cascades while `DELETE /learning/goals/{id}` does
+not — and that asymmetry is the design, not an oversight.
+
+#### Two deduplication mechanisms, both using NULL-is-distinct
+
+| Table | Constraint | What it prevents |
+| --- | --- | --- |
+| `uq_career_evidence_source_identity` over `(user_id, evidence_type, source, project_id, skill_id, repository_id)` | a full unique constraint | a project-derived evidence row being inserted twice |
+| `uq_risks_live_identity` (Phase 7) over `(user_id, risk_type, entity_type, entity_id)`, partial | a *partial* index | a risk that resolves and legitimately returns colliding with its own history |
+
+PostgreSQL treats NULLs as distinct in a btree unique index, which is the whole trick: several
+manually-added `ACHIEVEMENT` rows (all three FKs null) coexist, while a derived one cannot
+be duplicated. Phase 9 uses a full constraint because unlike a risk, evidence has no
+"resolved" state.
+
+#### Features, not models
+
+Three feature vectors ship, one per phase, each stamped with a closed schema version:
+`developer_features.v1`, `learning_features.v1`, `career_features.v1`. Nothing is trained,
+loaded, served or registered. The rule between them is one sentence — **a figure that could
+not be computed is `null`, never `0`** — and `career_features.v1.project_activity` is its
+worked example: it is null when no repository has ever been scanned, because `0` would assert
+that a repository exists and carries no commits when the truth is that nobody has looked.
+Inside a training matrix a fabricated zero is indistinguishable from an observed one.
+
+#### Conventions the three subsystems established
+
+| Convention | Rule |
+| --- | --- |
+| Literal sub-paths before parameterised routes | Starlette matches in registration order and does not prefer a literal segment over a parameter. `POST /learning/goals/{goal_id}` registered above `/learning/summary` would bind the literal string `summary` to the path parameter and answer 422 about an id that never existed |
+| A page-size cap is a rejection | `?limit=500` is a 422. A caller that asked for 500 and received 200 cannot tell a truncated page from a page that was always 200 rows long |
+| `PATCH` is `exclude_unset=True` | `None` means "write SQL NULL" downstream. A field the client never sent is not a field the user asked to clear; an explicit `null` is |
+| An immutable stamp has one producer | `completed_at` is written only by `POST /learning/goals/{id}/complete`, from the **database** clock |
+| An identity column is not editable | `local_path`, `source` and the `*_id` pointers are absent from their `PATCH` payloads, because a re-pointed row becomes a second record |
+| The window ceiling belongs to the service | Only `ge=1` is declared on the route; a constant there would answer 422 against a limit the deployment has raised |
+| `analytics.read` guards the writes too | No `developer.write`, `learning.write` or `career.write` exists — the permission test asserts the complete member set, and a new one would be granted to exactly the roles `analytics.read` already covers |
+
+---
+
 ## See also
 
 | Document | Contents |
@@ -1598,3 +1859,5 @@ table, which is why both are called "Phase 2".
 | [`../README.md`](../README.md) | Setup, quick start, environment variables, commands, troubleshooting, roadmap |
 | [`api-conventions.md`](api-conventions.md) | Endpoint contract: versioning, error codes, request ids, pagination, the endpoint checklist |
 | [`development.md`](development.md) | Clean-machine setup, daily workflow, adding an endpoint or a page, testing and style conventions |
+| [`specifications/phase-8-developer-report.md`](specifications/phase-8-developer-report.md) | What Phase 8 shipped, the four git tables, and the two defects three agents independently reported |
+| [`specifications/phase-9-learning-career-report.md`](specifications/phase-9-learning-career-report.md) | What Phase 9 shipped, the six learning/career tables, and the contract disagreements |

@@ -48,6 +48,7 @@ Two consequences worth stating plainly:
 | [8. Code conventions](#8-code-conventions) | ruff, docstrings, TypeScript strictness, the react-refresh constraint |
 | [9. Before you open a pull request](#9-before-you-open-a-pull-request) | The checklist |
 | [10. Verified baseline and known limits](#10-verified-baseline-and-known-limits) | What was actually executed, and what was not |
+| [11. Developer, Learning and Career settings](#11-developer-learning-and-career-settings) | Registering and scanning a local repository, and the fourteen environment variables Phases 8 and 9 added |
 
 ---
 
@@ -199,8 +200,8 @@ worker carries its own connection pool and its own empty revocation denylist.
 
 | You changed | Run |
 | --- | --- |
-| Python, no schema or data | `python -m pytest -m "not integration"` — 366 tests, no database |
-| A model, a repository, or anything touching data | `python -m pytest` — the full 499, needs PostgreSQL |
+| Python, no schema or data | `python -m pytest -m "not integration"` — 1011 tests, no database |
+| A model, a repository, or anything touching data | `python -m pytest` — the full 2090, needs PostgreSQL |
 | TypeScript | `npm run typecheck && npm test` |
 | A component's markup or a route | `npm test`, plus `npm run build` — `tsc -b` catches types and import paths, but only a real build proves the module graph resolves |
 
@@ -324,9 +325,18 @@ caller-scoped resource, scope the lookup by the caller's id in the query
 confirm the id exists and turn the route into a probe for real ids.
 `SessionService.revoke` is the reference implementation.
 
-**Add a permission to a new module's catalog, not to a route.** `projects.*`,
-`tasks.*` and `analytics.read` are declared in the map and nothing guards them yet;
-Projects and Tasks will consume them when they arrive.
+**Add a permission to a new module's catalog, not to a route.** `app/core/permissions.py`
+declares **eleven** capabilities today — `users.read/write`, `projects.read/write`,
+`tasks.read/write`, `analytics.read`, `calendar.read/write` and `knowledge.read/write` —
+and every module router from Phase 3 onward guards its reads and its writes with one of
+them. Phases 8 and 9 added none: Developer, Learning and Career are guarded by
+`analytics.read`, because registering a repository or writing a goal is the caller
+answering a question about rows derived from their own record. Before adding a capability,
+read the argument in
+[`api-conventions.md`](api-conventions.md#analyticsread-guards-the-writes-too) — a new
+member is granted to exactly the roles an existing one already covers, and
+`tests/test_permissions.py` asserts the complete set, so it will fail until both are
+extended together.
 
 ### 3.4 The error-translation rule
 
@@ -476,13 +486,13 @@ which is `integration`-marked and so only runs when one is available.
 ### 4.2 Rules for revision files
 
 **A migration must not import a model.** `migrations/versions/0001_initial_create_users.py`
-and `0002_phase2_identity_sessions.py` both say so in their own module docstring,
-and it is the single most important rule in this section: a revision is explicit
-DDL that happens to look like what the model describes today. If it imported
-`app.models.user`, then editing the model later would silently change the
-*meaning* of an already-applied migration — and on a fresh database, or after a
-`downgrade`, that old revision would produce a different schema than it did the
-day it was written.
+and `0002_phase2_identity_sessions.py` both say so in their own module docstring, and
+every later revision follows the rule — and it is the single most important rule in this
+section: a revision is explicit DDL that happens to look like what the model describes
+today. If it imported `app.models.user`, then editing the model later would silently
+change the *meaning* of an already-applied migration — and on a fresh database, or after
+a `downgrade`, that old revision would produce a different schema than it did the day it
+was written.
 
 Corollary: autogenerate output is a **draft**. Rename a column in a generated
 `op.alter_column`, add `server_default=`, or add a comment, and the drift check
@@ -532,14 +542,17 @@ The chain has exactly one head and is asserted to be linear by
 `backend/tests/test_migrations.py::test_the_migration_chain_is_linear_and_has_a_single_head`.
 
 > **Known constraint.** That test asserts the full revision list literally —
-> `== ["0002", "0001"]`, head `0002` — so adding a third revision makes it fail
-> until the list is extended. That is a deliberate pin on the current chain, not an
-> oversight. Phase 2 updated it from `["0001"]` when it added `0002`.
+> `== ["0009", "0008", "0007", "0006", "0005", "0004", "0003", "0002", "0001"]`, head
+> `0009` — so adding a tenth revision makes it fail until the list is extended. That is a
+> deliberate pin on the current chain, not an oversight. Phase 2 extended it when it added
+> `0002`, and Phases 3 through 9 extended it again.
 
 Drift is also a test, not just a command:
 `test_autogenerate_reports_no_drift` compares the live schema against
-`Base.metadata` with the same options `env.py` uses. It is `integration`-marked,
-so it has not been run in the environment these documents were written in.
+`Base.metadata` with the same options `env.py` uses. It is `integration`-marked, so it
+needs a reachable PostgreSQL — and it now runs, because a native PostgreSQL 16 is
+available in the development environment and `alembic upgrade head` is applied by the
+`test_database_url` fixture.
 
 `backend/tests/test_migration_ddl.py` is the database-free substitute, and it is
 worth reading before you add a revision. It renders the whole chain to SQL
@@ -691,7 +704,7 @@ no-op.
 | What to mark | Any test that touches the database — which in practice means any test whose signature pulls in `client`, `db_session` or `truncated_database` |
 | How | Module-level `pytestmark = pytest.mark.integration`, as in `test_auth.py`, `test_repositories.py`, `test_errors.py`, `test_migrations.py`; per-test `@pytest.mark.integration` where only one test needs it |
 | What must pass offline | `python -m pytest -m "not integration"` with PostgreSQL stopped |
-| Current split | 366 offline, 133 integration, 499 collected |
+| Current split | 2090 collected — 1011 offline, 1079 `integration`. Both halves pass, the integration half against a native PostgreSQL 16 |
 
 Mark a test `integration` because it genuinely needs a database — not because it
 is easier to get green that way. The offline subset is the fast inner loop; a
@@ -766,7 +779,7 @@ internal package path. Pair it with `assert_error_envelope`.
 | Config | `test` block in `frontend/vite.config.ts`; `include: ['src/**/*.{test,spec}.{ts,tsx}']` |
 | Setup | `src/test/setup.ts`, applied per test: `@testing-library/jest-dom/vitest`, `cleanup()`, and shims for `scrollIntoView`, `matchMedia` and `AbortSignal` |
 | Location | Colocated next to the subject (`components/ui/button.test.tsx`), not in a `__tests__` folder |
-| Current suite | 22 files, 134 tests |
+| Current suite | 42 files, 607 tests |
 
 Individual test files should not add their own environment shims — the setup
 file installs them in `beforeEach` and `unstubAllGlobals` in `afterEach` would
@@ -1075,55 +1088,75 @@ And, not command-shaped:
 ## 10. Verified baseline and known limits
 
 These are the numbers this document was written against. They are results, not
-projections.
+projections: every row was produced by running the command in the environment
+described immediately below the table.
 
 | Command | Working directory | Result |
 | --- | --- | --- |
-| `pytest -m "not integration"` | `backend/` | **366 passed, 133 deselected** (499 collected) |
-| `ruff check .` | `backend/` | clean, 62 files |
-| `ruff format --check .` | `backend/` | clean, 62 files |
+| `python -m pytest` | `backend/` | **2090 passed** — the full suite, 1079 of them `integration` tests, against a native PostgreSQL 16 |
+| `python -m pytest -m "not integration"` | `backend/` | **1011 passed, 1079 deselected** |
+| `ruff check .` | `backend/` | clean |
+| `ruff format --check .` | `backend/` | 155 files already formatted, **22 would be reformatted** — see below |
 | `npm run typecheck` | `frontend/` | clean |
 | `npm run lint` | `frontend/` | clean |
-| `npm test` | `frontend/` | 22 files, **134 tests** passing |
-| `npm run build` | `frontend/` | succeeds |
-| `python scripts/verify_compose.py` | repository root | passes — 14 Compose variables, all documented in `.env.example` |
+| `npm test` | `frontend/` | 42 files, **607 tests** passing |
+| `npx vite build` | `frontend/` | succeeds |
+| `python scripts/verify_compose.py` | repository root | passes — 3 services, 14 Compose variables, all documented in `.env.example` |
+
+**One row in that table is not green, and it is recorded rather than hidden.**
+`ruff format --check .` reports 22 files the formatter would rewrite — 10 under `app/` and
+12 under `tests/`, every one of them a Phase 8 or Phase 9 addition (`app/api/deps.py`,
+`app/api/v1/learning.py`, `app/repositories/{learning,career}.py`,
+`app/schemas/developer.py`, the developer/career/learning service modules, and their
+twelve test files). `ruff check .` is clean, so this is formatting only and changes no
+behaviour; but the pre-pull-request checklist asks for both to be clean and this one is
+not. Run `python -m ruff format .` before opening a pull request.
 
 Uncompressed `frontend/dist/assets/` chunk sizes from that build:
 
 | Chunk | Bytes |
 | --- | --- |
-| `react` | 222,295 |
+| `charts` | 432,148 |
+| `react` | 222,425 |
 | `radix` | 113,444 |
-| `router` | 92,153 |
-| `index` (entry) | 91,633 |
-| `settings-page` | 39,952 |
-| `data` | 37,974 |
-| `icons` | 19,199 |
-| `dashboard-page` | 11,760 |
-| per-page placeholder chunks | ~0.40 kB each |
+| `index` (entry) | 104,155 |
+| `router` | 92,238 |
+| `learning-page` (largest route) | 67,842 |
+| `career-page` | 52,538 |
+| `icons` | 46,668 |
+| `data` | 37,965 |
+| `developer-page` | 35,303 |
+| `knowledge-page` | 34,610 |
+| `planner-page` | 32,662 |
+| `settings-page` | 31,313 |
+| `module-page` (the three placeholders) | 2,754 |
 
-Two things to read off that table. A page that renders nothing but the registry is
-~0.40 kB, because the code lives in `ModulePage` and the registry — so a placeholder
-chunk growing by kilobytes means something page-specific has crept in. And
-`settings-page` went from 4.8 kB in Phase 1 to 39.9 kB, which is route splitting
-working: the page that grew got its own chunk rather than inflating the entry.
+Two things to read off that table. `charts` is now the largest chunk in the bundle,
+because Analytics shipped and pulls in recharts — it was reserved for a module that did
+not exist when this list was first written. And the three remaining placeholder routes
+share one 2,754 B `module-page` chunk, because the code lives in `ModulePage` and the
+registry; a placeholder chunk growing by kilobytes means something page-specific has
+crept in.
 
 ### What was **not** verified here
 
-The environment this baseline was captured in had **no PostgreSQL and no Docker**.
-That means:
+The environment this baseline was captured in has a working **native PostgreSQL 16** but
+**no Docker** — `docker` and `docker compose` are both absent from it. That means:
 
 | Not run | Why it matters |
 | --- | --- |
-| `pytest` in full (the 133 integration tests) | The offline subset is green; the database-backed half has not been executed there. This matters more in Phase 2 than in Phase 1, because Phase 2 changed the `users` table, added three more, and put a session row behind nearly every auth path — all of it on the side that has never been exercised here. Run the full suite before trusting a change to a model, repository or migration |
-| `docker compose up` | `docker-compose.yml` has never been executed by `docker compose`. `scripts/verify_compose.py` validates it statically — Compose v2 syntax, three services, real build contexts, existing bind mounts, every `${VAR}` documented — and cannot tell you the stack starts. Treat the first run as untested |
-| `alembic upgrade head` against a live database | `tests/test_migration_ddl.py` renders `0001` and `0002` to SQL offline and compares the emitted DDL against `Base.metadata` — that is real evidence about the DDL, and it is **not** the same as having applied it. A migration can render correctly and still fail on a real server. `alembic check` and `test_autogenerate_reports_no_drift` both need a database and were not run |
+| `docker compose up` | `docker-compose.yml` has never been executed by `docker compose`. `scripts/verify_compose.py` validates it statically — Compose v2 syntax, three services, real build contexts, existing bind mounts, every `${VAR}` documented — and cannot tell you the stack starts. Treat the first run as untested, and note that the images themselves have never been built either |
+| The containers in the production configuration | Nothing here says the `backend` or `frontend` Dockerfile works; only that the repository they build from lints, type-checks, tests and builds |
+| `postgresql:16-alpine` | The suite runs against native PostgreSQL 16.2 on Windows. The Compose path uses the Alpine image and its `docker/postgres/init/` extension script, which nothing here has executed |
 
-Nothing in this document should be read as a claim that those three were
-exercised. They are the parts that still need a machine with a database.
+Everything database-backed **was** run, and against the real thing: the 1079
+`integration` tests cover the repositories, sessions, account deletion, RBAC, password
+reset, the drift check and the detailed-health endpoint, and `alembic upgrade head` is
+applied by the `test_database_url` fixture on every integration session. So the migration
+chain and the queries built on it are exercised, not merely rendered offline.
 
-Two further limitations that are properties of the code, not of the environment,
-so that neither is mistaken for a bug to route around:
+Three further limitations that are properties of the code, not of the environment, so
+that none is mistaken for a bug to route around:
 
 - **`audit_log_retention_days` has no enforcing job.** The setting states a policy
   and gives the value somewhere to be displayed; nothing prunes `audit_logs`, so the
@@ -1132,6 +1165,175 @@ so that neither is mistaken for a bug to route around:
   It exists so the role → permission wiring has a route whose refusal is observable
   end to end, and it returns an unbounded list because a fixture that could itself
   need pagination would be a worse fixture. Do not build UI on it.
+- **Search, AI Assistant and Experiments have no backend at all.** They are the three
+  pages still rendering `ModulePage`, and `/search` in particular is a shortcut hint
+  pointing at work that has not been done.
+
+---
+
+## 11. Developer, Learning and Career settings
+
+Phases 8 and 9 added fourteen environment variables and one workflow — registering a local
+git repository — that has no analogue anywhere else in this codebase. Both are described
+here; both are also in [`.env.example`](../.env.example) with the same wording.
+
+### 11.1 Registering and scanning a local repository
+
+Developer Intelligence reads repositories **on the machine the backend runs on**, through the
+`git` CLI. There is no hosted account to connect and nothing leaves the machine.
+
+#### What you need
+
+| Requirement | Notes |
+| --- | --- |
+| `git` on `PATH` **for the backend process** | Not for your shell. The backend starts `git` as a subprocess, so it inherits the server's environment. A `git` you installed in a shell profile the server never sources is not a `git` the server can find |
+| An absolute path to a git work tree | Relative paths are resolved and stored as absolute, but you should pass the absolute one |
+| An authenticated session | Every route requires a bearer token and `analytics.read` |
+
+#### The flow
+
+```bash
+# 1. register — the server validates the path and proves it is a work tree
+#    BEFORE writing anything, then stores the RESOLVED absolute path
+curl -X POST http://localhost:8000/api/v1/developer/repositories \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"local_path": "E:/Nexo", "name": "Nexo"}'
+
+# 2. scan — synchronous. ?full=false (the default) reads only what landed
+#    since the stored high-water mark
+curl -X POST "http://localhost:8000/api/v1/developer/repositories/$ID/scan" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Or press **Register repository** and **Scan** on `/developer`, which is the same two calls.
+
+#### The rules you cannot see from the HTTP surface
+
+- **Validation happens before the write, not after it.** A row pointing at a directory that
+  is not a repository would fail on every future scan and would already be on the dashboard
+  by the time anybody found out. So the server resolves the path, checks for a `.git` entry,
+  and — when `DEVELOPER_PATH_ALLOWLIST` is configured — proves it is under one of the roots
+  *before* storing.
+- **A bare `git init` with no commits registers successfully.** It is the first thing a user
+  does with this feature, and refusing it would tell them their new project does not exist.
+- **One path may be registered once per account** (`409`). Two *accounts* registering the
+  same directory is allowed: it is a local directory and both may legitimately watch it.
+  The account is capped at `DEVELOPER_MAX_REPOSITORIES`.
+- **`PATCH` cannot move `local_path`.** The path is the row's identity and the one field
+  checked against the filesystem. To repoint a repository, register the new one and remove
+  the old.
+- **The scan is idempotent.** Commits are upserted on `(repository_id, commit_hash)`, so a
+  rescan of an unchanged repository reports `commits_discovered` equal to what git returned
+  and `commits_added` of `0`. **That gap is the proof the upsert worked, not a sign
+  anything went missing.**
+
+#### A failed scan is a row, not an exception
+
+Every scan is wrapped, so a deleted directory, a corrupt `.git`, an unreadable network share
+and a git process that hangs past its timeout all come back as `git_scan_runs` with
+`status: 'error'` and a human sentence in `error`. The route answers **200**.
+
+When you are debugging a repository that will not read, this is the sequence:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/api/v1/developer/repositories/$ID"
+# → last_scan_status, last_scan_error, last_scanned_at
+```
+
+Then work **down the stack**, because each answer rules out a layer:
+
+| Check | Rules out |
+| --- | --- |
+| `last_scan_error`'s sentence | The request never reached git. It is the engine's own message |
+| `git --version` in a shell with the backend's `PATH` | git is not installed for the process that matters |
+| Run the exact path by hand from the backend's working directory | A relative-path or drive-letter problem the server's cwd would explain |
+| Is `DEVELOPER_PATH_ALLOWLIST` set? | The path is outside every configured root — the error sentence says so |
+
+#### The two caveats that will otherwise surprise you
+
+- **After a history rewrite — a rebase, `filter-branch`, a force-push — pass
+  `?full=true`.** The default scan is incremental (`git log --since` the stored
+  `latest_commit_at`), because that is what keeps a rescan cheap and idempotent. After a
+  rewrite that mark points at a commit that no longer exists, and only a full read can
+  recover from it. Nothing detects the situation automatically. This is the single most
+  common "my counts dropped after a rebase" report, and `?full=true` is the answer.
+- **`maintenance_activity` reads low on a repository scanned before per-commit paths were
+  stored.** Migration `0008` deliberately creates **no** `git_commit_files` table — it would
+  grow to millions of rows on a mature codebase to answer questions the phase does not ask —
+  so the metric can only read the commits *this account* recorded. A file somebody else last
+  touched six months ago therefore reads as quiet here, which is a true statement about
+  *this record*. A commit with no recorded file paths cannot be classified and does not
+  count.
+
+#### Windows
+
+NEXUS runs a `SelectorEventLoop` on every platform, because psycopg's async driver needs
+`loop.add_reader` and asyncio's Windows default does not provide it. But on Windows a
+`SelectorEventLoop` raises `NotImplementedError` from `subprocess_exec` — it has no
+subprocess transport at all. The git engine detects this (a **class** test, not a trial
+call, so no unrelated exception is caught and misreported as a repository problem) and runs
+the *same* call on a private `ProactorEventLoop` from a worker thread.
+
+The fallback is deliberately the same function, so the timeout, the output byte ceiling, the
+kill and the stderr sanitiser all still apply. The cost is one thread hop per git
+invocation. On POSIX none of it runs.
+
+### 11.2 The environment variables
+
+Fourteen, all additive, all with the setting name in uppercase and the field name in
+lowercase on `Settings`.
+
+#### Developer (Phase 8)
+
+| Variable | Default | What it controls |
+| --- | --- | --- |
+| `DEVELOPER_GIT_TIMEOUT_SECONDS` | `30` | Wall-clock budget for one `git` invocation. The subprocess is killed when this elapses, so a hung repository becomes an error row rather than a request that never returns |
+| `DEVELOPER_MAX_COMMITS_PER_SCAN` | `2000` | Backstop against a repository whose entire log is new to us. The scan is incremental, so this is not the expected volume |
+| `DEVELOPER_MAX_REPOSITORIES` | `100` | How many paths one account may register. Each is a directory the server will read on demand |
+| `DEVELOPER_DEFAULT_WINDOW_DAYS` | `30` | The window used when a request names no dates. A month, not a week: a week of commits cannot distinguish a habit from an off week |
+| `DEVELOPER_MAX_WINDOW_DAYS` | `366` | Hard ceiling on any requested window. Every windowed aggregate scans the owner's whole commit history, so an unbounded range is the one query shape these indexes cannot serve |
+| `DEVELOPER_ACTIVITY_GRANULARITY_DEFAULT` | `day` | Bucket size for the activity series. One of `day`, `week`, `month`, validated **where it is read** rather than here — an unknown bucket size is a request the caller can be told about, whereas a process that refuses to start takes the whole app down over one analytics preference |
+| `DEVELOPER_PATH_ALLOWLIST` | `""` | Comma-separated roots under which a repository may be registered. Empty means any readable absolute path that validates as a git work tree, which is the right default for a local-first application. Set it in a shared deployment to stop the server reading an arbitrary path at all |
+
+#### Learning and career (Phase 9)
+
+| Variable | Default | What it controls |
+| --- | --- | --- |
+| `LEARNING_DEFAULT_WINDOW_DAYS` | `30` | Same argument as `DEVELOPER_DEFAULT_WINDOW_DAYS`: a skill level is only ever described alongside how much was recorded inside the window |
+| `LEARNING_MAX_WINDOW_DAYS` | `366` | Hard ceiling on any requested window |
+| `LEARNING_MAX_GOALS` | `200` | How many goals one account may keep. **Archived goals still count** — deleting them would delete the record the user kept them for |
+| `LEARNING_MAX_SKILLS` | `100` | How many skills one account may keep. The skills list is the input to every gap calculation, so this cap is also what bounds that computation per request |
+| `LEARNING_MIN_EVIDENCE_FOR_ESTIMATE` | `3` | Below this many activities in the window, NEXUS offers **no** level estimate at all. This is a **refusal**, not a low-confidence badge: a thin sample shown with a "low confidence" label is still a claim, whereas a stated refusal is not |
+| `CAREER_MAX_EVIDENCE` | `500` | Ceiling on rows in one career-evidence list. Everything on a profile is user-supplied or user-approved, so this is a rendering bound rather than a correctness one |
+| `CAREER_STALE_INACTIVE_DAYS` | `21` | After this many days with no recorded activity, a target skill counts as dormant and is eligible for a `REVIVE_TARGET_SKILL` nudge. Three weeks is roughly one review cycle: long enough that someone deep in a project is not nagged, short enough that a habit has visibly lapsed |
+
+#### Two of these deserve a warning before you change them
+
+- **`DEVELOPER_PATH_ALLOWLIST` is a security control, not a preference.** Empty is safe only
+  because NEXUS is local-first and bound to loopback. In any shared deployment, an empty
+  allowlist lets any authenticated account ask the server to run `git` against any directory
+  it can read. Set it.
+- **`LEARNING_MIN_EVIDENCE_FOR_ESTIMATE` is not a tuning knob.** Lowering it to `1` makes
+  every tracked skill with a single recorded activity carry a number NEXUS derived, shown
+  with the same weight as one derived from forty. The default of `3` is the smallest sample
+  the phase considered worth inferring from at all.
+
+### 11.3 Testing the git engine
+
+The git engine is the only code in NEXUS that talks to another program, so its tests are
+structured differently from everything else:
+
+| File | What it does |
+| --- | --- |
+| `tests/test_developer_git.py` | Pure argument construction, output parsing, the timeout/kill path, the sanitiser, the Windows loop-detection. No repository and no subprocess |
+| `tests/test_developer_git_integration.py` | Creates real temporary git repositories, commits into them, and asserts the engine reads what git wrote. Needs `git` on `PATH` and is the slowest Phase 8 file |
+| `tests/test_developer_metrics.py` | Every formula, asserted to the exact value, with **no database and no `.git` directory** — because `metrics.py` is pure |
+
+If you change `metrics.py`, the pure suite is the one that will catch you in under a second.
+If you change `git.py`, the integration file is the only thing that can tell you the change
+is real.
 
 ---
 
@@ -1142,3 +1344,5 @@ so that neither is mistaken for a bug to route around:
 | [`../README.md`](../README.md) | Prerequisites, quick start, environment variables, the command catalogue, troubleshooting, roadmap |
 | [`architecture.md`](architecture.md) | Layering rationale, request lifecycle, error contract, auth design, persistence, decisions and the cost each one accepts |
 | [`api-conventions.md`](api-conventions.md) | Base URL and versioning, the error envelope and its code table, request ids, pagination, the endpoint checklist |
+| [`specifications/phase-8-developer-report.md`](specifications/phase-8-developer-report.md) | What Phase 8 shipped and what was actually executed |
+| [`specifications/phase-9-learning-career-report.md`](specifications/phase-9-learning-career-report.md) | What Phase 9 shipped and what was actually executed |

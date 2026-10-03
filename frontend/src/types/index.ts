@@ -252,3 +252,130 @@ export type {
   RiskSummaryRead,
   RiskType,
 } from './risk'
+
+// Phase 8. Re-exported like every other feature's types so consumers reach them
+// from the barrel rather than importing `@/types/developer` directly. The
+// developer vocabulary is a set of frozen `as const` arrays plus a handful of
+// mirrors of the server's configured defaults, so those go out by value and the
+// rest as types. `PaginationParams` is deliberately absent from the type block:
+// it already comes from './pagination', and exporting it twice collides.
+export {
+  ACTIVITY_GRANULARITIES,
+  DEVELOPER_DEFAULT_ACTIVITY_GRANULARITY,
+  DEVELOPER_DEFAULT_WINDOW_DAYS,
+  DEVELOPER_FEATURE_SCHEMA_VERSIONS,
+  DEVELOPER_METRIC_KEYS,
+  DEVELOPER_METRIC_UNITS,
+  GIT_SCAN_STATUSES,
+  MAX_DEVELOPER_WINDOW_DAYS,
+  NOT_ENOUGH_DATA,
+} from './developer'
+export type {
+  ActivityGranularity,
+  ActivityParams,
+  BranchListRead,
+  BranchRead,
+  CommitListParams,
+  CommitListRead,
+  CommitRead,
+  DeveloperActivityBucketRead,
+  DeveloperActivityRead,
+  DeveloperFeatureSchemaVersion,
+  DeveloperFeatureValues,
+  DeveloperFeatureVectorRead,
+  DeveloperMetricKey,
+  DeveloperMetricRead,
+  DeveloperMetricUnit,
+  DeveloperSummaryRead,
+  DeveloperWindowParams,
+  GitScanStatus,
+  ProjectDeveloperRead,
+  RepositoryCreatePayload,
+  RepositoryFeatureVectorRead,
+  RepositoryListParams,
+  RepositoryListRead,
+  RepositoryRead,
+  RepositoryScanParams,
+  RepositoryUpdatePayload,
+  ScanRunRead,
+} from './developer'
+
+// Phase 9. Re-exported like every other feature's types so consumers reach them
+// from the barrel rather than importing `@/types/learning` directly. The learning
+// and career vocabulary is a set of frozen `as const` arrays plus mirrors of the
+// server's configured defaults, so those go out by value and the rest as types.
+// Four names are deliberately absent from the type block because the barrel
+// already exports them from their own home — `PaginationParams` from
+// './pagination', `ISODateTimeString` and `UUIDString` from './api', and
+// `DateOnlyString` (as `WorkDateOnlyString`) plus `ProjectPriority` from
+// './work'. `./learning` re-exports the first three itself, so naming any of
+// them here would be a duplicate export of one symbol.
+export {
+  CAREER_EVIDENCE_TYPES,
+  CAREER_FEATURE_SCHEMA_VERSIONS,
+  CAREER_MAX_EVIDENCE,
+  CAREER_RECORD_KINDS,
+  CAREER_STALE_INACTIVE_DAYS,
+  INSUFFICIENT_DATA_MESSAGE,
+  LEARNING_ACTIVITY_TYPES,
+  LEARNING_DEFAULT_WINDOW_DAYS,
+  LEARNING_FEATURE_SCHEMA_VERSIONS,
+  LEARNING_GOAL_STATUSES,
+  LEARNING_MAX_GOALS,
+  LEARNING_MAX_SKILLS,
+  LEARNING_METRIC_UNITS,
+  LEARNING_MIN_EVIDENCE_FOR_ESTIMATE,
+  MAX_LEARNING_WINDOW_DAYS,
+  MAX_SKILL_LEVEL,
+  MIN_SKILL_LEVEL,
+  SKILL_LEVEL_SOURCES,
+} from './learning'
+export type {
+  CareerEvidenceCreatePayload,
+  CareerEvidenceListParams,
+  CareerEvidenceListRead,
+  CareerEvidenceRead,
+  CareerEvidenceType,
+  CareerEvidenceUpdatePayload,
+  CareerExperienceCreatePayload,
+  CareerExperienceListParams,
+  CareerExperienceListRead,
+  CareerExperienceRead,
+  CareerExperienceUpdatePayload,
+  CareerFeatureSchemaVersion,
+  CareerFeatureValues,
+  CareerFeatureVectorRead,
+  CareerProfileRead,
+  CareerProfileUpsert,
+  CareerRecordKind,
+  CareerSummaryRead,
+  LearningActivityBucketRead,
+  LearningActivityCreatePayload,
+  LearningActivityListParams,
+  LearningActivityListRead,
+  LearningActivityRead,
+  LearningActivitySeriesRead,
+  LearningActivityType,
+  LearningFeatureSchemaVersion,
+  LearningFeatureValues,
+  LearningFeatureVectorRead,
+  LearningGoalCreatePayload,
+  LearningGoalListParams,
+  LearningGoalListRead,
+  LearningGoalRead,
+  LearningGoalStatus,
+  LearningGoalUpdatePayload,
+  LearningMetricRead,
+  LearningMetricUnit,
+  LearningSummaryRead,
+  LearningWindowParams,
+  SkillCreatePayload,
+  SkillGapListRead,
+  SkillGapParams,
+  SkillGapRead,
+  SkillLevelSource,
+  SkillListParams,
+  SkillListRead,
+  SkillRead,
+  SkillUpdatePayload,
+} from './learning'

@@ -44,9 +44,14 @@ from enum import StrEnum
 __all__ = [
     "ActivityEvent",
     "CalendarEventType",
+    "CareerEvidenceType",
+    "CareerRecordKind",
     "EvidenceStrength",
+    "GitScanStatus",
     "KnowledgeEntityType",
     "KnowledgeLinkType",
+    "LearningActivityType",
+    "LearningGoalStatus",
     "NoteStatus",
     "ProjectPriority",
     "ProjectStatus",
@@ -57,13 +62,19 @@ __all__ = [
     "RiskSeverity",
     "RiskStatus",
     "RiskType",
+    "SkillLevelSource",
     "TaskPriority",
     "TaskStatus",
     "WorkSessionStatus",
     "validate_activity_event",
     "validate_calendar_event_type",
+    "validate_career_evidence_type",
+    "validate_career_record_kind",
+    "validate_git_scan_status",
     "validate_knowledge_entity_type",
     "validate_knowledge_link_type",
+    "validate_learning_activity_type",
+    "validate_learning_goal_status",
     "validate_note_status",
     "validate_project_priority",
     "validate_project_status",
@@ -72,6 +83,7 @@ __all__ = [
     "validate_resource_type",
     "validate_risk_status",
     "validate_risk_type",
+    "validate_skill_level_source",
     "validate_task_priority",
     "validate_task_status",
     "validate_work_session_status",
@@ -370,6 +382,41 @@ class ActivityEvent(StrEnum):
     RECOMMENDATION_REJECTED = "recommendation_rejected"
     RECOMMENDATION_COMPLETED = "recommendation_completed"
 
+    # -- Phase 8 (Developer Intelligence) -------------------------------------
+    # Repository and commit facts are recorded here for the same reason the task
+    # lifecycle is: they are the trail Phase 6 analytics reads and the surface
+    # Phase 10 learns from. A scan writes one REPOSITORY_SCANNED row rather than
+    # one row per commit, because a re-scan of an unchanged repository is not new
+    # history — COMMIT_DETECTED is reserved for a commit the scan had not seen.
+    REPOSITORY_REGISTERED = "repository_registered"
+    REPOSITORY_UPDATED = "repository_updated"
+    REPOSITORY_SCANNED = "repository_scanned"
+    REPOSITORY_REMOVED = "repository_removed"
+    COMMIT_DETECTED = "commit_detected"
+    BRANCH_CREATED = "branch_created"
+    BRANCH_CHANGED = "branch_changed"
+    FILE_ACTIVITY_DETECTED = "file_activity_detected"
+
+    # -- Phase 9 (Learning & Career) -----------------------------------------
+    # The learning and career lifecycle is recorded here for the same reason the
+    # task lifecycle is: these rows are the trail Phase 6 analytics reads and
+    # the surface Phase 10 learns from. What is deliberately *not* recorded is
+    # anything that would be an inferred quality — there is no `SKILL_LEVEL_
+    # ESTIMATED` event, because an estimate is a read-time derivation over the
+    # activities below and not a moment that happened. The evidence for a
+    # number is the `LEARNING_SESSION_RECORDED` and `SKILL_ACTIVITY_RECORDED`
+    # rows; the claim itself is a column, and a column can say who made it.
+    LEARNING_GOAL_CREATED = "learning_goal_created"
+    LEARNING_GOAL_UPDATED = "learning_goal_updated"
+    LEARNING_GOAL_COMPLETED = "learning_goal_completed"
+    LEARNING_SESSION_RECORDED = "learning_session_recorded"
+    SKILL_CREATED = "skill_created"
+    SKILL_UPDATED = "skill_updated"
+    SKILL_ACTIVITY_RECORDED = "skill_activity_recorded"
+    CAREER_PROFILE_UPDATED = "career_profile_updated"
+    CAREER_EVIDENCE_ADDED = "career_evidence_added"
+    CAREER_EVIDENCE_UPDATED = "career_evidence_updated"
+
 
 def validate_project_status(value: ProjectStatus | str) -> ProjectStatus:
     """Coerce a stored or user-supplied value into a :class:`ProjectStatus`.
@@ -629,6 +676,16 @@ class RecommendationType(StrEnum):
     reschedule anything without confirmation, and encoding that as a type list
     containing no "do it now" member makes the constraint structural rather
     than a rule somebody has to remember at each call site.
+
+    The two Phase 9 members are the same kind of thing as the Phase 7 eight.
+    Both name something the *user* does with their own learning record — book
+    sessions against a goal they set, or record a practice activity — and
+    neither says anything about the person: ``REVIEW_LEARNING_GOAL`` is about a
+    deadline and a percentage the user themselves entered, and
+    ``REVIVE_TARGET_SKILL`` is about days since the last activity NEXUS was
+    told about. A level is the user's or visibly derived, and neither member
+    carries a claim about ability into the vocabulary that a rule might later
+    hang one on.
     """
 
     RESCHEDULE_TASK = "reschedule_task"
@@ -641,6 +698,8 @@ class RecommendationType(StrEnum):
     BLOCK_TIME = "block_time"
     COMPLETE_BLOCKED_TASK = "complete_blocked_task"
     REVIEW_PROJECT = "review_project"
+    REVIEW_LEARNING_GOAL = "review_learning_goal"
+    REVIVE_TARGET_SKILL = "revive_target_skill"
 
 
 class RecommendationStatus(StrEnum):
@@ -759,3 +818,257 @@ def validate_recommendation_status(value: RecommendationStatus | str) -> Recomme
         return RecommendationStatus(value)
     except ValueError:
         raise ValueError(f"Unknown recommendation status: {value!r}") from None
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — the developer-intelligence vocabulary
+# ---------------------------------------------------------------------------
+
+
+class GitScanStatus(StrEnum):
+    """The outcome of one attempt to read a repository from disk.
+
+    ``PENDING`` is not a member: a scan is a synchronous request, so a row is only
+    ever written once the attempt has already finished.
+
+    Two members, because two is what the scan boundary needs. Every scan is
+    wrapped, so a repository git cannot read — deleted mid-request, corrupt, not
+    a work tree, past the timeout — comes back as an ``ERROR`` row carrying a
+    human sentence instead of an exception that takes the page down. A third
+    "in flight" member would be a state the server never spends time in and would
+    leave the health of a repository unanswerable for the duration of every scan.
+
+    Persisted on ``git_scan_runs.status`` and mirrored onto
+    ``git_repositories.last_scan_status``.
+    """
+
+    OK = "ok"
+    ERROR = "error"
+
+
+def validate_git_scan_status(value: GitScanStatus | str) -> GitScanStatus:
+    """Coerce a stored or user-supplied value into a :class:`GitScanStatus`.
+
+    Raises:
+        ValueError: If not a known status. ``git_scan_runs.status`` is what the
+            "when did this repository last stop being readable" query filters
+            on, and ``git_repositories.last_scan_status`` is what decides whether
+            a registration is presented as healthy or as failed. A value neither
+            recognises leaves a scan row that reports neither outcome — the
+            repository looks scanned, and nothing can say whether it succeeded.
+    """
+    if isinstance(value, GitScanStatus):
+        return value
+    try:
+        return GitScanStatus(value)
+    except ValueError:
+        raise ValueError(f"Unknown git scan status: {value!r}") from None
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — the learning and career vocabulary
+# ---------------------------------------------------------------------------
+
+
+class LearningGoalStatus(StrEnum):
+    """Where a learning goal sits in its own life.
+
+    ``ARCHIVED`` is separate from ``COMPLETED`` because a finished goal the user
+    still wants as a record and a goal they have dismissed are different facts,
+    and an archived goal must not count as incomplete work anywhere.
+
+    ``PAUSED`` is a member rather than a comment on ``NOT_STARTED`` for the same
+    reason the planner has a separate "on hold" state: a goal the user intends
+    to return to in March is not a goal they have abandoned, and merging the two
+    would make every "still open" count lie about one of them.
+    """
+
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+
+
+class SkillLevelSource(StrEnum):
+    """Who is allowed to claim a number for a skill level.
+
+    This is the single most important honesty control in Phase 9. A level the
+    user typed is a claim they are making and NEXUS merely records; a level
+    NEXUS derived is an inference it must be able to show its working for.
+
+    There is deliberately no "unknown" member and no null: a skill with no level
+    is not a skill with an unknown level, and a row that could hold either would
+    let an inference be presented as a self-assessment by accident. The source is
+    written with the number, every time, so the UI never has to guess which of
+    the two it is about to render.
+
+    Persisted on ``skills.level_source``.
+    """
+
+    USER_DEFINED = "user_defined"
+    SYSTEM_ESTIMATE = "system_estimate"
+
+
+class LearningActivityType(StrEnum):
+    """What kind of event counts as evidence that something was learned.
+
+    Each member is a fact NEXUS can point at a record for. None of them implies
+    understanding — ``RESOURCE_VIEWED`` in particular records that a page was
+    opened, which is the weakest of these and is weighted as such.
+
+    ``CODING_ACTIVITY`` exists so that Phase 8's repository facts can be
+    referenced as evidence without being re-described as learning: the row says
+    *this activity happened and here is the thing it came from*, and the
+    ``source_type``/``source_id`` pair says what that thing was. NEXUS never
+    converts a commit into a claim that a task was completed.
+
+    Persisted on ``learning_activities.activity_type``.
+    """
+
+    STUDY_SESSION = "study_session"
+    TASK_COMPLETED = "task_completed"
+    NOTE_CREATED = "note_created"
+    RESOURCE_VIEWED = "resource_viewed"
+    CONCEPT_LEARNED = "concept_learned"
+    PROJECT_COMPLETED = "project_completed"
+    CODING_ACTIVITY = "coding_activity"
+
+
+class CareerEvidenceType(StrEnum):
+    """A thing worth putting in front of someone who is deciding about you.
+
+    ``CERTIFICATION`` and ``ACHIEVEMENT`` are user-entered rows and nothing
+    else. NEXUS never creates a certification, never dates one, and never
+    infers one from activity — the absence of a generator is what makes the
+    rest of this table trustworthy, so these two members carry no machinery
+    behind them at all.
+
+    The remaining five are types a *derived* row may have, and each names the
+    subsystem it would have come from, so ``career_evidence.source`` and
+    ``career_evidence.evidence_type`` can be checked against each other rather
+    than trusted to agree.
+
+    Persisted on ``career_evidence.evidence_type``.
+    """
+
+    PROJECT_COMPLETED = "project_completed"
+    FEATURE_SHIPPED = "feature_shipped"
+    REPOSITORY_ACTIVITY = "repository_activity"
+    SKILL_ACTIVITY = "skill_activity"
+    LEARNING_MILESTONE = "learning_milestone"
+    CERTIFICATION = "certification"
+    ACHIEVEMENT = "achievement"
+
+
+class CareerRecordKind(StrEnum):
+    """A line on the career profile that is a record rather than an achievement.
+
+    Education, work experience and certifications are the dated history a
+    profile is made of, and they are three different *kinds* of claim — one was
+    studied, one was worked, one was passed. Collapsing them into an undifferentiated
+    "entry" list would lose exactly the part a reader is scanning for.
+
+    There is no ``OTHER`` here, unlike :class:`CalendarEventType` or
+    :class:`ResourceType`: those hold a *characterisation* the user applies to
+    their own life and "other" is a useful answer. This column picks which of
+    three record shapes is being written, so a fourth kind would need a fourth
+    shape to go with it.
+
+    Persisted on ``career_experience.kind``.
+    """
+
+    EDUCATION = "education"
+    EXPERIENCE = "experience"
+    CERTIFICATION = "certification"
+
+
+def validate_learning_goal_status(value: LearningGoalStatus | str) -> LearningGoalStatus:
+    """Coerce a stored or user-supplied value into a :class:`LearningGoalStatus`.
+
+    Raises:
+        ValueError: If the value is not a known status. ``status`` is what the
+            open-goals, overdue-goals and completion-rate queries all filter on,
+            so an unrecognised value leaves a goal that counts as neither
+            finished nor outstanding — the one place where being wrong cannot be
+            noticed from the numbers, because the total still adds up.
+    """
+    if isinstance(value, LearningGoalStatus):
+        return value
+    try:
+        return LearningGoalStatus(value)
+    except ValueError:
+        raise ValueError(f"Unknown learning goal status: {value!r}") from None
+
+
+def validate_skill_level_source(value: SkillLevelSource | str) -> SkillLevelSource:
+    """Coerce a stored or user-supplied value into a :class:`SkillLevelSource`.
+
+    Raises:
+        ValueError: If not a known source. This is the Phase 9 honesty control
+            and it is the one place where a bad value is not merely
+            unrenderable: a row whose source nothing recognises would have to be
+            rendered by the UI, and the only safe rendering is the cautious one.
+            Failing the write instead means a skill level can never reach a
+            screen without a stated provenance.
+    """
+    if isinstance(value, SkillLevelSource):
+        return value
+    try:
+        return SkillLevelSource(value)
+    except ValueError:
+        raise ValueError(f"Unknown skill level source: {value!r}") from None
+
+
+def validate_learning_activity_type(
+    value: LearningActivityType | str,
+) -> LearningActivityType:
+    """Coerce a stored or user-supplied value into a :class:`LearningActivityType`.
+
+    Raises:
+        ValueError: If not a known type. ``activity_type`` is what separates a
+            weighted study session from an unweighted page view, so an
+            unrecognised value would silently land in whichever bucket the
+            query forgot to exclude — and the evidence count behind a skill
+            level would then overstate itself.
+    """
+    if isinstance(value, LearningActivityType):
+        return value
+    try:
+        return LearningActivityType(value)
+    except ValueError:
+        raise ValueError(f"Unknown learning activity type: {value!r}") from None
+
+
+def validate_career_evidence_type(value: CareerEvidenceType | str) -> CareerEvidenceType:
+    """Coerce a stored or user-supplied value into a :class:`CareerEvidenceType`.
+
+    Raises:
+        ValueError: If not a known type. ``evidence_type`` is one of the six
+            columns of ``uq_career_evidence_source_identity``, so a value nothing
+            recognises does not merely fail to render — it defeats the
+            constraint that is the entire deduplication mechanism for derived
+            career evidence.
+    """
+    if isinstance(value, CareerEvidenceType):
+        return value
+    try:
+        return CareerEvidenceType(value)
+    except ValueError:
+        raise ValueError(f"Unknown career evidence type: {value!r}") from None
+
+
+def validate_career_record_kind(value: CareerRecordKind | str) -> CareerRecordKind:
+    """Coerce a stored or user-supplied value into a :class:`CareerRecordKind`.
+
+    Raises:
+        ValueError: If not a known kind. The three members are the three record
+            shapes the profile renders, and an unrecognised one is a row that
+            appears in no section of the timeline it was filed under.
+    """
+    if isinstance(value, CareerRecordKind):
+        return value
+    try:
+        return CareerRecordKind(value)
+    except ValueError:
+        raise ValueError(f"Unknown career record kind: {value!r}") from None

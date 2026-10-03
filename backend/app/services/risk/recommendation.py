@@ -64,25 +64,66 @@ caller is
 :meth:`~app.services.risk.detection.RiskDetectionService.evaluate`, which writes
 that length into ``risk_evaluations.recommendations_created``; counting a
 refreshed suggestion as a creation would make the run summary claim suggestions
-the user has already seen.
+the user has already seen. :meth:`RecommendationService.generate_learning`
+returns creations on the same terms.
 
 One gap, named rather than papered over
 ---------------------------------------
-:data:`recommendation_rules` maps :class:`~app.models.enums.RiskType` to the rules
-that fire on it, and :data:`~app.models.enums.RiskType.SCHEDULING` maps to no
-rules at all. The contracts freeze eight rules, none of them a scheduling one, so
-a scheduling risk is raised and stored without a suggestion attached. That is a
+:data:`recommendation_rules` maps a key to the rules that fire on it, and
+:data:`~app.models.enums.RiskType.SCHEDULING` maps to no rules at all. The Phase 7
+contracts freeze eight risk-raised rules, none of them a scheduling one, so a
+scheduling risk is raised and stored without a suggestion attached. That is a
 deliberate reading of a frozen contract rather than an oversight: inventing a
 ninth rule here would put a column other agents are already coding against behind
 a name nobody agreed on. The empty tuple is spelled in the table so the gap is
 visible as data — adding the rule later is one entry in one dict.
 
+Learning rules read the record rather than a risk
+--------------------------------------------------
+Phase 9 adds two more rules, and they are the first ones here with **no raising
+risk behind them**. A goal whose target date is 14 days out at 35% recorded
+progress is a real condition long before any detector scores anything, and an
+account can hold one for an account that has no projects, no tasks and no risks
+at all — which is exactly the account the learning pages are built for. So
+:data:`recommendation_rules` gains one more key, ``None``, meaning "rules that
+raise from the user's own record", and :meth:`RecommendationService.generate_learning`
+walks it in the same way :meth:`~RecommendationService.generate` walks the risk
+types: resolve the name through the same ``getattr``, run the rule, deduplicate on
+the same identity, persist through the same :meth:`~RecommendationService._persist`.
+There is no second dispatch path, no parallel registry and no second dedup.
+
+Two consequences are worth stating, because both are the phase's rules rather than
+stylistic preferences.
+
+**A learning rule proposes; it never asserts a level.** The copy quotes the
+percent the *user* entered on the goal and, for a dormant skill, the level the
+*user* set — carried with its :class:`~app.models.enums.SkillLevelSource` phrase
+from :mod:`app.services.learning.gaps`, so "2/5" is always rendered as "a
+self-assessed 2/5" or "a NEXUS system estimate of 2/5" and never as a bare
+number. Nothing reads a level as a statement about a person, and no sentence here
+names hours worked, effort or ability.
+
+**A missing figure is a reason to decline, not a zero.** A goal with no
+``target_date`` cannot be approaching a deadline, and a skill that has never had
+an activity recorded against it has no recency to be stale about — so both rules
+say nothing rather than inventing "0 days" or "0%". Both are no-ops, not errors:
+an account with no learning data produces no suggestion at all, exactly as an
+account with no risks does.
+
+**No ML, here or anywhere else in this engine.** Both rules are a comparison
+against a stated threshold and an arithmetic difference, in that order. There is
+no score, no fitted coefficient and no ranking; the priority ladders below are
+hand-written bands read off the same figure the reason quotes, so a suggestion's
+urgency is a fact about the record rather than an output of a model.
+
 What the rules need, and why the constructor looks like it does
 --------------------------------------------------------------
-Four collaborators, matching the contracts: the risk repository (every write and
+Five collaborators, matching the contracts: the risk repository (every write and
 the dedup lookup), the task and project repositories (a suggestion that names a
 task or a project has to name the *right* one, and the metadata captured at
-detection time is a snapshot rather than a lookup), and the activity sink.
+detection time is a snapshot rather than a lookup), the learning repository (the
+two Phase 9 rules have no risk to read and no other table that holds a goal, a
+skill or the date of the last activity against one), and the activity sink.
 
 The activity sink is also a **reader** here, not only a writer.
 :meth:`RecommendationService._rule_break_down_task` answers "how many times has
@@ -99,9 +140,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
+
+from sqlalchemy import func, select
 
 from app.core.exceptions import ConflictError, NotFoundError
 from app.models.enums import (
@@ -111,22 +154,36 @@ from app.models.enums import (
     RecommendationType,
     RiskSeverity,
     RiskType,
+    SkillLevelSource,
     TaskStatus,
     validate_recommendation_type,
     validate_risk_type,
+    validate_skill_level_source,
 )
+from app.models.learning import MAX_SKILL_LEVEL
 from app.models.risk import LIVE_RISK_STATUSES, Recommendation, Risk
 from app.models.user import User
 from app.repositories.project import ProjectRepository
 from app.repositories.risk import RiskRepository
 from app.repositories.task import TaskRepository
 from app.services.activity_service import ActivityService
+from app.services.learning.gaps import LEVEL_SOURCE_PHRASES
+from app.services.learning.metrics import OPEN_GOAL_STATUSES
 from app.services.risk.scoring import DEFAULT_SEVERITY_THRESHOLDS
 
+if TYPE_CHECKING:
+    from app.models.learning import LearningGoal, Skill
+    from app.repositories.learning import LearningRepository
+
 __all__ = [
+    "DEFAULT_STALE_INACTIVE_DAYS",
     "ENTITY_ACCOUNT",
+    "ENTITY_LEARNING_GOAL",
     "ENTITY_PROJECT",
+    "ENTITY_SKILL",
     "ENTITY_TASK",
+    "GOAL_DEADLINE_HORIZON_DAYS",
+    "GOAL_LOW_PROGRESS_PERCENT",
     "MIN_RESCHEDULES",
     "Recommendation",
     "RecommendationDraft",
@@ -134,7 +191,7 @@ __all__ = [
     "recommendation_rules",
 ]
 
-#: The three values ``risks.entity_type`` and ``recommendations.entity_type``
+#: The five values ``risks.entity_type`` and ``recommendations.entity_type``
 #: can hold. Spelled here rather than imported from
 #: :mod:`app.services.risk.detection` for the reason
 #: :mod:`app.repositories.risk` duplicates its index predicates: a rule module
@@ -147,10 +204,97 @@ ENTITY_TASK = "task"
 ENTITY_PROJECT = "project"
 ENTITY_ACCOUNT = "account"
 
+#: The two Phase 9 values, added to the same vocabulary rather than to a column.
+#: A suggestion about a learning goal or a skill is filed exactly the way a
+#: suggestion about a task is: ``entity_type`` names which table ``entity_id``
+#: points at, and nothing else changes. There is no foreign key and no new column
+#: because ``entity_id`` never had one — it is a polymorphic pointer, the same
+#: shape ``learning_activities.source_type``/``source_id`` already uses — so a
+#: suggestion can already point at a row in a table this engine did not know about
+#: when the column was declared. A rule that filed these under :data:`ENTITY_ACCOUNT`
+#: would lose the one thing that lets the UI link the card to the goal it names.
+ENTITY_LEARNING_GOAL = "learning_goal"
+ENTITY_SKILL = "skill"
+
 #: Recorded ``TASK_RESCHEDULED`` events on one task before the break-it-down rule
 #: speaks. Three is the point at which a task has been moved three times rather
 #: than adjusted once or twice, and it is the threshold the contracts name.
 MIN_RESCHEDULES = 3
+
+#: How close a goal's own target date has to be before the deadline rule speaks.
+#: Thirty days rather than the deadline rule's hours because the unit is different
+#: in kind: a task due tomorrow is a scheduling problem with a number of minutes to
+#: find, while a goal due in a month is an intention the user set months ago and a
+#: nudge about it inside the last fortnight would be reacting to noise rather than
+#: to the record. A goal with **no** target date is not inside this window at all
+#: and is declined rather than measured — see the rule.
+GOAL_DEADLINE_HORIZON_DAYS = 30
+
+#: The recorded progress, in percent, below which a goal inside the horizon is
+#: worth saying something about. Fifty is the midpoint of the 0-100 column
+#: ``ck_learning_goals_progress_range`` enforces, and the figure quoted in the
+#: reason is the user's own number — never a sum over the activities recorded
+#: against the goal, because a study session and a percentage are different units
+#: and converting between them is the first step towards NEXUS claiming to know
+#: whether somebody learned something.
+GOAL_LOW_PROGRESS_PERCENT = 50
+
+#: How many days without a recorded activity make a tracked skill dormant enough
+#: to mention. Mirrors ``career_stale_inactive_days`` in :mod:`app.core.config`,
+#: which is the value a deployment tunes; this is the default so the rule can be
+#: exercised without a settings object, and :meth:`RecommendationService.__init__`
+#: takes the configured number in preference to it. Three weeks is roughly one
+#: review cycle: long enough that somebody deep in a project is not nagged, short
+#: enough that a lapsed habit is still visible on the record.
+DEFAULT_STALE_INACTIVE_DAYS = 21
+
+#: Priority bands for the goal-deadline rule, read off the *days remaining* — the
+#: same figure the reason quotes, so urgency and justification cannot disagree.
+#: The first band whose ceiling the distance falls inside wins, and a date that
+#: has already passed is the first band because "you are two weeks late" is a
+#: stronger reason to open the goal than "you have a fortnight".
+_GOAL_DEADLINE_PRIORITY: tuple[tuple[int, RecommendationPriority], ...] = (
+    (0, RecommendationPriority.CRITICAL),
+    (7, RecommendationPriority.HIGH),
+    (GOAL_DEADLINE_HORIZON_DAYS, RecommendationPriority.MEDIUM),
+)
+
+#: Priority bands for the dormant-skill rule, read off the **number of levels
+#: still to go** on the record. Both figures are the user's: the current level is
+#: theirs or is an estimate carrying its own phrase, and the target is theirs.
+#: The ordering is the honest one — a skill dormant since January with three
+#: levels to climb is worth more attention than a dormant one that is a single
+#: step from where the user says they already are.
+#:
+#: **Medium is the ceiling, and that is a decision rather than an oversight.** The
+#: action this rule proposes is "record one short practice activity", which costs
+#: its reader nothing to defer to next week; ranking it above medium would be
+#: NEXUS manufacturing urgency out of two numbers the user typed. The ladder is
+#: still a real derivation — a two-level gap and a one-level gap are different
+#: records and do not get the same answer — but neither of them is an emergency.
+_SKILL_GAP_PRIORITY: tuple[tuple[int, RecommendationPriority], ...] = (
+    (2, RecommendationPriority.MEDIUM),
+    (1, RecommendationPriority.LOW),
+)
+
+#: The goal states the rule will raise something about, as their stored strings.
+#: Derived from :data:`app.services.learning.metrics.OPEN_GOAL_STATUSES` rather
+#: than restated, for that module's reason: a completed or archived goal is not
+#: outstanding work, and a paused one is still something the user intends to return
+#: to. Two lists of the same three strings is a list that will disagree the day a
+#: state is added to one of them.
+_OPEN_GOAL_STATUSES: frozenset[str] = frozenset(status.value for status in OPEN_GOAL_STATUSES)
+
+#: Page size the learning sweeps read in. The repository's own default rather than
+#: a new constant, and the sweep stops on a short page rather than assuming one
+#: statement was enough.
+_LEARNING_PAGE_SIZE = 200
+
+#: Ceiling on the rows one learning sweep will walk. ``learning_max_goals`` and
+#: ``learning_max_skills`` cap the account at 200 each, so this is slack rather
+#: than a policy — it exists so a retuned cap cannot turn the paging loop into an
+#: unbounded one, and it is checked per row rather than per page.
+_LEARNING_SCAN_LIMIT = 1_000
 
 #: A recommendation's priority is the raising risk's severity, read through this
 #: table. Keyed by member rather than by position so that re-ordering either enum
@@ -177,9 +321,14 @@ _MEDIUM_FLOOR: int = next(
 )
 
 #: What a rule looks like. Every rule is an async method taking keyword-only
-#: ``owner`` and ``risk`` and returning a draft or ``None``; the type alias says
-#: so once instead of in eight signatures.
-_Rule = Callable[..., Awaitable["RecommendationDraft | None"]]
+#: ``owner`` and ``risk`` and returning a draft, several drafts, or nothing; the
+#: type alias says so once instead of in ten signatures.
+#:
+#: ``risk`` is ``None`` for the two Phase 9 rules, which are registered under the
+#: ``None`` key and raised from the user's own record rather than from a stored
+#: condition — that is the whole difference between them and the other eight, and
+#: it is stated in the type rather than left to be discovered from a ``KeyError``.
+_Rule = Callable[..., Awaitable["RecommendationDraft | Sequence[RecommendationDraft] | None"]]
 
 #: Shared with ``app.api.v1.recommendations`` on purpose. The two surfaces
 #: answer the same condition — an id that is not the caller's, and an id
@@ -187,6 +336,10 @@ _Rule = Callable[..., Awaitable["RecommendationDraft | None"]]
 #: sentences. Neither wording leaks which case it was; both simply read
 #: better than a generic 404 body.
 _RECOMMENDATION_NOT_FOUND = "That recommendation does not exist."
+
+#: The row type a page-producing read returns. One name for the two learning
+#: sweeps so :meth:`RecommendationService._scan` is typed rather than ``Any``.
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,15 +362,26 @@ class RecommendationDraft:
 
     recommendation_type: RecommendationType
     #: Derived from the raising risk's severity by
-    #: :meth:`RecommendationService._draft`. Present on the carrier because
+    #: :meth:`RecommendationService._draft`, or read off the rule's own figure
+    #: through :meth:`RecommendationService._learning_draft` when there is no
+    #: risk. Present on the carrier because
     #: :meth:`~app.repositories.risk.RiskRepository.upsert_recommendation` writes
-    #: it, and rules do not set it.
+    #: it, and rules do not set it by hand.
     priority: RecommendationPriority
     title: str
     description: str
     reason: str
     entity_type: str | None
     entity_id: uuid.UUID | None
+    #: Ids, numbers and vocabulary strings the rule derived along the way, stored
+    #: beside the suggestion by :meth:`RecommendationService._persist` so a
+    #: suggestion raised from a goal or a skill is as auditable months later as one
+    #: raised from a risk. Empty rather than absent because the two Phase 9 rules
+    #: fill it and the eight risk rules have nothing to add that the risk row does
+    #: not already carry — the risk's own ``metadata`` is its provenance, and a
+    #: second copy of it inside the suggestion is how two documents start
+    #: disagreeing.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Reject a draft that would render as a bare imperative.
@@ -244,7 +408,8 @@ class RecommendationDraft:
             )
 
 
-#: Which rules fire on which kind of risk.
+#: Which rules fire on which kind of risk — and, under the ``None`` key, which
+#: fire on no kind of risk at all.
 #:
 #: The mapping is a name of a method on :class:`RecommendationService` rather
 #: than a callable, so the table is readable in one screen and a rule cannot be
@@ -253,10 +418,20 @@ class RecommendationDraft:
 #: both the blocked-work and the review-the-signals suggestion — lists them in the
 #: order the stronger one should be read first.
 #:
+#: :data:`None` is the Phase 9 scope. It is not a ninth
+#: :class:`~app.models.enums.RiskType` and deliberately not one: a risk type is a
+#: condition a detector knows how to re-derive, and neither of these two is a
+#: condition anybody has scored. They are read from ``learning_goals`` and
+#: ``skills`` directly by
+#: :meth:`RecommendationService.generate_learning`, which hands every name under
+#: this key ``risk=None``. One registry, one dispatch, one dedup — and a
+#: suggestion raised with no risk behind it, which ``recommendations.risk_id`` is
+#: nullable for.
+#:
 #: The empty tuple for :data:`~app.models.enums.RiskType.SCHEDULING` is the
-#: documented gap this module's docstring describes: the contracts freeze eight
-#: rules and none of them proposes an action for a fault in the plan.
-recommendation_rules: Mapping[RiskType, tuple[str, ...]] = {
+#: documented gap this module's docstring describes: the Phase 7 contracts freeze
+#: eight rules and none of them proposes an action for a fault in the plan.
+recommendation_rules: Mapping[RiskType | None, tuple[str, ...]] = {
     RiskType.DEADLINE: ("_rule_block_time", "_rule_review_deadline"),
     RiskType.WORKLOAD: ("_rule_reduce_workload",),
     RiskType.TASK: ("_rule_complete_blocked_task", "_rule_break_down_task"),
@@ -264,6 +439,7 @@ recommendation_rules: Mapping[RiskType, tuple[str, ...]] = {
     RiskType.ESTIMATION: ("_rule_update_estimate",),
     RiskType.CONSISTENCY: ("_rule_review_consistency",),
     RiskType.SCHEDULING: (),
+    None: ("_rule_review_learning_goal", "_rule_revive_target_skill"),
 }
 
 
@@ -282,6 +458,8 @@ class RecommendationService:
         tasks: TaskRepository,
         projects: ProjectRepository,
         activity: ActivityService | None = None,
+        learning: LearningRepository | None = None,
+        stale_inactive_days: int = DEFAULT_STALE_INACTIVE_DAYS,
     ) -> None:
         """Wire the service.
 
@@ -299,11 +477,26 @@ class RecommendationService:
                 isolation, and the one thing it costs is that the reschedule rule
                 declines rather than guessing a count. The API layer is not that
                 caller; see :func:`app.api.deps.get_recommendation_service`.
+            learning: Phase 9 learning persistence, read by the two rules that
+                raise from a goal or a skill rather than from a risk. ``None``
+                declines both of them, for the same reason ``activity=None``
+                declines the reschedule rule: a suggestion justified by a figure
+                this service never read is the fabricated figure the whole engine
+                is built to avoid, and every read here is owner-scoped inside the
+                repository, so there is no "which account's goals" question to
+                answer badly when the caller simply has not wired them.
+            stale_inactive_days: How many days without a recorded activity make a
+                tracked skill dormant. Pass ``settings.career_stale_inactive_days``
+                so a deployment gets its own number; the default is that setting's
+                documented value, which keeps a caller that has no settings object
+                from having to invent one.
         """
         self.risks = risks
         self.tasks = tasks
         self.projects = projects
         self.activity = activity
+        self.learning = learning
+        self.stale_inactive_days = max(1, int(stale_inactive_days))
 
     # -- Generation ----------------------------------------------------------
 
@@ -350,9 +543,62 @@ class RecommendationService:
             if not _is_live(risk):
                 continue
             for rule_name in recommendation_rules[validate_risk_type(risk.risk_type)]:
-                draft = await self._rule(rule_name)(owner=owner, risk=risk)
-                if draft is None:
-                    continue
+                for draft in _drafts(await self._rule(rule_name)(owner=owner, risk=risk)):
+                    identity = (
+                        draft.recommendation_type.value,
+                        draft.entity_type,
+                        draft.entity_id,
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    row = await self._persist(owner=owner, risk=risk, draft=draft)
+                    if row is not None:
+                        created.append(row)
+        return created
+
+    async def generate_learning(self, *, owner: User) -> list[Recommendation]:
+        """Raise suggestions from the user's own learning record, deduplicated.
+
+        The Phase 9 half of the engine, and the reason
+        :data:`recommendation_rules` has a ``None`` key: these two rules have no
+        raising risk, so there is nothing for :meth:`generate` to walk. An account
+        can hold a goal two weeks from its target date at 35% recorded progress
+        while owning no projects, no tasks and no risks at all, and the learning
+        pages would then be the only place the suggestion could come from.
+
+        Everything else is deliberately the same machinery: the names come from the
+        same registry, are resolved through the same ``getattr(self, name)``, land
+        in the same per-pass ``seen`` set on the same identity, and are written
+        through the same :meth:`_persist` — so an open suggestion saying exactly
+        the same thing is not rewritten here either. ``recommendations.risk_id`` is
+        nullable for this case and is written as ``NULL``.
+
+        **A no-op when there is nothing to say, and never an error.** No learning
+        repository wired, no goals, no skills, no goal inside the deadline
+        horizon, no dormant skill: every one of those returns an empty list. A
+        rule that raised a placeholder for a user with nothing recorded would be
+        the "measured zero" failure the phase forbids — the one place where the
+        engine would be asserting something it never looked at.
+
+        Args:
+            owner: The account the sweep runs for. Every read goes through the
+                owner-scoped repository methods, so a row belonging to somebody
+                else is never loaded rather than being loaded and filtered.
+
+        Returns:
+            The rows this call **created**, in the order they were written. A
+            refreshed suggestion is not included, on the same terms as
+            :meth:`generate`.
+        """
+        if self.learning is None:
+            return []
+
+        created: list[Recommendation] = []
+        seen: set[tuple[str, str | None, uuid.UUID | None]] = set()
+
+        for rule_name in recommendation_rules[None]:
+            for draft in _drafts(await self._rule(rule_name)(owner=owner, risk=None)):
                 identity = (
                     draft.recommendation_type.value,
                     draft.entity_type,
@@ -361,7 +607,7 @@ class RecommendationService:
                 if identity in seen:
                     continue
                 seen.add(identity)
-                row = await self._persist(owner=owner, risk=risk, draft=draft)
+                row = await self._persist(owner=owner, risk=None, draft=draft)
                 if row is not None:
                     created.append(row)
         return created
@@ -379,7 +625,7 @@ class RecommendationService:
         return getattr(self, name)
 
     async def _persist(
-        self, *, owner: User, risk: Risk, draft: RecommendationDraft
+        self, *, owner: User, risk: Risk | None, draft: RecommendationDraft
     ) -> Recommendation | None:
         """Write one draft, or skip it when an open suggestion already says this.
 
@@ -388,6 +634,13 @@ class RecommendationService:
         caller counts creations, and a refreshed suggestion that was counted as
         new would inflate the run summary by the number of suggestions a user has
         chosen to leave open.
+
+        ``risk`` is ``None`` for the Phase 9 rules, which is why ``risk_id`` is
+        written as SQL ``NULL`` rather than read off a row that does not exist,
+        and why the risk keys are simply absent from the metadata: a suggestion
+        raised from a goal carries the figures the goal rule derived
+        (:attr:`RecommendationDraft.metadata`) and asserts no risk score it never
+        computed.
         """
         existing = await self.risks.find_open_recommendation(
             owner.id,
@@ -398,6 +651,18 @@ class RecommendationService:
         if existing is not None and _says_the_same(existing, draft):
             return None
 
+        metadata: dict[str, Any] = {"rule": draft.recommendation_type.value}
+        if risk is not None:
+            metadata.update(
+                {
+                    "risk_type": risk.risk_type,
+                    "risk_score": int(risk.score),
+                    "risk_severity": risk.severity,
+                    "evidence_strength": risk.evidence_strength,
+                }
+            )
+        metadata.update(draft.metadata)
+
         row, was_created = await self.risks.upsert_recommendation(
             owner.id,
             recommendation_type=draft.recommendation_type,
@@ -405,16 +670,10 @@ class RecommendationService:
             title=draft.title,
             description=draft.description,
             reason=draft.reason,
-            risk_id=risk.id,
+            risk_id=risk.id if risk is not None else None,
             entity_type=draft.entity_type,
             entity_id=draft.entity_id,
-            metadata={
-                "rule": draft.recommendation_type.value,
-                "risk_type": risk.risk_type,
-                "risk_score": int(risk.score),
-                "risk_severity": risk.severity,
-                "evidence_strength": risk.evidence_strength,
-            },
+            metadata=metadata,
         )
         if was_created:
             await self._record_event(
@@ -470,6 +729,64 @@ class RecommendationService:
             reason=reason,
             entity_type=entity_type,
             entity_id=entity_id,
+        )
+
+    def _learning_draft(
+        self,
+        *,
+        recommendation_type: RecommendationType,
+        priority: RecommendationPriority,
+        title: str,
+        description: str,
+        reason: str,
+        entity_type: str,
+        entity_id: uuid.UUID,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> RecommendationDraft:
+        """Build a draft for a rule that has no raising risk behind it.
+
+        The Phase 9 twin of :meth:`_draft`, and the difference is the whole reason
+        it exists: there is no risk, so there is no severity to read the priority
+        off. **The caller cannot choose it either** — the ``priority`` argument is
+        a lookup through one of the two ladders above, done inside the rule with
+        the same figure the reason quotes, so "how soon does this want an answer"
+        is a fact about the record and not an opinion a method expressed.
+
+        Keeping the drafts on one class rather than introducing a second carrier is
+        what preserves the invariants: :class:`RecommendationDraft` still rejects a
+        title, a description or a reason that cannot explain itself, and the two
+        learning rules get that check for free rather than having to re-implement
+        the digit rule this module exists to enforce.
+
+        Args:
+            recommendation_type: What action is proposed.
+            priority: The band the rule's ladder returned. Re-validated here so a
+                typo in a rule is a ``ValueError`` at construction rather than an
+                ``IntegrityError`` from the table's check constraint.
+            title: WHAT, in a few words.
+            description: The SUGGESTED ACTION, in the imperative.
+            reason: WHY, with the numbers the rule just read.
+            entity_type: :data:`ENTITY_LEARNING_GOAL` or :data:`ENTITY_SKILL`.
+            entity_id: The goal or skill the action is about.
+            metadata: The figures behind the decision, stored with the suggestion.
+
+        Returns:
+            The draft, constructed through the same validating carrier as every
+            other rule's.
+
+        Raises:
+            ValueError: Propagated from :class:`RecommendationDraft`, or if
+                ``priority`` is not one of the four bands the column allows.
+        """
+        return RecommendationDraft(
+            recommendation_type=validate_recommendation_type(recommendation_type),
+            priority=RecommendationPriority(priority),
+            title=title,
+            description=description,
+            reason=reason,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            metadata=dict(metadata or {}),
         )
 
     # -- Rule 1: deadline gap ------------------------------------------------
@@ -887,6 +1204,245 @@ class RecommendationService:
             entity_id=risk.entity_id,
         )
 
+    # -- Rule 9: a learning goal closing in ----------------------------------
+    #
+    # The first rule here with no raising risk. It is registered under the ``None``
+    # key of ``recommendation_rules``, hands ``risk=None`` to every ``_rule_*``
+    # call and returns one draft per goal that qualifies rather than one per pass —
+    # an account may hold several dated goals and a rule that could only say
+    # something about the first would be arbitrary about which one it picked.
+
+    async def _rule_review_learning_goal(
+        self, *, owner: User, risk: Risk | None
+    ) -> tuple[RecommendationDraft, ...]:
+        """A goal whose own target date is near, with little progress recorded.
+
+        Fires on the user's own record: an open goal, a ``target_date`` inside
+        :data:`GOAL_DEADLINE_HORIZON_DAYS` (or already past it), and a recorded
+        ``progress`` below :data:`GOAL_LOW_PROGRESS_PERCENT`.
+
+        **The figures are the user's, and the reason says so.** ``progress`` is
+        the percentage they entered on the goal — ``LearningGoal.progress`` is
+        documented as never being computed from the activities beneath it — and
+        the closing sentence says plainly that NEXUS did not estimate it. Summing
+        study minutes into a percentage is the tempting derivation and the one this
+        rule refuses: a session and a percentage are different units, and the
+        result would be a number about somebody dressed as a number about a
+        record.
+
+        **Declines rather than inventing a figure** in the two cases where the
+        data cannot answer: a goal with **no** ``target_date``, which is not
+        approaching a deadline and cannot be measured against one, and a goal in a
+        terminal state. Neither is a gap to be filled with a default, and both are
+        the absence of a measurement rather than a measurement of zero.
+
+        A goal whose date has passed gets its own wording and the top priority
+        band, for the reason :meth:`_rule_review_deadline` splits its two cases
+        the way it does: "you are two weeks late" and "you have a fortnight" are
+        different facts, and a reader deserves to be told which one they are
+        looking at.
+        """
+        if risk is not None or self.learning is None:
+            return ()
+        today = (await self._now()).date()
+
+        drafts: list[RecommendationDraft] = []
+        for goal in await self._scan(
+            lambda skip: self.learning.list_goals(owner.id, limit=_LEARNING_PAGE_SIZE, offset=skip)
+        ):
+            if goal.status not in _OPEN_GOAL_STATUSES or goal.target_date is None:
+                continue
+            days_left = (goal.target_date - today).days
+            if days_left > GOAL_DEADLINE_HORIZON_DAYS or goal.progress >= GOAL_LOW_PROGRESS_PERCENT:
+                continue
+            drafts.append(self._goal_deadline_draft(goal, days_left=days_left))
+        return tuple(drafts)
+
+    def _goal_deadline_draft(self, goal: LearningGoal, *, days_left: int) -> RecommendationDraft:
+        """The copy for one qualifying goal, and the ladder that graded it.
+
+        Split out of :meth:`_rule_review_learning_goal` for the same reason
+        :meth:`_rule_complete_blocked_task` splits: the branch is the wording, not
+        the decision, and a rule that both decided and phrased would have to be
+        read in one breath to be checked.
+
+        The suggested action names three sessions because the contracts' own worked
+        example does — a concrete number somebody can put in a calendar, not an
+        exhortation to "make time". It also offers the other honest option, moving
+        the date, because a target date the user set is theirs to change and a rule
+        that only ever says "work harder" is one that has forgotten that.
+        """
+        name = _clip(goal.title, 120)
+        progress = int(goal.progress)
+        priority = _ladder_band(_GOAL_DEADLINE_PRIORITY, days_left)
+
+        if days_left < 0:
+            title = f"Decide the next step for {name}"
+            description = (
+                "Decide whether to move the target date, reduce the scope, or record the "
+                "goal as done."
+            )
+            reason = (
+                f"The target date for {name} passed {abs(days_left)} day(s) ago with "
+                f"{progress}% recorded progress against it. That percentage is the one on "
+                "the record, not one NEXUS estimated."
+            )
+        else:
+            due = _day_phrase(goal.target_date)
+            title = f"Schedule learning sessions for {name} before {due}"
+            description = (
+                f"Add three short study sessions for {name} to the coming week, or move "
+                f"its target date if the scope behind it has changed."
+            )
+            reason = (
+                f"{name} has a target date of {due}, which is {days_left} day(s) away, and "
+                f"{progress}% recorded progress against it. That percentage is the one on "
+                "the record, not one NEXUS estimated."
+            )
+
+        return self._learning_draft(
+            recommendation_type=RecommendationType.REVIEW_LEARNING_GOAL,
+            priority=priority,
+            title=title,
+            description=description,
+            reason=reason,
+            entity_type=ENTITY_LEARNING_GOAL,
+            entity_id=goal.id,
+            metadata={
+                "goal_status": goal.status,
+                "progress": progress,
+                "days_to_deadline": days_left,
+            },
+        )
+
+    # -- Rule 10: a dormant target skill --------------------------------------
+
+    async def _rule_revive_target_skill(
+        self, *, owner: User, risk: Risk | None
+    ) -> tuple[RecommendationDraft, ...]:
+        """A skill the user is aiming at, with nothing recorded against it lately.
+
+        Fires on ``skills.last_activity_at`` being at least
+        ``stale_inactive_days`` old, on a skill whose ``target_level`` is above its
+        ``current_level``. One draft per dormant skill, for the same reason rule 9
+        returns one per goal.
+
+        **Never a claim about the person, and never about effort.** The sentence
+        quotes a day count, the date of the last recorded activity, and the two
+        levels the user themselves set — the current one carried with the phrase
+        its :class:`~app.models.enums.SkillLevelSource` requires, so it reads "a
+        self-assessed 2/5" or "a NEXUS system estimate of 2/5" and never a bare
+        number that could be read as an ability. Nothing here says how long anyone
+        worked or how much they got done, because ``learning_activities`` records
+        that something was logged, not how anybody spent a month.
+
+        **A skill with no ``last_activity_at`` at all is declined**, and this is the
+        one case worth arguing for. Such a skill is not "stale for 0 days" — it is
+        a skill nothing has ever been recorded against, which is a different fact
+        and is the one :mod:`app.services.learning.gaps` already reports as
+        ``available=False`` with a reason. Raising a "come back to Python" nudge
+        the moment the name is typed would be the engine inventing the inactivity
+        it is about to quote. NEXUS recorded nothing, so it says nothing.
+        """
+        if risk is not None or self.learning is None:
+            return ()
+        today = (await self._now()).date()
+
+        drafts: list[RecommendationDraft] = []
+        for skill in await self._scan(
+            lambda skip: self.learning.list_skills(owner.id, limit=_LEARNING_PAGE_SIZE, offset=skip)
+        ):
+            if skill.current_level >= skill.target_level or skill.last_activity_at is None:
+                continue
+            days_idle = (today - _as_utc(skill.last_activity_at).date()).days
+            if days_idle < self.stale_inactive_days:
+                continue
+            drafts.append(self._inactive_skill_draft(skill, days_idle=days_idle))
+        return tuple(drafts)
+
+    def _inactive_skill_draft(self, skill: Skill, *, days_idle: int) -> RecommendationDraft:
+        """The copy for one dormant skill, and the ladder that graded it.
+
+        The grade is read off the number of levels still to go rather than off the
+        idle period, because "how long" is not how urgent a practice nudge is and
+        claiming otherwise would be a ranking the record does not support. Both
+        levels are the user's own numbers, so this is arithmetic over two stored
+        integers and nothing else.
+        """
+        name = _clip(skill.name, 120)
+        levels_to_go = int(skill.target_level) - int(skill.current_level)
+        recorded = int(skill.evidence_count)
+        plural = "activity" if recorded == 1 else "activities"
+        last = _as_utc(skill.last_activity_at)
+
+        return self._learning_draft(
+            recommendation_type=RecommendationType.REVIVE_TARGET_SKILL,
+            priority=_ladder_band(_SKILL_GAP_PRIORITY, levels_to_go),
+            title=f"Add a practice session for {name}",
+            description=(
+                f"Record one short practice activity for {name}, or lower its target level "
+                f"if it is not one you are aiming at right now."
+            ),
+            reason=(
+                f"The last activity recorded against {name} was {days_idle} day(s) ago, on "
+                f"{_day_phrase(last.date())}, and the record carries "
+                f"{_level_phrase(skill.level_source, int(skill.current_level))} against a "
+                f"target of {int(skill.target_level)}/{MAX_SKILL_LEVEL}. NEXUS has "
+                f"recorded {recorded} related learning {plural} against it in total."
+            ),
+            entity_type=ENTITY_SKILL,
+            entity_id=skill.id,
+            metadata={
+                "days_since_last_activity": days_idle,
+                "current_level": int(skill.current_level),
+                "target_level": int(skill.target_level),
+                "level_source": skill.level_source,
+                "evidence_count": recorded,
+            },
+        )
+
+    # -- Learning reads -------------------------------------------------------
+
+    async def _scan(self, page_of: Callable[[int], Awaitable[tuple[list[_T], int]]]) -> list[_T]:
+        """Read an owner-scoped learning set in pages, or nothing at all.
+
+        The same shape :meth:`app.services.learning.service.LearningIntelligenceService._paged`
+        uses, and for the same reason: one statement returns
+        :data:`_LEARNING_PAGE_SIZE` rows and no more, so a set larger than that has
+        to be walked rather than silently truncated to its first page. A short
+        page ends the walk, so the ordinary case costs exactly one round trip and
+        an empty set costs one.
+
+        Args:
+            page_of: ``(offset) -> awaitable`` returning one page of rows and a
+                total this method ignores — the length of what it read is the
+                count, for the same reason the Phase 9 service ignores it.
+
+        Returns:
+            The rows, in the order the repository ordered them.
+        """
+        rows: list[_T] = []
+        while len(rows) < _LEARNING_SCAN_LIMIT:
+            page, _total = await page_of(len(rows))
+            rows.extend(page)
+            if len(page) < _LEARNING_PAGE_SIZE:
+                break
+        return rows
+
+    async def _now(self) -> datetime:
+        """The database clock, as UTC.
+
+        Never ``datetime.now()``, and never an instant carried in from a request:
+        both rules below are arithmetic on a *distance* — days to a target date,
+        days since the last activity — so a host whose clock drifts from the
+        server's would move a suggestion from one priority band to another. Read
+        through the learning repository's session rather than taking a session of
+        its own, which is why the rules need that collaborator at all rather than
+        only its two query methods.
+        """
+        value = await self.learning.session.scalar(select(func.now()))
+        return _as_utc(value) if isinstance(value, datetime) else datetime.now(UTC)
+
     # -- Lifecycle -----------------------------------------------------------
 
     async def accept(self, *, owner: User, recommendation_id: uuid.UUID) -> Recommendation:
@@ -1174,6 +1730,94 @@ def _int(meta: Mapping[str, Any], key: str) -> int:
     """
     value = meta.get(key)
     return int(value) if isinstance(value, int | float) else 0
+
+
+def _drafts(
+    outcome: RecommendationDraft | Sequence[RecommendationDraft] | None,
+) -> tuple[RecommendationDraft, ...]:
+    """Normalise whatever a rule handed back into the drafts it actually raised.
+
+    A rule may return one draft, several, or nothing — the eight Phase 7 rules
+    return at most one because a single risk is a single condition, while a
+    learning rule sweeps an account's goals or skills and returns one per
+    qualifying row. Both are flattened here rather than in each caller, so
+    :meth:`RecommendationService.generate` and
+    :meth:`RecommendationService.generate_learning` walk drafts the same way and
+    the per-pass ``seen`` set means the same thing in both.
+
+    A bare string is a sequence of one-character strings and would silently become
+    a list of nonsense drafts, so it is refused rather than iterated. No rule does
+    this; the check is here because the alternative is a failure that renders as a
+    recommendation with a one-letter title.
+    """
+    if outcome is None:
+        return ()
+    if isinstance(outcome, RecommendationDraft):
+        return (outcome,)
+    if isinstance(outcome, str | bytes):
+        raise TypeError(
+            f"A rule returned {type(outcome).__name__} rather than a draft or a sequence "
+            "of them; a suggestion has four parts and none of them is a string."
+        )
+    return tuple(outcome)
+
+
+def _ladder_band(
+    ladder: Sequence[tuple[int, RecommendationPriority]], value: int
+) -> RecommendationPriority:
+    """The first band whose ceiling ``value`` falls inside.
+
+    The two learning ladders are written most urgent first and each entry is a
+    ceiling rather than a floor, so a value past every ceiling lands on the lowest
+    band. That fallback cannot invent urgency — it is the bottom of the same four
+    bands the rest of the engine uses — and the rules only reach it for a figure
+    they have already decided is worth mentioning at all.
+
+    Args:
+        ladder: ``(ceiling, band)`` pairs, most urgent first.
+        value: The figure the band is read off — days remaining, or levels to go.
+
+    Returns:
+        The band, or :attr:`RecommendationPriority.LOW` when ``value`` is past
+        every ceiling.
+    """
+    for ceiling, band in ladder:
+        if value <= ceiling:
+            return band
+    return RecommendationPriority.LOW
+
+
+def _level_phrase(level_source: str, current_level: int) -> str:
+    """``"user_defined"`` and 2 -> ``"a self-assessed 2/5"``.
+
+    Rebuilt here from :data:`app.services.learning.gaps.LEVEL_SOURCE_PHRASES`
+    rather than imported whole from that module, for the reason
+    :func:`_duration` gives for the detector's formatter: a sentence here should
+    not move when the other surface's wording is retuned. What is *not* duplicated
+    is the phrase table itself — Phase 9's rule that a level is either the user's
+    or visibly derived is enforced by that table, and a copy of the two strings
+    that could drift from it would be an unenforced copy of the phase's single most
+    important control. So this reads its adjective from there and says which of the
+    two claims it is quoting.
+    """
+    if SkillLevelSource(level_source) is SkillLevelSource.SYSTEM_ESTIMATE:
+        return f"a NEXUS system estimate of {current_level}/{MAX_SKILL_LEVEL}"
+    adjective = LEVEL_SOURCE_PHRASES[validate_skill_level_source(level_source)]
+    return f"a {adjective} {current_level}/{MAX_SKILL_LEVEL}"
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Read an instant as UTC, normalising a naive one to that zone.
+
+    The same rule :mod:`app.repositories.learning` applies before it writes a
+    ``timestamptz``: an instant with no offset would be read in whatever
+    ``TimeZone`` the connection happened to be configured with, so the same
+    recorded activity could fall on two different days — and the number of days is
+    the entire figure the dormant-skill rule quotes.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _float_or_none(meta: Mapping[str, Any], key: str) -> float | None:

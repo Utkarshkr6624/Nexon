@@ -6,11 +6,12 @@ own machine and is never deployed to a cloud. No paid APIs, no paid services.
 
 ---
 
-## Status: Phase 2 (identity, sessions and security) is complete
+## Status: Phases 1 through 9 are delivered
 
-Phase 1 built the technical foundation. Phase 2 turns authentication into a real account
-system: persistent device sessions, a password policy, password recovery, role-based
-permissions, an audit trail, and a five-tab settings surface. What exists today:
+Phase 1 built the technical foundation and Phase 2 turned authentication into a real
+account system: persistent device sessions, a password policy, password recovery,
+role-based permissions, an audit trail, and a five-tab settings surface. Phases 3 to 9
+then made the module surface real, one module per phase. What exists today:
 
 | Area | State |
 | --- | --- |
@@ -21,31 +22,40 @@ permissions, an audit trail, and a five-tab settings surface. What exists today:
 | Password policy, password change, and password reset (no mail service required) | Done |
 | Role-based permissions (`user` / `admin`) with a fail-closed `require_permission()` | Done |
 | Security audit trail (`audit_logs`, 12 event types, best-effort writes) | Done |
-| Alembic migration pipeline | Done — two revisions, `0001` and `0002_phase2_identity_sessions` |
-| PostgreSQL 16 via Docker Compose, three-service stack | Declared and statically validated; never executed by `docker compose` |
+| Alembic migration pipeline | Done — nine revisions, `0001_initial_create_users` → `0009_phase9_learning_career`, a single linear head |
+| PostgreSQL 16 | The Compose stack is declared and statically validated but has **never** been executed by `docker compose`. A **native** PostgreSQL 16 runs in the development environment and backs every database-backed test |
 | React + TypeScript frontend: router, app shell, design system, theming | Done |
 | Frontend design-system primitives, several hand-rolled (see below) | Done |
 | Structured logging, `X-Request-ID` correlation, shared error envelope | Done |
 | Health/readiness endpoints, Swagger/ReDoc | Done |
-| Automated tests | Passing — 366 backend + 134 frontend; **133 backend `integration` tests need PostgreSQL and have not been run** |
+| Projects, Tasks, Planner, Knowledge, Analytics, Risks, Recommendations (Phases 3–7) | Live — migrations `0003`–`0007`, backend routes and real pages |
+| Developer, Learning, Career (Phases 8 and 9) | Live — see [Phase 8 and Phase 9](#phase-8-and-phase-9--developer-learning-and-career) |
+| Search, AI Assistant, Experiments | Designed placeholder pages only |
+| Automated tests | Passing — **2090 backend** (1011 offline, 1079 `integration`, every one of them run against PostgreSQL 16) and **607 frontend** across 42 files |
 
-The 366 backend figure is `pytest -m "not integration"` from `backend/` (499 collected);
-the other 133 tests are marked `integration` and need a live PostgreSQL. `frontend/` runs
-134 tests across 22 files with `npm test`. Neither a database nor Docker was available on
-the machine this document was written on, so nothing that needs either was executed — and
-in particular **the integration suite has never passed here, because it has never run.**
+The 2090 backend figure is the result of `python -m pytest` from `backend/` — the full
+suite, not a subset. `pytest -m "not integration"` is the 1011-test offline slice and
+`pytest -m "integration"` is the other 1079; both are green, so the migrations, the
+repositories and every database-backed endpoint have been executed against a real
+server. `frontend/` runs 607 tests across 42 files with `npm test`. Docker is still not
+installed on this machine, so `docker compose up` remains untested — see
+[Troubleshooting](#docker-compose-up-fails-before-anything-starts).
 
-**What does not exist yet.** Projects, Tasks, Planner, Knowledge, Search, Analytics,
-Developer, Learning, Career, AI Assistant and Experiments are *designed placeholder pages
-only*. They render a real module description, the planned capabilities and the phase in
-which they ship — but they store nothing, compute nothing, and read no data. Every metric
-tile on those pages renders an em dash on purpose; no sample data is fabricated. There is
-no module API at all: every endpoint the backend serves belongs to auth, users or health.
+**What does not exist yet.** Search, AI Assistant and Experiments are *designed
+placeholder pages only*. They render a real module description, the planned capabilities
+and the phase in which they ship — but they store nothing, compute nothing, and read no
+data. Every metric tile on those pages renders an em dash on purpose; no sample data is
+fabricated.
 
-The live pages are Login, Register, Forgot password, Reset password (all real calls to the
-auth endpoints), Dashboard (service health polled from the API) and Settings (profile,
-password, active sessions with per-device revoke and "sign out everywhere", theme, and a
-password-protected account deletion).
+The rest of the routed surface is live. Login, Register, Forgot password and Reset
+password call the real auth endpoints; Dashboard polls service health from the API;
+Settings carries profile, password, active sessions with per-device revoke and "sign out
+everywhere", theme, and a password-protected account deletion. Projects, Project detail,
+Tasks, Planner, Month, Knowledge, Note detail, Concept detail, Analytics, Risk center,
+Recommendations, Developer, Developer repository, Learning and Career are all backed by
+real routes and real tables. The backend serves **136 paths and 183 operations**; the
+per-module inventories live in the phase reports and in
+[`docs/api-conventions.md`](docs/api-conventions.md).
 
 Two things exist to prove something works rather than to be useful. `POST /api/v1/users/`
 is the administrative account listing: it exists so the role → permission wiring has a route
@@ -53,8 +63,113 @@ whose refusal is observable end to end, and it is not a product feature. The aud
 retention setting states a policy that **no job enforces** — nothing is currently pruning
 `audit_logs`.
 
-Do not build on this README as if the product modules were functional. See
-[Roadmap](#roadmap).
+See [Roadmap](#roadmap) for what has not shipped.
+
+---
+
+## Phase 8 and Phase 9 — Developer, Learning and Career
+
+These two phases landed after the original Status table above was written; that table has
+since been brought up to date with them. In short:
+
+| Module | State |
+| --- | --- |
+| **Developer** (`/developer`, `/developer/repositories/:id`) | **Live.** Register a local git repository, scan it, and read commits, branches, changed lines and language. All 15 backend routes and both pages exist |
+| **Learning** (`/learning`) | **Live.** Goals, tracked skills, recorded activities, skill gaps. 20 backend routes |
+| **Career** (`/career`) | **Live.** Profile, dated records, portfolio evidence. 13 backend routes |
+
+Each has a full backend, a migration (`0008`, `0009`), and real frontend pages. The two
+reports are the honest record of what was executed and what could not be:
+
+- [`docs/specifications/phase-8-developer-report.md`](docs/specifications/phase-8-developer-report.md)
+- [`docs/specifications/phase-9-learning-career-report.md`](docs/specifications/phase-9-learning-career-report.md)
+
+### The three rules that shape both features
+
+These are not style preferences; they are properties of the code, and they are worth
+knowing before you build on either surface.
+
+1. **A commit is evidence, never a verdict.** Git records that a commit object carries an
+   author date; it does not record how long anyone worked. So there is no hours figure, no
+   focus score and no productivity verdict anywhere on the developer surface — only counts
+   of commit objects, of days that carried a commit, and of lines git counted from a diff.
+2. **A skill level is the user's, or visibly derived.** A level is either one the person
+   set (`user_defined`) or one NEXUS estimated from recorded activities
+   (`system_estimate`), and the source is rendered beside the number on every path. The
+   wording differs accordingly — *"current self-assessed 2/5"* versus *"current NEXUS system
+   estimate of 2/5"* — and an explanation that omits the phrase its source requires cannot
+   be constructed. The neutral form of a gap is *"Target 4/5, current self-assessed 2/5.
+   NEXUS recorded 6 related learning activities in the last 30 days."* Never *"You are not
+   good at X."*
+3. **Absence of measurement is a reason, not a zero.** A real `0` renders as `0`. A figure
+   that could not be computed is `null` on the wire, `—` on screen, and often carries a
+   sentence saying why. Insufficient data reads *"Not enough data yet."*
+
+### Registering a local repository
+
+Developer Intelligence reads repositories **on the machine the backend runs on**, through
+the `git` CLI. There is no hosted account to connect.
+
+```bash
+# from the repository root
+curl -X POST http://localhost:8000/api/v1/developer/repositories \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"local_path": "E:/Nexo", "name": "Nexo"}'
+
+# scan it — ?full=false reads only what landed since the last scan
+curl -X POST "http://localhost:8000/api/v1/developer/repositories/$ID/scan" \
+  -H "Authorization: Bearer $TOKEN"
+
+# or press "Scan" on /developer
+```
+
+The path is validated and resolved to an absolute path **before** the row is stored, so a
+relative path cannot quietly resolve elsewhere once a different working directory runs the
+scan. A bare `git init` with no commits registers successfully — it is the first thing a
+user does with this feature.
+
+**A broken repository never breaks NEXUS.** A scan answers **200 whether the read worked or
+not**: a deleted directory, a corrupt `.git`, an unreadable network share and a git process
+that hangs past its timeout all come back as a scan row with `status: 'error'` and a human
+sentence. The row lists in the repository list carrying `last_scan_status` and
+`last_scan_error`, so you can see which directories git could not read rather than one of
+them silently removing itself.
+
+Two things are worth knowing before you rely on it:
+
+- **After a history rewrite — a rebase, `filter-branch`, a force-push — pass `?full=true`.**
+  The default scan is incremental (`git log --since` the stored high-water mark), and after
+  a rewrite that mark points at a commit that no longer exists. Nothing detects this
+  automatically.
+- **The Windows fallback costs a thread hop per git invocation.** NEXUS runs a
+  `SelectorEventLoop` everywhere because psycopg needs it, and on Windows that loop cannot
+  spawn a subprocess. The git engine detects the condition and runs the *same* call on a
+  private `ProactorEventLoop` from a worker thread, so the timeout, output ceiling and kill
+  all still apply.
+
+`DEVELOPER_PATH_ALLOWLIST` restricts which roots a repository may be registered under.
+Empty (the default) means any readable absolute path that validates as a git work tree,
+which is the right default for a local-first application.
+
+### The environment variables these phases added
+
+Fourteen new settings, in [`.env.example`](.env.example) and documented in
+[`docs/development.md`](docs/development.md) §11. The five a newcomer is most likely to
+change:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DEVELOPER_PATH_ALLOWLIST` | `""` (unset) | Comma-separated roots under which a repository may be registered. Unset means any readable absolute path |
+| `DEVELOPER_GIT_TIMEOUT_SECONDS` | `30` | Wall-clock budget for one `git` invocation. A hung repository becomes an error row, not a request that never returns |
+| `DEVELOPER_DEFAULT_WINDOW_DAYS` | `30` | Window used when a request names no dates |
+| `LEARNING_MIN_EVIDENCE_FOR_ESTIMATE` | `3` | Below this many activities, NEXUS offers **no** level estimate at all and says so |
+| `CAREER_STALE_INACTIVE_DAYS` | `21` | After this many days with no recorded activity, a target skill counts as dormant and is eligible for a nudge |
+
+**No model runs anywhere in this product.** Both phases produce *feature vectors* —
+`developer_features.v1`, `learning_features.v1`, `career_features.v1` — which are named
+numbers stamped with a schema version, ready for a Phase 10 trainer. Nothing is trained,
+loaded, served or registered, and no endpoint infers anything.
 
 ---
 
@@ -112,7 +227,7 @@ Nexo/
 ├── backend/
 │   ├── run.py              entrypoint — selects the psycopg-compatible event loop
 │   ├── alembic.ini         no credentials; the URL comes from settings
-│   ├── migrations/         Alembic env + versions (0001, 0002_phase2_identity_sessions)
+│   ├── migrations/         Alembic env + versions (0001 … 0009, single head)
 │   ├── requirements.txt    runtime deps above the DEV MARKER, dev deps below
 │   ├── pyproject.toml      ruff configuration
 │   ├── pytest.ini          testpaths, asyncio mode, `integration` marker
@@ -123,21 +238,27 @@ Nexo/
 │       ├── api/
 │       │   ├── router.py              mounts /api/v1
 │       │   ├── deps.py                HTTP-layer wiring: session → repo → service
-│       │   └── v1/{router,health,auth,users}.py
+│       │   └── v1/                    19 routers: health, auth, users, projects, tasks,
+│       │                              tags, activity, calendar, work_sessions, planner,
+│       │                              availability, knowledge, analytics, developer, risks,
+│       │                              recommendations, intelligence, learning, career
 │       ├── core/
 │       │   ├── config.py              typed settings (pydantic-settings)
 │       │   ├── exceptions.py         domain errors + shared error envelope
 │       │   ├── event_loop.py         SelectorEventLoop on Windows for psycopg
 │       │   ├── logging.py            JSON/console logging, redaction, request_id
 │       │   ├── middleware.py          X-Request-ID, timing, access log
-│       │   ├── permissions.py         Permission enum, ROLE_PERMISSIONS, gate factory
+│       │   ├── permissions.py         Permission enum (11 members), ROLE_PERMISSIONS, gate factory
 │       │   ├── security.py            bcrypt + JWT issue/verify, token digests
 │       │   └── deps.py                canonical auth dependencies
 │       ├── db/{base,session}.py       Base + mixins, async engine and session
-│       ├── models/                   user, session, password_reset, audit
-│       ├── repositories/             user, session, password_reset, audit
-│       ├── schemas/                  common, health, user, session, security
-│       └── services/                 auth, session, user, audit
+│       ├── models/                   user, session, password_reset, audit, project, task,
+│       │                              tag, activity, planner, knowledge, analytics, risk,
+│       │                              developer, learning, career
+│       ├── repositories/             one per model module, SQL only
+│       ├── schemas/                  common, health, user, session, security + one per module
+│       └── services/                 auth, session, user, audit + one per module
+│                                    (developer/, learning/, career/ are packages)
 └── frontend/
     ├── vite.config.ts      dev proxy (:8000), code splitting, Vitest config
     ├── tailwind.config.ts  token → utility mapping
@@ -148,8 +269,9 @@ Nexo/
         ├── main.tsx        React root
         ├── app/            providers, query client, theme provider, auth bootstrap
         ├── routes/         router, layouts, guards, lazy route table
-        ├── pages/          one file per route (most modules are placeholders)
-        ├── features/       domain logic: auth, health, modules, settings, palette
+        ├── pages/          one file per route (search, assistant and experiments are placeholders)
+        ├── features/       domain logic: auth, health, modules, settings, palette, work,
+        │                   planner, knowledge, analytics, risk, developer, learning, career
         ├── components/
         │   ├── ui/         design-system primitives (shadcn-style; some hand-rolled)
         │   ├── layout/     app shell, sidebar, top bar, menus, palette
@@ -157,7 +279,8 @@ Nexo/
         │   └── brand/      logo
         ├── hooks/          use-command-palette, use-debounce, use-media-query
         ├── lib/            api-client.ts, utils.ts (cn)
-        ├── services/       auth.ts, sessions.ts, users.ts, health.ts, errors.ts
+        ├── services/       auth, sessions, users, health, errors, work, planner, knowledge,
+        │                   analytics, risk, developer, learning
         ├── stores/         Zustand auth, theme and toast stores
         ├── types/          wire types mirroring the backend schemas
         └── index.css       design tokens (HSL channels) + structural helpers
@@ -179,7 +302,7 @@ Nexo/
 | Auth | PyJWT 2.15 + bcrypt 5.0 | HS256, access + refresh, in-process access-token denylist plus database-backed device sessions |
 | Database | PostgreSQL 16 (`postgres:16-alpine`) | `pg_trgm`, `unaccent` enabled on first init |
 | Lint / format (backend) | ruff 0.16 | `check` + `format --check`, line length 100 |
-| Tests (backend) | pytest 9.1 + pytest-asyncio + httpx | 366 tests without a database; 133 more are marked `integration` and need PostgreSQL |
+| Tests (backend) | pytest 9.1 + pytest-asyncio + httpx | 2090 collected and passing — 1011 run with the database down, 1079 are `integration`-marked and run against PostgreSQL |
 | Framework (frontend) | React 19 | function components, StrictMode |
 | Language (frontend) | TypeScript 5.7 | `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax` |
 | Build / dev server | Vite 7 | dev proxy, manual chunks, Vitest config |
@@ -188,15 +311,17 @@ Nexo/
 | Client state | Zustand 5 | auth session, theme, command palette, toasts |
 | Styling | Tailwind CSS 3.4 + shadcn/ui conventions | `cva` variants, lucide icons, and a small number of hand-rolled primitives where no Radix package is installed |
 | Charts | recharts 2.15 | reserved for the Analytics module |
-| Tests (frontend) | Vitest 3.2 + React Testing Library | 134 tests in 22 files |
+| Tests (frontend) | Vitest 3.2 + React Testing Library | 607 tests in 42 files |
 
 Production bundle is code-split per route and by vendor group. Current build, uncompressed
-`frontend/dist/assets/` sizes: entry chunk `index` 91,633 B, largest vendor chunk `react`
-222,295 B, then `radix` 113,444 B, `router` 92,153 B and `data` 37,974 B. The largest real
-page chunk is now `settings-page` at 39,952 B — it grew sharply in Phase 2, from 4.8 kB to
-carry five panels, the session list and the password dialogs — followed by
-`dashboard-page` at 11,760 B. The ten stub module pages are ~0.40 kB each and
-`search-page`, which renders a disabled input pointing at Phase 4, is 1,269 B.
+`frontend/dist/assets/` sizes, as produced by `npx vite build`: entry chunk `index`
+104,155 B, largest vendor chunk `charts` 432,148 B, then `react` 222,425 B, `radix`
+113,444 B, `router` 92,238 B and `data` 37,965 B. The largest real page chunk is now
+`learning-page` at 67,842 B, followed by `career-page` at 52,538 B, `developer-page` at
+35,303 B, `knowledge-page` at 34,610 B and `planner-page` at 32,662 B; `settings-page` is
+31,313 B. The shared `module-page` chunk the three remaining placeholder routes render is
+2,754 B, and `not-found-page` 2,314 B. A placeholder chunk growing by kilobytes is the
+signal that something page-specific has crept into it.
 
 ---
 
@@ -361,6 +486,8 @@ directory. Every variable is case-insensitive.
 | Frontend — dev server only | `VITE_DEV_PROXY_TARGET` — server-side, read by `frontend/vite.config.ts`; it is never bundled into the browser build |
 | Frontend — **reserved, read by no code** | `VITE_API_SERVER_URL`, `VITE_APP_NAME`, `VITE_ENABLE_COMMAND_PALETTE` — declared in `frontend/src/vite-env.d.ts` and in `.env.example`, but no module in `frontend/src` reads them. They are kept so the names stay stable for whoever wires those features up; changing them has no effect today. |
 | Docker Compose | `BIND_HOST` (see below), `POSTGRES_CONTAINER_NAME`, `POSTGRES_VOLUME_NAME`, `BACKEND_CONTAINER_NAME`, `FRONTEND_CONTAINER_NAME` |
+| Developer intelligence (Phase 8) | `DEVELOPER_GIT_TIMEOUT_SECONDS` (30), `DEVELOPER_MAX_COMMITS_PER_SCAN` (2000), `DEVELOPER_MAX_REPOSITORIES` (100), `DEVELOPER_DEFAULT_WINDOW_DAYS` (30), `DEVELOPER_MAX_WINDOW_DAYS` (366), `DEVELOPER_ACTIVITY_GRANULARITY_DEFAULT` (`day`), `DEVELOPER_PATH_ALLOWLIST` (unset) |
+| Learning and career (Phase 9) | `LEARNING_DEFAULT_WINDOW_DAYS` (30), `LEARNING_MAX_WINDOW_DAYS` (366), `LEARNING_MAX_GOALS` (200), `LEARNING_MAX_SKILLS` (100), `LEARNING_MIN_EVIDENCE_FOR_ESTIMATE` (3), `CAREER_MAX_EVIDENCE` (500), `CAREER_STALE_INACTIVE_DAYS` (21) |
 
 `BIND_HOST` (default `127.0.0.1`) prefixes every published port mapping in
 `docker-compose.yml` — the database, the API and the Vite dev server. The default keeps all
@@ -431,7 +558,7 @@ scripts and npm scripts. `make` with no argument lists them.
 | `make db-wait` | `scripts/wait_for_db.py --timeout $(TIMEOUT)` — block until PostgreSQL accepts connections. `make db-wait TIMEOUT=120` to wait longer. |
 | `make test-db` | `scripts/create_test_database.py` — create the `nexus_test` database. Never drops anything by default; pass `TEST_DB_FLAGS=--drop` to rebuild it, which is destructive. |
 | `make test` | `test-backend` then `test-frontend` |
-| `make test-backend` | `pytest` in `backend/` (the 133 `integration` tests included — they need PostgreSQL) |
+| `make test-backend` | `pytest` in `backend/` (all 2090 tests — the 1079 `integration` ones included, and they need PostgreSQL) |
 | `make test-frontend` | `npm run test` in `frontend/` |
 | `make lint` | ruff check, ruff format --check, eslint, tsc -b |
 | `make backend` | `scripts/dev.sh backend` |
@@ -459,8 +586,8 @@ Backend — run from `backend/`:
 
 ```bash
 python run.py                                   # dev server, honours NEXUS_HOST/PORT/RELOAD
-python -m pytest                                # 499 collected: 366 plus 133 integration (need PostgreSQL)
-python -m pytest -m "not integration"           # 366 tests, no database needed
+python -m pytest                                # 2090 collected: 1011 offline plus 1079 integration (need PostgreSQL)
+python -m pytest -m "not integration"           # 1011 tests, no database needed
 python -m ruff check .
 python -m ruff format --check .
 python -m alembic upgrade head                  # apply migrations
@@ -479,7 +606,7 @@ Frontend — run from `frontend/`:
 npm run dev            # Vite dev server on :5173
 npm run build          # tsc -b && vite build
 npm run preview        # serve dist/ on :4173
-npm test               # vitest run (134 tests in 22 files)
+npm test               # vitest run (607 tests in 42 files)
 npm run test:watch     # vitest
 npm run test:coverage  # vitest run --coverage
 npm run lint           # eslint .
@@ -520,7 +647,17 @@ bash scripts/dev.sh [both|backend|frontend]
 | Liveness (no database) | http://localhost:8000/health |
 | Detailed health | http://localhost:8000/api/v1/health |
 
-Current endpoints — **17 operations across 16 paths**:
+### Endpoints
+
+The API serves **136 paths and 183 operations** today, across nineteen routers mounted
+under `/api/v1` by `backend/app/api/v1/router.py`.
+
+The table below is the **Phase 2 slice** — health, auth and users — which is the part
+this README documents route by route. It is 17 operations across 16 paths of that
+total. Everything Phases 3 through 9 added (projects, tasks, tags, activity, calendar,
+work sessions, planner, availability, knowledge, analytics, developer, risks,
+recommendations, intelligence, learning and career) is inventoried in the phase reports
+and, by convention, in [`docs/api-conventions.md`](docs/api-conventions.md).
 
 | Method | Path | Auth | Success |
 | --- | --- | --- | --- |
@@ -659,44 +796,48 @@ Add `--strict` to also list `.env.example` entries compose never uses. It exits 
 any failure. None of that tells you whether the images build or the stack comes up.
 
 Note that `docker-compose.yml` was authored on a machine without Docker, and it has never
-been executed by `docker compose`. The YAML is structurally validated by that script; treat
-the first real run as untested and go straight to `docker compose logs -f`.
+been executed by `docker compose` — Docker is still not installed in this development
+environment. The YAML is structurally validated by that script; treat the first real run as
+untested and go straight to `docker compose logs -f`.
 
 ---
 
 ## Roadmap
 
 Phase numbers in the module column are the ones recorded in
-`frontend/src/features/modules/catalog.ts`.
+`frontend/src/features/modules/catalog.ts`, and the state column is what the code does
+today.
 
-| Phase | Module | Adds |
-| --- | --- | --- |
-| 1 | Foundation (done) | Repo, stack, auth, migrations, design system, health, docs, tests |
-| 1 | Dashboard, Settings (live) | Service health card, theme and session preferences |
-| 2 | Identity and security (done) | Persistent device sessions, password policy / change / reset, role-based permissions, security audit trail, five-tab settings |
-| 2 | Projects, Tasks (next) | The execution layer: outcomes, projects, tasks, triage views |
-| 3 | Planner | Weekly capacity, time blocks, focus log |
-| 4 | Knowledge, Search | Linked notes, retrieval index, unified search |
-| 5 | Analytics | Traceable metrics derived from real records |
-| 6 | Developer | Local git repository analysis, work attribution |
-| 7 | Learning | Tracks, spaced review, applied evidence |
-| 8 | Career | Goals, evidence, opportunity log |
-| 9 | AI Assistant | Grounded local-LLM answers via Ollama, proposed actions |
-| 10 | Experiments | Hypothesis, bounded scope, keep-or-kill verdict |
+| Phase | Module | State | Adds |
+| --- | --- | --- | --- |
+| 1 | Foundation | Done | Repo, stack, auth, migrations, design system, health, docs, tests |
+| 1 | Dashboard, Settings | Live | Service health card, theme and session preferences |
+| 2 | Identity and security | Done | Persistent device sessions, password policy / change / reset, role-based permissions, security audit trail, five-tab settings |
+| 2 | Projects, Tasks | Live | The execution layer: outcomes, projects, tasks, triage views |
+| 3 | Planner | Live | Weekly capacity, time blocks, focus log |
+| 4 | Knowledge | Live | Linked notes, concepts, resources, bookmarks |
+| 4 | Search | Placeholder | Unified cross-module retrieval index |
+| 5 | Analytics | Live | Traceable metrics derived from real records |
+| 6 | Developer | **Delivered in Phase 8** | Local git repository analysis, work attribution |
+| 7 | Risks, Recommendations | Live | The risk register and the drafts derived from it |
+| 8 | Learning | **Delivered in Phase 9** | Goals, tracked skills, skill gaps |
+| 9 | Career | **Delivered in Phase 9** | Profile, dated records, portfolio evidence |
+| 9 | AI Assistant | Placeholder | Grounded local-LLM answers via Ollama, proposed actions |
+| 10 | Experiments | Placeholder | Hypothesis, bounded scope, keep-or-kill verdict |
 
 Phase 2 was *infrastructure*, not product surface: it made the accounts behind the shell
-real and added no module. Projects and Tasks are still placeholder pages. Note also that
-the module phases above are the ones recorded in
+real and added no module. Note also that the module phases above are the ones recorded in
 `frontend/src/features/modules/catalog.ts` and describe when each **module** ships — they
 are not the same axis as the platform work recorded in the
-[Status](#status-phase-2-identity-sessions-and-security-is-complete) table, which is why
-both carry a "Phase 2".
+[Status](#status-phases-1-through-9-are-delivered) table, which is why both carry a
+"Phase 2".
 
 Behind those modules sit infrastructure seams that are described in the extension-roadmap
 section of [`docs/architecture.md`](docs/architecture.md): Redis (replacing the in-process
 access-token revocation store), an audit-log pruning job (the retention setting exists; the
-job does not), background workers, an ML training pipeline, a local model registry,
-Ollama-backed local LLM features, and git repository analysis. None of them exists yet.
+job does not), background workers, an ML training pipeline, a local model registry, and
+Ollama-backed local LLM features. Git repository analysis is no longer a seam — it
+shipped in Phase 8 and reads local work trees through the `git` CLI.
 
 ---
 
@@ -706,5 +847,7 @@ Ollama-backed local LLM features, and git repository analysis. None of them exis
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | Layering, request lifecycle, auth and session design, RBAC, the audit trail, password policy and reset, configuration, logging, database strategy, extension roadmap, decisions and rationale |
 | [`docs/development.md`](docs/development.md) | Clean-machine setup, the daily loop, migrations, adding a repository, service, permission-guarded endpoint, audit event, page, settings panel or design-system primitive, testing conventions, code conventions, the pre-pull-request checklist, and the verified baseline (including what was *not* run) |
-| [`docs/api-conventions.md`](docs/api-conventions.md) | Base URL and versioning, health endpoints, the full endpoint catalogue, authentication (tokens, sessions, the password policy, permissions, password reset), the error envelope and its full code table, request-id correlation, pagination, the checklist every endpoint must satisfy |
+| [`docs/api-conventions.md`](docs/api-conventions.md) | Base URL and versioning, health endpoints, the full endpoint catalogue, authentication (tokens, sessions, the password policy, permissions, password reset), the error envelope and its full code table, request-id correlation, pagination, the checklist every endpoint must satisfy, and the conventions Phases 8 and 9 established |
+| [`docs/specifications/phase-8-developer-report.md`](docs/specifications/phase-8-developer-report.md) | What Phase 8 shipped, the four git tables, the 14 routes, `developer_features.v1`, the tests actually executed, the two defects three agents independently reported, and the known repo-scan limitations |
+| [`docs/specifications/phase-9-learning-career-report.md`](docs/specifications/phase-9-learning-career-report.md) | What Phase 9 shipped, the six learning/career tables, the 33 routes, `learning_features.v1` and `career_features.v1`, the tests actually executed, and the contract disagreements |
 | [`docs/specifications/README.md`](docs/specifications/README.md) | The authoritative specifications for Phases 3–9 — projects and tasks, planner and scheduling, knowledge base, analytics, risk and recommendations, developer intelligence, learning and career — with the dependency chain each phase requires and the standing rules that apply to all of them |

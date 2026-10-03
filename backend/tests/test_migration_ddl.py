@@ -46,6 +46,8 @@ MIGRATION_MODULES = (
     "migrations.versions.0005_phase5_knowledge",
     "migrations.versions.0006_phase6_analytics",
     "migrations.versions.0007_phase7_intelligence",
+    "migrations.versions.0008_phase8_developer_intelligence",
+    "migrations.versions.0009_phase9_learning_career",
 )
 
 PG = postgresql.dialect()
@@ -235,8 +237,10 @@ def test_the_migration_chain_is_linear_with_a_single_head():
     """
     script = ScriptDirectory.from_config(_alembic_config("postgresql+psycopg://unused"))
 
-    assert script.get_heads() == ["0007"]
+    assert script.get_heads() == ["0009"]
     assert [revision.revision for revision in script.walk_revisions()] == [
+        "0009",
+        "0008",
         "0007",
         "0006",
         "0005",
@@ -246,6 +250,8 @@ def test_the_migration_chain_is_linear_with_a_single_head():
         "0001",
     ]
     assert {revision.revision: revision.down_revision for revision in script.walk_revisions()} == {
+        "0009": "0008",
+        "0008": "0007",
         "0007": "0006",
         "0006": "0005",
         "0005": "0004",
@@ -601,6 +607,29 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
         "risks": 1,
         "recommendations": 2,
         "risk_evaluations": 1,
+        # Phase 8. The three tables that hang off a repository each carry two:
+        # the owning user, plus the repository they belong to. `git_repositories`
+        # is the exception — its second reference is the *project* it is
+        # associated with, which is SET NULL so the repository trail outlives the
+        # project rather than the other way round.
+        "git_repositories": 2,
+        "git_commits": 2,
+        "git_branches": 2,
+        "git_scan_runs": 2,
+        # Phase 9. The three new user-owned tables that also point at something
+        # else carry two references each, and the counts say so deliberately:
+        # `learning_goals` reaches a skill, a project *and* a note, and
+        # `career_evidence` reaches a project, a skill *and* a repository. Those
+        # links are SET NULL so the trail outlives the thing it points at — the
+        # reasoning `git_repositories.project_id` already sets out — while the
+        # owning `user_id` cascades, because a row with no owner is an orphan no
+        # query can reach.
+        "learning_goals": 4,
+        "skills": 1,
+        "learning_activities": 3,
+        "career_profiles": 1,
+        "career_experience": 1,
+        "career_evidence": 4,
     }
 
 
@@ -686,6 +715,79 @@ def test_the_migration_declares_exactly_one_foreign_key_per_table(ddl):
             "ix_risk_evaluations_owner_evaluated",
             "risk_evaluations",
             ("user_id", "evaluated_at"),
+            False,
+        ),
+        # Phase 8. Each of these is a windowed read keyed on the owner and then
+        # ordered or filtered by time, which is the shape a bare `user_id` index
+        # cannot serve — the two composite indexes per fact table are the ones
+        # that make the analytics windows cheap, and are listed here so their
+        # column order is checked rather than merely their existence.
+        ("ix_git_repositories_user_id", "git_repositories", ("user_id",), False),
+        (
+            "ix_git_repositories_owner_active",
+            "git_repositories",
+            ("user_id", "is_active"),
+            False,
+        ),
+        ("ix_git_repositories_project_id", "git_repositories", ("project_id",), False),
+        ("ix_git_commits_user_id", "git_commits", ("user_id",), False),
+        (
+            "ix_git_commits_repo_committed",
+            "git_commits",
+            ("repository_id", "committed_at"),
+            False,
+        ),
+        (
+            "ix_git_commits_user_committed",
+            "git_commits",
+            ("user_id", "committed_at"),
+            False,
+        ),
+        ("ix_git_branches_user_id", "git_branches", ("user_id",), False),
+        ("ix_git_branches_repo_id", "git_branches", ("repository_id",), False),
+        ("ix_git_scan_runs_user_id", "git_scan_runs", ("user_id",), False),
+        (
+            "ix_git_scan_runs_repo_scanned",
+            "git_scan_runs",
+            ("repository_id", "scanned_at"),
+            False,
+        ),
+        # Phase 9. Same two shapes as Phase 8's: a bare `user_id` index for the
+        # list read, and a composite `(user_id, <time or status>)` for the
+        # windowed reads every learning and career screen is made of. The
+        # `(user_id, target_date)` and `(user_id, occurred_on)` indexes in
+        # particular are what make "goals due soon" and "evidence, newest first"
+        # cheap; their column order is the point of listing them here.
+        ("ix_learning_goals_user_id", "learning_goals", ("user_id",), False),
+        (
+            "ix_learning_goals_owner_status",
+            "learning_goals",
+            ("user_id", "status"),
+            False,
+        ),
+        (
+            "ix_learning_goals_owner_target_date",
+            "learning_goals",
+            ("user_id", "target_date"),
+            False,
+        ),
+        ("ix_skills_user_id", "skills", ("user_id",), False),
+        ("ix_learning_activities_user_id", "learning_activities", ("user_id",), False),
+        (
+            "ix_learning_activities_user_occurred",
+            "learning_activities",
+            ("user_id", "occurred_at"),
+            False,
+        ),
+        ("ix_learning_activities_skill_id", "learning_activities", ("skill_id",), False),
+        ("ix_learning_activities_goal_id", "learning_activities", ("goal_id",), False),
+        ("ix_career_profiles_user_id", "career_profiles", ("user_id",), False),
+        ("ix_career_experience_user_id", "career_experience", ("user_id",), False),
+        ("ix_career_evidence_user_id", "career_evidence", ("user_id",), False),
+        (
+            "ix_career_evidence_user_occurred",
+            "career_evidence",
+            ("user_id", "occurred_on"),
             False,
         ),
     ],

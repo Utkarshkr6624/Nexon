@@ -150,6 +150,74 @@ class Settings(BaseSettings):
     # anything longer belongs to the worker this phase only prepares for.
     analytics_rebuild_max_days: int = 180
 
+    # -- Developer intelligence (Phase 8) ------------------------------------
+    #: Wall-clock budget for one `git` invocation. A repository that hangs --
+    #: a network-mounted work tree, a filter process waiting on a prompt -- must
+    #: come back as an ERROR scan row with a human sentence, not as a request
+    #: that never returns. The subprocess is killed when this elapses.
+    developer_git_timeout_seconds: int = 30
+    #: Upper bound on the commits one scan will transfer. The scan reads history
+    #: incrementally, so this is a backstop against a repository whose entire log
+    #: is new to us, not the expected volume.
+    developer_max_commits_per_scan: int = 2000
+    #: How many repositories one account may register. Each registered path is a
+    #: directory the server will read on demand; an unbounded list is an
+    #: unbounded bill for a list page that renders all of them.
+    developer_max_repositories: int = 100
+    #: Window used when a request names no dates. A month, not a week: a week of
+    #: commits is too few to distinguish a habit from an off week.
+    developer_default_window_days: int = 30
+    #: Hard ceiling on any requested window, in days. The same argument as
+    #: `analytics_max_range_days`: every windowed aggregate here scans the
+    #: owner's whole commit history, so an unbounded range is the one query
+    #: shape these indexes cannot serve.
+    developer_max_window_days: int = 366
+    #: Bucket size for the activity series when a request names none. One of
+    #: `day`, `week` or `month` -- it is validated where it is read rather than
+    #: here, because an unknown bucket size is a request the caller can be told
+    #: about, whereas a process that refuses to start takes the whole app down
+    #: over one analytics preference.
+    developer_activity_granularity_default: str = "day"
+    #: Comma-separated roots under which a repository may be registered. Empty
+    #: means any readable absolute path that validates as a git work tree,
+    #: which is the right default for a local-first application. Set it in a
+    #: shared deployment to stop the server reading an arbitrary path at all.
+    developer_path_allowlist: str = ""
+
+    # -- Learning and career (Phase 9) --------------------------------------
+    #: Window used when a request names no dates. A month, for the reason
+    #: `developer_default_window_days` is a month: a shorter window cannot
+    #: distinguish a habit from an off week, and a skill level is only ever
+    #: described alongside how much was recorded inside it.
+    learning_default_window_days: int = 30
+    #: Hard ceiling on any requested window, in days. Every windowed aggregate
+    #: here scans the owner's whole activity history, so an unbounded range is
+    #: the one query shape these indexes cannot serve.
+    learning_max_window_days: int = 366
+    #: How many learning goals one account may keep. Each goal renders as a row
+    #: with its own progress and deadline, so an unbounded list is an unbounded
+    #: page — and archived goals still count toward it, because deleting them
+    #: would delete the record the user kept them for.
+    learning_max_goals: int = 200
+    #: How many skills one account may keep. The skills list is the input to
+    #: every gap calculation, so a cap here is also what bounds that computation
+    #: per request.
+    learning_max_skills: int = 100
+    #: Below this many activities for a skill, NEXUS offers no level estimate at
+    #: all. This is the cold-start guard from the brief, and it is a refusal
+    #: rather than a default: a thin sample shown with a low confidence badge
+    #: still reads as a claim, whereas a stated refusal does not.
+    learning_min_evidence_for_estimate: int = 3
+    #: Ceiling on rows in one career-evidence list. Everything on a profile is
+    #: user-supplied or user-approved, so the bound here is a rendering bound
+    #: rather than a correctness one.
+    career_max_evidence: int = 500
+    #: After this many days with no recorded activity, a target skill counts as
+    #: dormant and is eligible for a nudge. Three weeks is roughly one review
+    #: cycle: long enough that someone deep in a project does not get nagged,
+    #: short enough that a habit has visibly lapsed.
+    career_stale_inactive_days: int = 21
+
     # -- Logging -------------------------------------------------------------
     log_level: str = "INFO"
     log_json: bool = True

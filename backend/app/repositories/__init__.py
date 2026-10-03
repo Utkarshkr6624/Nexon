@@ -3,6 +3,8 @@
 from app.repositories.activity import ActivityRepository
 from app.repositories.analytics import AnalyticsRepository
 from app.repositories.audit import AuditRepository
+from app.repositories.career import CareerRepository
+from app.repositories.developer import DeveloperRepository
 from app.repositories.knowledge import (
     BookmarkRepository,
     CategoryRepository,
@@ -12,6 +14,7 @@ from app.repositories.knowledge import (
     NoteRepository,
     ResourceRepository,
 )
+from app.repositories.learning import LearningRepository
 from app.repositories.password_reset import PasswordResetRepository
 from app.repositories.planner import (
     AvailabilityRuleRepository,
@@ -31,10 +34,13 @@ __all__ = [
     "AvailabilityRuleRepository",
     "BookmarkRepository",
     "CalendarEventRepository",
+    "CareerRepository",
     "CategoryRepository",
     "ConceptRepository",
+    "DeveloperRepository",
     "DocumentRepository",
     "KnowledgeLinkRepository",
+    "LearningRepository",
     "NoteRepository",
     "PasswordResetRepository",
     "ProjectRepository",

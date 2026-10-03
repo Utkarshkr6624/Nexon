@@ -277,30 +277,33 @@ export const MODULES: ModuleDefinition[] = [
     to: '/developer',
     label: 'Developer',
     summary:
-      'Your engineering footprint in one place: repositories, commits, pull requests and the systems you maintain.',
+      'What your local git repositories have recorded: commits per day, branches, changed lines and the language git can see — read with the git CLI on the machine NEXUS runs on, with no hosted account to connect.',
     vision:
-      'The developer surface connects local git history to the work records you keep here, so "what did I actually build" is answerable without a separate dashboard. Repository metadata is read locally — no hosted service required — and every derived number is traceable back to the commits it came from.',
-    phase: 6,
+      'The developer surface reads local work trees and reports the evidence, and it is deliberate that it reports nothing else. A commit timestamp proves that work happened at an instant and nothing about how long anyone was at it, so there is no hours figure, no focus score and no productivity verdict anywhere on this surface — the metrics are counts of commits, of days that carried a commit, and of lines added and removed, and each one states the arithmetic it was built from. Every scan is recorded whatever its outcome: a repository git cannot read becomes a row carrying a sentence, never an exception that takes the page down, because one unreadable directory must not be able to break the product. Nothing re-reads a repository on its own, so every figure is as of a named scan and the page says how old that is rather than presenting it as current.',
+    phase: 8,
     icon: Code2,
     keywords: ['git', 'code', 'repos', 'engineering', 'commits'],
     capabilities: [
       {
         title: 'Local repository scan',
-        description: 'Reads git history from disk; no hosted account or token required.',
+        description:
+          'Reads git history from disk with the git CLI; no hosted account, token or pull-request forge involved.',
       },
       {
-        title: 'Work attribution',
-        description: 'Links commits and pull requests to the tasks and projects they served.',
+        title: 'Recorded activity over a window',
+        description:
+          'Commits, active days and changed lines bucketed by day, week or month, with quiet days plotted as zeros rather than skipped.',
       },
       {
-        title: 'System inventory',
-        description: 'A live list of the services and repositories you actually maintain.',
+        title: 'Eight explained metrics',
+        description:
+          'Each one states how it is computed, repeats itself with the figures behind it, and says why it could not be measured rather than reporting zero.',
       },
     ],
     metrics: [
-      { label: 'Repositories', hint: 'Requires a local repository scan' },
-      { label: 'Commits (30d)', hint: 'Requires git history' },
-      { label: 'Open pull requests', hint: 'Requires a forge integration' },
+      { label: 'Repositories', hint: 'Registered local work trees, each validated as a git work tree' },
+      { label: 'Commits (30d)', hint: 'Commits git recorded inside the window' },
+      { label: 'Days with a commit', hint: 'Distinct days carrying at least one commit — not hours spent' },
     ],
   },
   {
@@ -373,60 +376,76 @@ export const MODULES: ModuleDefinition[] = [
     to: '/learning',
     label: 'Learning',
     summary:
-      'Deliberate practice: courses, reading queues, spaced review and evidence that the knowledge stuck.',
+      'Goals, skills and the learning activity you record against them — with every level shown beside where it came from, and nothing measured that nobody recorded.',
     vision:
-      'Learning tracks what you are trying to learn, not what you have bookmarked. Each track pairs source material with review intervals, and notes captured during study flow back into the knowledge base. Progress is measured by recall and applied work rather than by the number of tabs left open.',
-    phase: 7,
+      'Learning is built on one refusal: NEXUS does not know how good you are at something, so it never says. A skill level is either one you set or one NEXUS estimated from recorded activities, and the badge beside the number says which, so a claim and an inference are never mistaken for one another. The same discipline runs through the rest of the surface. Progress on a goal is your own percentage because a percentage derived from the absence of a record would be a statement about your commitment rather than about the work; a gap between your level and your target is computed on read from both and never stored, so it cannot go stale and disagree with the card beside it; and a figure that could not be measured is a dash with the backend’s own reason rather than a zero, because zero would claim something was counted that nobody counted. Everything here is a count of records you created — goals written down, skills tracked, activities logged, minutes you attached to them — and the empty states say what fills them.',
+    phase: 9,
     icon: GraduationCap,
     keywords: ['study', 'courses', 'reading', 'review', 'skills'],
     capabilities: [
       {
-        title: 'Tracks and sources',
-        description: 'Courses and reading queues attached to a declared learning goal.',
+        title: 'Goals with your own progress',
+        description:
+          'A title, the skill or topic it is for, an optional deadline you set, and a progress figure that is yours — NEXUS never fills one in.',
       },
       {
-        title: 'Spaced review',
-        description: 'Review intervals scheduled from recall quality, not a fixed calendar.',
+        title: 'Levels with their source',
+        description:
+          'Every skill level renders beside whether you set it or NEXUS estimated it from recorded activity, with the evidence count underneath.',
       },
       {
-        title: 'Applied evidence',
-        description: 'Projects and tasks link back to the track they exercised.',
+        title: 'Gaps with their working shown',
+        description:
+          'The distance to your target, computed on read, with the sentence naming both levels and the number of recorded activities behind them.',
+      },
+      {
+        title: 'Recorded activity, never inferred',
+        description:
+          'Study sessions, completed tasks, notes, concepts and opened resources are counted as the separate kinds of event they are.',
       },
     ],
     metrics: [
-      { label: 'Active tracks', hint: 'Requires learning tracks' },
-      { label: 'Due for review', hint: 'Requires review scheduling' },
-      { label: 'Completion rate', hint: 'Requires source progress' },
+      { label: 'Open goals', hint: 'Not completed and not archived' },
+      { label: 'Tracked skills', hint: 'Each one carrying a level and its source' },
+      { label: 'Activities recorded', hint: 'Learning events inside the selected window' },
     ],
   },
   {
     to: '/career',
     label: 'Career',
     summary:
-      'The long arc: goals, evidence, contacts and a running record of how your work has grown.',
+      'A profile, dated records and portfolio evidence — all of it supplied by you, with a development-areas panel that reports distance and evidence and never a verdict.',
     vision:
-      'Career is the slowest-moving module and the one with the longest half-life. It holds the goals you are working toward, the evidence that supports them, and the conversations and opportunities attached to them, so that a review or an application is assembled from real history instead of reconstructed memory.',
-    phase: 8,
+      'Career is the slowest-moving surface in NEXUS and the one with the longest half-life, so it is also the one where an invented detail would do the most damage: a certification, an employer or a date that NEXUS made up would sit on your profile looking exactly like the ones you typed. Nothing here is written for you. The profile is your words field for field, the summary is your paragraph and is never rewritten, and every dated record and every manually added piece of evidence is stored verbatim. What NEXUS contributes is provenance rather than content: each evidence row says whether you entered it or a subsystem derived it from a record you created, repository evidence names the code events a scan recorded rather than dressing them as delivered projects, and the skill tiles pair every level with the source of that level. The development-areas panel is deliberately the dullest thing here — a distance between a level and a target you chose, with the recorded activity behind it — because that is all the records support. There is no readiness score, no employer match and no suitability claim anywhere on this surface.',
+    phase: 9,
     icon: Briefcase,
     keywords: ['growth', 'goals', 'review', 'profile', 'history'],
     capabilities: [
       {
-        title: 'Goals and evidence',
-        description: 'Long-horizon goals backed by artefacts pulled from real work.',
+        title: 'A profile that is only yours',
+        description:
+          'Target role, headline, summary, location and links — stored as typed, with no generated paragraph and no inferred target.',
       },
       {
-        title: 'Opportunity log',
-        description: 'Conversations, applications and outcomes recorded with dates.',
+        title: 'Portfolio evidence with provenance',
+        description:
+          'Rows you added and rows a subsystem derived, each labelled with which, and linked to the project, skill or repository they came from.',
       },
       {
-        title: 'Narrative export',
-        description: 'A generated summary assembled from your own records.',
+        title: 'Dated records by kind',
+        description:
+          'Education, work experience and certifications counted separately — a CV section is not an achievements section.',
+      },
+      {
+        title: 'Development areas, neutrally',
+        description:
+          'Skills whose recorded level sits below the target you set, with the activity recorded in the window stated beside them.',
       },
     ],
     metrics: [
-      { label: 'Active goals', hint: 'Requires career goals' },
-      { label: 'Evidence items', hint: 'Requires linked artefacts' },
-      { label: 'Last review', hint: 'Requires review history' },
+      { label: 'Experience records', hint: 'Roles you listed, with the dates you gave' },
+      { label: 'Evidence items', hint: 'Yours and those derived, counted separately by kind' },
+      { label: 'Tracked skills', hint: 'Each one carrying a level and its source' },
     ],
   },
   {

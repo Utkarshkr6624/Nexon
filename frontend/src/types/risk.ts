@@ -104,6 +104,10 @@ export const RECOMMENDATION_TYPES = [
   'block_time',
   'complete_blocked_task',
   'review_project',
+  // Phase 9. Both name something the person does with their own learning record,
+  // and both are raised without a risk behind them — hence `risk_id: null`.
+  'review_learning_goal',
+  'revive_target_skill',
 ] as const
 export type RecommendationType = (typeof RECOMMENDATION_TYPES)[number]
 

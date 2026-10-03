@@ -21,10 +21,10 @@ of its output, because each is a way the whole design fails quietly:
 * **A reason cannot be constructed without a figure.**
   :class:`~app.services.risk.recommendation.RecommendationDraft` raises on a
   reason carrying no digit, and the tests here assert both that the construction
-  raises and that every one of the eight rules puts its *actual* numbers into the
-  sentence — "3h", "127%", "4 of 7", "9.3". A reason that is a restatement of
-  the title renders perfectly on a card, which is exactly why nobody would
-  notice its absence without a check.
+  raises and that every one of the ten rules puts its *actual* numbers into the
+  sentence — "3h", "127%", "4 of 7", "9.3", "14 day(s)", "35%". A reason that is a
+  restatement of the title renders perfectly on a card, which is exactly why
+  nobody would notice its absence without a check.
 * **One suggestion per condition, refreshed rather than duplicated.**
   The brief forbids "hundreds of identical records", and the only thing that
   makes that true across runs is the repository's open-status partial index plus
@@ -64,6 +64,33 @@ reads puts the numbers under the test's control and lets each rule's expected
 sentence be derived by hand from them. Every expected string below was written
 from the documented shape rather than copied from a run, so a wording change
 shows up as a diff a reviewer can read.
+
+Phase 9 — the last two rule groups
+---------------------------------
+The Phase 9 rules raise from the user's own learning record rather than from a
+stored risk, so they are exercised through
+:meth:`~app.services.risk.recommendation.RecommendationService.generate_learning`
+and their fixtures are real ``learning_goals`` and ``skills`` rows rather than a
+risk's ``metadata`` blob. Three properties are asserted there that could not be
+asserted above, and each is a way this design fails quietly:
+
+* **The same registry, the same dispatch, the same dedup.** The two names sit in
+  :data:`~app.services.risk.recommendation.recommendation_rules` under the ``None``
+  key, resolve through the same ``getattr``, and are written by the same
+  ``_persist`` — so the open-status partial index, the refresh-instead-of-duplicate
+  rule and the rejection-frees-the-row behaviour all apply without a word of
+  Phase 9-specific code.
+* **Priority is still derived, never chosen.** The two learning rules have no
+  raising risk and so no severity to read a band off, which is exactly the opening
+  a rule could take to name its own urgency. Both read theirs from a hand-written
+  ladder over a figure they quote, and the structural test above checks their
+  signatures alongside the other eight.
+* **A missing figure is a reason to decline.** A goal with no target date, a
+  skill nothing has ever been recorded against, and an account with no learning
+  data at all each produce *nothing* — not a suggestion quoting ``0`` days or
+  ``0%``, which is the fabricated-zero failure the phase forbids and the one a
+  cold-start default would introduce without any test noticing until the copy
+  read it.
 """
 
 from __future__ import annotations
@@ -73,11 +100,11 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ConflictError, NotFoundError
@@ -85,6 +112,7 @@ from app.models.activity import ActivityLog
 from app.models.enums import (
     ActivityEvent,
     EvidenceStrength,
+    LearningGoalStatus,
     RecommendationPriority,
     RecommendationStatus,
     RecommendationType,
@@ -93,17 +121,22 @@ from app.models.enums import (
     RiskType,
     TaskStatus,
 )
+from app.models.learning import LearningGoal, Skill
 from app.models.risk import Recommendation, Risk
 from app.models.task import TaskDependency
 from app.models.user import User
 from app.repositories.activity import ActivityRepository
+from app.repositories.learning import LearningRepository
 from app.repositories.project import ProjectRepository
 from app.repositories.risk import RiskRepository
 from app.repositories.task import TaskRepository
 from app.services.activity_service import ActivityService
 from app.services.risk.recommendation import (
+    DEFAULT_STALE_INACTIVE_DAYS,
     ENTITY_ACCOUNT,
+    ENTITY_LEARNING_GOAL,
     ENTITY_PROJECT,
+    ENTITY_SKILL,
     ENTITY_TASK,
     MIN_RESCHEDULES,
     RecommendationDraft,
@@ -1731,18 +1764,25 @@ def test_no_rule_has_a_way_to_choose_its_own_priority() -> None:
     comes from severity" cannot be true of one rule and false of another — a
     rule that wanted to say "this one is urgent" would have to raise a risk that
     says so, which is the only place urgency is a fact about anything.
+
+    **Ten rules, not eight.** Phase 9 adds two under the ``None`` key — the
+    learning rules, which are raised from the user's own record and have no risk
+    to derive anything from — and they are held to the *same* signature: keyword
+    only, ``owner`` and ``risk`` and nothing else, and still no ``priority``. A
+    learning rule that could pass its own band would break the guarantee the other
+    eight keep, and the way it would break it is exactly the way the first eight
+    could.
     """
     registered = {name for rule_names in recommendation_rules.values() for name in rule_names}
-    assert len(registered) == 8, "the contracts freeze eight rules"
-    for risk_type, rule_names in recommendation_rules.items():
+    assert len(registered) == 10, "eight risk-raised rules plus the two Phase 9 learning rules"
+    for scope, rule_names in recommendation_rules.items():
+        label = scope.value if scope is not None else "learning"
         for name in rule_names:
             signature = inspect.signature(getattr(RecommendationService, name))
-            assert "priority" not in signature.parameters, (
-                f"{risk_type.value}/{name} can set a priority"
-            )
+            assert "priority" not in signature.parameters, f"{label}/{name} can set a priority"
             # ``self`` apart, every rule is handed exactly the two arguments
-            # ``generate`` passes and nothing else, and both keyword-only, so no
-            # rule can widen what it is given either.
+            # ``generate`` and ``generate_learning`` pass and nothing else, and
+            # both keyword-only, so no rule can widen what it is given either.
             assert set(signature.parameters) - {"self"} == {"owner", "risk"}, (
                 f"{name} has an unexpected parameter"
             )
@@ -1750,8 +1790,30 @@ def test_no_rule_has_a_way_to_choose_its_own_priority() -> None:
                 if parameter.name == "self":
                     continue
                 assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (
-                    f"{name}/{parameter.name} is positional"
+                    f"{label}/{name}/{parameter.name} is positional"
                 )
+
+
+def test_the_learning_rules_are_registered_under_the_key_that_means_no_risk() -> None:
+    """One registry, one dispatch — and the Phase 9 rules are in it.
+
+    The contracts extend this engine rather than building a parallel path, so the
+    thing worth pinning is that the two new rules are *names in the same table*
+    that :meth:`RecommendationService._rule` resolves, and that they are keyed
+    apart from every :class:`~app.models.enums.RiskType`: a risk type is a
+    condition a detector can re-derive, and neither a goal's deadline nor a
+    dormant skill is one.
+
+    Both halves are asserted rather than described: the key is literally ``None``,
+    and both names resolve to methods on the class.
+    """
+    assert recommendation_rules[None] == (
+        "_rule_review_learning_goal",
+        "_rule_revive_target_skill",
+    )
+    assert None not in set(RiskType)
+    for name in recommendation_rules[None]:
+        assert callable(getattr(RecommendationService, name))
 
 
 # Cold start
@@ -2000,3 +2062,679 @@ async def test_every_suggestion_is_written_for_one_account_only(
     stored = await _stored(db_session, fixture.primary.id)
 
     assert stored.user_id == owner.id
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — learning recommendations raised with no risk behind them
+# ---------------------------------------------------------------------------
+
+#: The two registers Phase 9 bans on top of the shared
+#: :data:`NEUTRALITY_PROHIBITIONS`. The first is a claim about somebody's
+#: ability, which the phase's first rule rules out and which the level-phrase
+#: mechanism exists to prevent; the second quotes a duration as though it measured
+#: the person, which is the honest-language rule restated for a phase whose
+#: evidence table records *that something was logged* rather than how anyone
+#: spent a month. Matched on word boundaries, for the reason the list above is.
+_PERSON_PROHIBITIONS = (
+    "not good at",
+    "weak at",
+    "weak",
+    "bad at",
+    "struggling with",
+    "unproductive",
+    "inactive person",
+    "lazy",
+    "hours worked",
+    "hours of work",
+    "put in",
+    "mastery",
+    "proficiency",
+    "proficient",
+    "aptitude",
+)
+
+
+def _learning_service(session: AsyncSession) -> RecommendationService:
+    """Wire the service the way ``get_recommendation_service`` does, plus learning.
+
+    Module-level and mirroring the API wiring rather than the ``service`` fixture,
+    because the two sweeps need different collaborators: the learning rules read
+    ``learning_goals`` and ``skills`` and have no risk to walk, so the fixture that
+    exercises the Phase 7 rules cannot stand in for this one. Everything the
+    Phase 7 fixture passes is passed here too, so a test that reaches both halves
+    gets one service rather than two that happen to agree.
+
+    ``stale_inactive_days`` is left at the module default on purpose — it is
+    :data:`DEFAULT_STALE_INACTIVE_DAYS`, the same number
+    ``settings.career_stale_inactive_days`` documents, and a test that wanted the
+    other one would say so explicitly rather than inheriting a settings object
+    nobody read.
+    """
+    return RecommendationService(
+        RiskRepository(session),
+        TaskRepository(session),
+        ProjectRepository(session),
+        ActivityService(ActivityRepository(session)),
+        LearningRepository(session),
+    )
+
+
+@pytest.fixture
+def learning(db_session: AsyncSession) -> LearningRepository:
+    """Phase 9 learning persistence, for writing the goals and skills the rules read."""
+    return LearningRepository(db_session)
+
+
+@pytest.fixture
+def learning_service(db_session: AsyncSession) -> RecommendationService:
+    """The Phase 9 sweep, wired by :func:`_learning_service`."""
+    return _learning_service(db_session)
+
+
+async def _db_now(session: AsyncSession) -> datetime:
+    """The database clock, as an aware UTC instant.
+
+    Read through the database rather than ``datetime.now()`` for the reason
+    :mod:`app.services.learning.service` gives at length: both Phase 9 rules are
+    arithmetic on a *distance in days*, so a host clock that drifted from the
+    server's would seed a fixture whose own dates disagreed with the rule's.
+    """
+    value = await session.scalar(select(func.now()))
+    assert isinstance(value, datetime)
+    return value
+
+
+async def _goal_columns(
+    session: AsyncSession, goal_id: uuid.UUID
+) -> tuple[str, str, int, date | None]:
+    """Read back ``(title, status, progress, target_date)`` as plain columns.
+
+    A column tuple rather than the ORM entity, because the identity map still
+    holds the object :meth:`LearningRepository.create_goal` returned: an entity
+    read would hand back that cached instance, and an assertion about what the
+    rule saw would then be comparing a fixture with itself. The values are checked
+    here so that the expected sentence below is derived from the row that exists
+    rather than from the arguments the fixture hoped for.
+    """
+    result = await session.execute(
+        select(
+            LearningGoal.title,
+            LearningGoal.status,
+            LearningGoal.progress,
+            LearningGoal.target_date,
+        ).where(LearningGoal.id == goal_id)
+    )
+    title, status, progress, target_date = result.one()
+    return title, status, progress, target_date
+
+
+async def _skill_columns(
+    session: AsyncSession, skill_id: uuid.UUID
+) -> tuple[str, int, int, str, int, datetime | None]:
+    """Read back a skill's ``(name, current, target, source, count, last)`` columns.
+
+    Column tuple for the same reason as :func:`_goal_columns`, and it matters more
+    here: :meth:`LearningRepository.record_skill_evidence` returns the refreshed
+    entity, and every figure the dormant-skill rule quotes is one of these
+    columns.
+    """
+    result = await session.execute(
+        select(
+            Skill.name,
+            Skill.current_level,
+            Skill.target_level,
+            Skill.level_source,
+            Skill.evidence_count,
+            Skill.last_activity_at,
+        ).where(Skill.id == skill_id)
+    )
+    name, current, target, source, evidence, last = result.one()
+    return name, current, target, source, evidence, last
+
+
+async def test_a_goal_whose_target_date_is_near_is_raised_with_its_own_figures(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """Rule 9: 14 days to the user's own target date, 35% recorded progress.
+
+    The fixture's figures are the contracts' own worked example, so the expected
+    sentence is written by hand from them rather than copied from a run: a goal
+    titled "Machine Learning", a ``target_date`` exactly 14 days after the
+    database clock, and ``progress`` 35 — both columns the *user* filled in and
+    neither one NEXUS computed. The row is read back through :func:`_goal_columns`
+    first, so the three figures quoted below are the ones storage actually holds.
+
+    Fourteen days past the 7-day ceiling and inside the 30 puts the goal in the
+    ``medium`` band of :data:`_GOAL_DEADLINE_PRIORITY`. The reason's closing
+    sentence states that the percentage is on the record rather than estimated —
+    the honesty sentence the whole phase turns on, and the one a well-meaning
+    rewrite would lose first.
+    """
+    today = (await _db_now(db_session)).date()
+    target_date = today + timedelta(days=14)
+    goal = await learning.create_goal(
+        owner.id,
+        title="Machine Learning",
+        target_date=target_date,
+        progress=35,
+        status=LearningGoalStatus.IN_PROGRESS.value,
+    )
+    title, status, progress, stored_date = await _goal_columns(db_session, goal.id)
+    assert (title, status, progress, stored_date) == (
+        "Machine Learning",
+        "in_progress",
+        35,
+        target_date,
+    )
+
+    rows = await learning_service.generate_learning(owner=owner)
+
+    row = _only(rows, RecommendationType.REVIEW_LEARNING_GOAL)
+    due = f"{target_date:%d %b %Y}"
+    assert row.title == f"Schedule learning sessions for Machine Learning before {due}"
+    assert row.description == (
+        "Add three short study sessions for Machine Learning to the coming week, or move "
+        "its target date if the scope behind it has changed."
+    )
+    assert row.reason == (
+        f"Machine Learning has a target date of {due}, which is 14 day(s) away, and 35% "
+        "recorded progress against it. That percentage is the one on the record, not one "
+        "NEXUS estimated."
+    )
+    assert row.priority == RecommendationPriority.MEDIUM.value
+    assert row.entity_type == ENTITY_LEARNING_GOAL
+    assert row.entity_id == goal.id
+    assert row.risk_id is None, "this suggestion has no raising risk to point back to"
+
+
+async def test_a_goal_with_ample_progress_is_not_raised(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """The same 14-day horizon, 70% recorded — the rule's own gate, in one figure.
+
+    :data:`GOAL_LOW_PROGRESS_PERCENT` is 50 and this goal is above it. A goal the
+    user has recorded most of the way through is a healthy one, and a suggestion
+    about it would be the engine talking over them — so the assertion is that
+    *nothing at all* is raised, not that a lower-priority row appears.
+    """
+    today = (await _db_now(db_session)).date()
+    await learning.create_goal(
+        owner.id,
+        title="Machine Learning",
+        target_date=today + timedelta(days=14),
+        progress=70,
+    )
+
+    assert await learning_service.generate_learning(owner=owner) == []
+
+
+async def test_a_goal_with_no_target_date_is_not_measured_against_one(
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """A date that does not exist cannot be approached, so there is no sentence.
+
+    This is the absence-of-measurement rule rather than a measured zero: the goal
+    below is genuinely open and genuinely at 0%, but "you have 0 days left" would
+    be a figure NEXUS never read. Declining is the honest answer, and the test
+    exists because the alternative — defaulting ``target_date`` to today — is one
+    line away and would read perfectly on a card.
+    """
+    await learning.create_goal(owner.id, title="Rust", progress=0)
+
+    assert await learning_service.generate_learning(owner=owner) == []
+
+
+async def test_a_goal_whose_target_date_has_already_passed_is_raised_in_its_own_words(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """A passed date is a different fact from a near one, and reads differently.
+
+    Split for the reason :meth:`RecommendationService._rule_review_deadline` splits
+    its two deadline cases: "you are five days late" and "you have twenty-five
+    days" are not the same sentence, and the reader is owed which one they are
+    looking at. Five days past lands in the ``critical`` band of
+    :data:`_GOAL_DEADLINE_PRIORITY`, which is the top entry of the ladder rather
+    than a band a rule chose for itself.
+    """
+    today = (await _db_now(db_session)).date()
+    await learning.create_goal(
+        owner.id,
+        title="Rust",
+        target_date=today - timedelta(days=5),
+        progress=20,
+    )
+
+    rows = await learning_service.generate_learning(owner=owner)
+
+    row = _only(rows, RecommendationType.REVIEW_LEARNING_GOAL)
+    assert row.title == "Decide the next step for Rust"
+    assert row.description == (
+        "Decide whether to move the target date, reduce the scope, or record the goal as done."
+    )
+    assert row.reason == (
+        "The target date for Rust passed 5 day(s) ago with 20% recorded progress against "
+        "it. That percentage is the one on the record, not one NEXUS estimated."
+    )
+    assert row.priority == RecommendationPriority.CRITICAL.value
+
+
+async def test_a_completed_goal_is_never_raised_against_its_own_deadline(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """A finished goal is not outstanding work, whatever its progress column says.
+
+    ``COMPLETED`` is excluded from :data:`OPEN_GOAL_STATUSES` by the Phase 9 metrics
+    module for exactly this reason, and this rule reads that same set. A goal
+    stamped complete at 40% by some other path is a contradiction the user can
+    argue with, not a deadline NEXUS should raise a suggestion about.
+    """
+    today = (await _db_now(db_session)).date()
+    await learning.create_goal(
+        owner.id,
+        title="Machine Learning",
+        target_date=today + timedelta(days=14),
+        progress=40,
+        status=LearningGoalStatus.COMPLETED.value,
+    )
+
+    assert await learning_service.generate_learning(owner=owner) == []
+
+
+async def test_a_dormant_target_skill_is_raised_with_the_days_idle_and_the_levels(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """Rule 10: Python, 21 days idle, a self-assessed 2/5 against a target of 4/5.
+
+    The fixture writes one activity exactly :data:`DEFAULT_STALE_INACTIVE_DAYS`
+    old, so the rule fires *on* the boundary rather than comfortably past it —
+    a threshold quietly raised by a day would still pass a 30-day fixture and fail
+    here. The constant is asserted against the figure written into the expected
+    sentence below, so the two cannot drift apart silently.
+    ``evidence_count`` therefore reads 1, which is what makes that sentence say "1
+    related learning activity" in the singular, and the levels are read back
+    through :func:`_skill_columns` so the sentence is derived from the stored row.
+
+    The two levels put the gap at 2, which is the ``medium`` band of
+    :data:`_SKILL_GAP_PRIORITY`, and the current level is quoted with the phrase
+    its ``user_defined`` source requires. That phrase is the assertion worth
+    making: "a self-assessed 2/5" and a bare "2/5" differ by exactly the honesty
+    control the phase is built on.
+    """
+    assert DEFAULT_STALE_INACTIVE_DAYS == 21
+    now = await _db_now(db_session)
+    skill = await learning.create_skill(owner.id, name="Python", current_level=2, target_level=4)
+    await learning.record_skill_evidence(
+        owner.id, skill.id, now - timedelta(days=DEFAULT_STALE_INACTIVE_DAYS)
+    )
+    name, current, target, source, evidence, last = await _skill_columns(db_session, skill.id)
+    assert (name, current, target, source, evidence) == ("Python", 2, 4, "user_defined", 1)
+    assert last is not None
+
+    rows = await learning_service.generate_learning(owner=owner)
+
+    row = _only(rows, RecommendationType.REVIVE_TARGET_SKILL)
+    idle_on = f"{last.date():%d %b %Y}"
+    assert row.title == "Add a practice session for Python"
+    assert row.description == (
+        "Record one short practice activity for Python, or lower its target level if it "
+        "is not one you are aiming at right now."
+    )
+    assert row.reason == (
+        f"The last activity recorded against Python was 21 day(s) ago, on {idle_on}, and "
+        f"the record carries a self-assessed 2/5 against a target of 4/5. NEXUS has "
+        f"recorded 1 related learning activity against it in total."
+    )
+    assert row.priority == RecommendationPriority.MEDIUM.value
+    assert row.entity_type == ENTITY_SKILL
+    assert row.entity_id == skill.id
+    assert row.risk_id is None
+
+
+async def test_a_skill_with_recent_activity_is_not_raised(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """Worked on two days ago: 19 days idle is inside the window, so no nudge.
+
+    The same skill, the same levels and the same gap as the dormant fixture — only
+    the recency differs, which is what makes this the complement rather than a
+    second example. If the rule were keyed on anything else (the gap, the target
+    level, the mere existence of the skill) this would raise and the dormant case
+    would prove nothing about what the threshold is for.
+    """
+    now = await _db_now(db_session)
+    skill = await learning.create_skill(owner.id, name="Python", current_level=2, target_level=4)
+    await learning.record_skill_evidence(owner.id, skill.id, now - timedelta(days=2))
+
+    assert await learning_service.generate_learning(owner=owner) == []
+
+
+async def test_a_skill_nothing_has_ever_been_recorded_against_is_not_called_dormant(
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """A brand-new skill has no recency to be stale about, and is declined.
+
+    ``last_activity_at`` is null here, which is a *different fact* from "recorded
+    long ago" and is the distinction :mod:`app.services.learning.gaps` exists to
+    keep (``available=False`` with a reason, never ``gap=0``). Reading null as zero
+    would put "inactive for 0 days" into a sentence — or, worse, fire the nudge the
+    instant somebody typed the name, which is the engine inventing the inactivity it
+    is about to quote.
+    """
+    await learning.create_skill(owner.id, name="Rust", current_level=1, target_level=4)
+
+    assert await learning_service.generate_learning(owner=owner) == []
+
+
+async def test_a_skill_at_its_target_level_is_not_raised(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """Dormant but no longer a *target* skill: there is nothing left to aim at.
+
+    The gap is zero, so the reason the rule would build — two levels and a
+    distance — has nothing to say. A skill the user says they have reached is
+    dormant, not unfinished, and the two are different facts.
+    """
+    now = await _db_now(db_session)
+    skill = await learning.create_skill(owner.id, name="Python", current_level=4, target_level=4)
+    await learning.record_skill_evidence(owner.id, skill.id, now - timedelta(days=90))
+
+    assert await learning_service.generate_learning(owner=owner) == []
+
+
+async def test_an_account_with_no_learning_data_is_raised_nothing_at_all(
+    db_session: AsyncSession,
+    risks: RiskRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """No goals, no skills, no risks: an empty list, no rows, no events.
+
+    The cold-start case, and the specific way it fails is a fabricated zero — a
+    suggestion table with a row in it for a user who has recorded nothing, which
+    reads as "the engine looked and found this". So all four things are asserted:
+    the return value, the stored rows, the recommendation history and the event
+    feed, exactly as the Phase 7 cold-start test does for risks.
+    """
+    rows = await learning_service.generate_learning(owner=owner)
+
+    assert rows == []
+    assert await _all_rows(db_session, owner) == []
+    stored, total = await risks.list_recommendations(owner.id, limit=50, offset=0)
+    assert stored == []
+    assert total == 0
+    assert await _events(db_session, owner, ActivityEvent.RECOMMENDATION_CREATED) == []
+
+
+async def test_the_learning_sweep_is_a_no_op_when_no_learning_repository_is_wired(
+    owner: User,
+    db_session: AsyncSession,
+) -> None:
+    """A degraded collaborator makes the two rules decline, not the service raise.
+
+    The same bargain ``activity=None`` strikes for the reschedule rule: a
+    suggestion justified by a figure this service never read is the fabricated
+    figure the whole engine is built to avoid, so the sweep returns nothing rather
+    than guessing. Exercised through a service wired exactly as the Phase 7
+    fixture wires it — no learning repository at all.
+    """
+    service = RecommendationService(
+        RiskRepository(db_session),
+        TaskRepository(db_session),
+        ProjectRepository(db_session),
+        ActivityService(ActivityRepository(db_session)),
+    )
+
+    assert await service.generate_learning(owner=owner) == []
+
+
+async def test_generating_learning_twice_creates_nothing_the_second_time(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """The dedup is the repository's, and it covers the Phase 9 rules unchanged.
+
+    An open suggestion already saying exactly this is not rewritten, so a nightly
+    sweep cannot fill the feed with the same card. The count is read back from
+    storage rather than from the second call's return value alone: a return value
+    of ``[]`` with a row written anyway would pass the first half of this assertion
+    and fail the second.
+    """
+    today = (await _db_now(db_session)).date()
+    await learning.create_goal(
+        owner.id, title="Machine Learning", target_date=today + timedelta(days=14), progress=35
+    )
+    assert len(await learning_service.generate_learning(owner=owner)) == 1
+
+    second = await learning_service.generate_learning(owner=owner)
+
+    assert second == []
+    assert len(await _all_rows(db_session, owner)) == 1
+
+
+async def test_a_rejected_learning_suggestion_is_raised_again(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """The open-status index over ``new``/``viewed`` applies here too.
+
+    A rejection is the user's answer, and it has to free the row for the same
+    reason it does on a risk-raised suggestion: the user declined and the
+    condition did not change, so re-raising the identical wording would be nagging
+    rather than noticing. Two rows must therefore exist afterwards, with the first
+    still carrying its rejection.
+    """
+    today = (await _db_now(db_session)).date()
+    await learning.create_goal(
+        owner.id, title="Machine Learning", target_date=today + timedelta(days=14), progress=35
+    )
+    first = _only(
+        await learning_service.generate_learning(owner=owner),
+        RecommendationType.REVIEW_LEARNING_GOAL,
+    )
+    await learning_service.reject(owner=owner, recommendation_id=first.id)
+
+    second = await learning_service.generate_learning(owner=owner)
+
+    assert len(second) == 1
+    assert second[0].id != first.id
+    assert [row.status for row in await _all_rows(db_session, owner)] == [
+        RecommendationStatus.REJECTED.value,
+        RecommendationStatus.NEW.value,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_figures"),
+    [
+        (
+            "goal",
+            (
+                "14 day(s)",
+                "35%",
+                "target date of",
+                "the record, not one NEXUS estimated",
+            ),
+        ),
+        (
+            "skill",
+            (
+                "21 day(s)",
+                "self-assessed 2/5",
+                "target of 4/5",
+                "1 related learning activity",
+            ),
+        ),
+    ],
+)
+async def test_every_learning_reason_names_the_figures_behind_it(
+    kind: str,
+    expected_figures: tuple[str, ...],
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """Both new rules state their own data rather than restating their title.
+
+    :class:`RecommendationDraft` requires *a* digit, which the eight risk rules
+    satisfy through the shared score clause. These two have no risk and therefore no
+    score clause — inventing one would be a fabricated figure — so the figures in
+    the sentence are the only ones there are, and each is asserted by value: the
+    days, the user's own percentage or levels, and the sentence that says where the
+    number came from.
+    """
+    now = await _db_now(db_session)
+    today = now.date()
+    if kind == "goal":
+        await learning.create_goal(
+            owner.id, title="Machine Learning", target_date=today + timedelta(days=14), progress=35
+        )
+    else:
+        skill = await learning.create_skill(
+            owner.id, name="Python", current_level=2, target_level=4
+        )
+        await learning.record_skill_evidence(owner.id, skill.id, now - timedelta(days=21))
+
+    row = (await learning_service.generate_learning(owner=owner))[0]
+
+    assert row.reason.strip()
+    assert any(character.isdigit() for character in row.reason)
+    assert row.reason != row.title
+    for figure in expected_figures:
+        assert figure in row.reason, f"the {kind} rule dropped the figure {figure!r}"
+
+
+async def test_a_learning_suggestion_is_written_for_one_account_only(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """Ownership is a predicate in the read, and the row carries the caller's id.
+
+    The learning rules sweep an account's goals and skills rather than following a
+    pointer out of a risk, so this is the check that the sweep is owner-scoped
+    rather than scoped afterwards. A stranger's sweep finds nothing at all, and
+    nothing belonging to this account is raised for them.
+    """
+    today = (await _db_now(db_session)).date()
+    await learning.create_goal(
+        owner.id, title="Machine Learning", target_date=today + timedelta(days=14), progress=35
+    )
+    stranger = await register_user(db_session, username="bob", email="bob@nexus.test")
+
+    assert await learning_service.generate_learning(owner=stranger) == []
+    assert await learning_service.generate_learning(owner=owner) != []
+    stored = await _all_rows(db_session, owner)
+    assert len(stored) == 1
+    assert stored[0].user_id == owner.id
+
+
+async def test_no_learning_suggestion_makes_a_claim_about_the_person(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """Every sentence is scanned, and the two Phase 9 bans are asserted whole.
+
+    Beyond the shared :data:`NEUTRALITY_PROHIBITIONS`, the Phase 9 bans are about
+    ability and effort: a suggestion may not say the user is weak at a subject, and
+    it may not quote hours worked as though they measured the person. Both rules
+    are exercised in the same fixture — a goal inside its horizon *and* a dormant
+    skill — so the sweep has to get both right before anything is scanned.
+    """
+    now = await _db_now(db_session)
+    today = now.date()
+    await learning.create_goal(
+        owner.id, title="Machine Learning", target_date=today + timedelta(days=14), progress=35
+    )
+    skill = await learning.create_skill(owner.id, name="Python", current_level=2, target_level=4)
+    await learning.record_skill_evidence(owner.id, skill.id, now - timedelta(days=21))
+
+    rows = await learning_service.generate_learning(owner=owner)
+
+    assert len(rows) == 2
+    for row in rows:
+        for field, text in (
+            ("title", row.title),
+            ("description", row.description),
+            ("reason", row.reason),
+        ):
+            found = _prohibitions(text, _PERSON_PROHIBITIONS)
+            assert not found, (
+                f"the {row.recommendation_type} {field} characterises the person: {found}"
+            )
+        lowered = row.description.lower()
+        for phrase in (
+            "has been rescheduled",
+            "was rescheduled",
+            "has been moved",
+            "we rescheduled",
+        ):
+            assert phrase not in lowered, f"{row.recommendation_type} implies an action was taken"
+
+
+async def test_a_learning_suggestion_keeps_the_figures_the_rule_read(
+    db_session: AsyncSession,
+    learning: LearningRepository,
+    owner: User,
+    learning_service: RecommendationService,
+) -> None:
+    """The metadata a learning rule derives is stored, because there is no risk row.
+
+    The eight risk-raised suggestions are auditable through the risk they point at.
+    These two have ``risk_id`` null, so the provenance has to travel on the
+    suggestion itself: the percentage, the distance and the goal's status, with no
+    risk score invented for them. Read back through :func:`_stored` rather than
+    from the object the repository handed back, because that object is exactly what
+    the metadata regression already in this file once failed to persist.
+    """
+    today = (await _db_now(db_session)).date()
+    await learning.create_goal(
+        owner.id,
+        title="Machine Learning",
+        target_date=today + timedelta(days=14),
+        progress=35,
+        status=LearningGoalStatus.IN_PROGRESS.value,
+    )
+
+    raised = await learning_service.generate_learning(owner=owner)
+    stored = await _stored(db_session, raised[0].id)
+
+    assert stored.metadata_ == {
+        "rule": RecommendationType.REVIEW_LEARNING_GOAL.value,
+        "goal_status": "in_progress",
+        "progress": 35,
+        "days_to_deadline": 14,
+    }
+    assert stored.risk_id is None

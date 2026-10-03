@@ -45,6 +45,8 @@ from app.models.user import User
 from app.repositories.activity import ActivityRepository
 from app.repositories.analytics import AnalyticsRepository
 from app.repositories.audit import AuditRepository
+from app.repositories.career import CareerRepository
+from app.repositories.developer import DeveloperRepository
 from app.repositories.knowledge import (
     BookmarkRepository,
     CategoryRepository,
@@ -54,6 +56,7 @@ from app.repositories.knowledge import (
     NoteRepository,
     ResourceRepository,
 )
+from app.repositories.learning import LearningRepository
 from app.repositories.password_reset import PasswordResetRepository
 from app.repositories.planner import (
     AvailabilityRuleRepository,
@@ -70,7 +73,10 @@ from app.services.activity_service import ActivityService
 from app.services.analytics import AnalyticsService
 from app.services.audit_service import AuditService
 from app.services.auth_service import AuthService
+from app.services.career import CareerIntelligenceService
+from app.services.developer import DeveloperIntelligenceService
 from app.services.knowledge_service import KnowledgeService
+from app.services.learning import LearningIntelligenceService
 from app.services.planner_service import PlannerService
 from app.services.project_service import ProjectService
 from app.services.risk.detection import RiskDetectionService
@@ -168,6 +174,62 @@ def get_risk_repository(session: DbSession) -> RiskRepository:
     return RiskRepository(session)
 
 
+def get_developer_repository(session: DbSession) -> DeveloperRepository:
+    """Provide a request-scoped Phase 8 repository.
+
+    **A provider function, not ``Depends(DeveloperRepository)``.** The Phase 8
+    tables — ``git_repositories``, ``git_commits``, ``git_branches``,
+    ``git_scan_runs`` — are one storage concern and one set of owner-scoped
+    predicates, so they are one repository rather than four. Its constructor takes
+    an ``AsyncSession``, which is not a Pydantic field type, so handing FastAPI
+    the class itself raises ``FastAPIError: Invalid args for response field`` at
+    import time; every ``Dep`` alias in this file therefore names a function that
+    takes :data:`DbSession` and returns the collaborator, and this one follows the
+    rule like the rest.
+
+    It has a provider of its own rather than being reachable only through
+    :func:`get_developer_service` for the reason :func:`get_risk_repository`
+    states: a request that only wants a page of registered repositories, or one
+    repository's branches, must not construct the service graph behind it first.
+    """
+    return DeveloperRepository(session)
+
+
+def get_learning_repository(session: DbSession) -> LearningRepository:
+    """Provide a request-scoped Phase 9 learning repository.
+
+    ``learning_goals``, ``skills`` and ``learning_activities`` are one storage
+    concern and one set of owner-scoped predicates, so they are one repository
+    rather than three — the same reasoning :func:`get_developer_repository` gives
+    for the four Phase 8 tables.
+
+    **A provider function, not ``Depends(LearningRepository)``**, for the reason
+    that docstring states in full: the constructor takes an ``AsyncSession``,
+    which is not a Pydantic field type, so handing FastAPI the class itself fails
+    at import time.
+
+    It has a provider of its own rather than being reachable only through
+    :func:`get_learning_service` because the career service reads two things from
+    it — the recorded-activity count and the ownership check on a skill an
+    evidence row points at — without wanting the learning service's write path.
+    """
+    return LearningRepository(session)
+
+
+def get_career_repository(session: DbSession) -> CareerRepository:
+    """Provide a request-scoped Phase 9 career repository.
+
+    ``career_profiles``, ``career_experience`` and ``career_evidence`` are one
+    storage concern; the profile upsert in particular is keyed on a constraint
+    that belongs in the storage layer rather than in the router that calls it.
+
+    A provider function rather than ``Depends(CareerRepository)`` — same reason
+    as every other ``Dep`` alias in this file, and the same fix: take
+    :data:`DbSession` and return the collaborator.
+    """
+    return CareerRepository(session)
+
+
 def get_note_repository(session: DbSession) -> NoteRepository:
     """Provide a request-scoped note repository."""
     return NoteRepository(session)
@@ -228,6 +290,9 @@ KnowledgeLinkRepositoryDep = Annotated[
 ]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 RiskRepositoryDep = Annotated[RiskRepository, Depends(get_risk_repository)]
+DeveloperRepositoryDep = Annotated[DeveloperRepository, Depends(get_developer_repository)]
+LearningRepositoryDep = Annotated[LearningRepository, Depends(get_learning_repository)]
+CareerRepositoryDep = Annotated[CareerRepository, Depends(get_career_repository)]
 
 
 def get_session_service(
@@ -616,6 +681,8 @@ def get_recommendation_service(
     tasks: TaskRepositoryDep,
     projects: ProjectRepositoryDep,
     activity: ActivityServiceDep,
+    learning: LearningRepositoryDep,
+    settings: SettingsDep,
 ) -> RecommendationService:
     """Provide a request-scoped recommendation service.
 
@@ -643,6 +710,15 @@ def get_recommendation_service(
         tasks,
         projects,
         activity=activity,
+        # Phase 9 adds the two learning rules, which read goals and skills rather
+        # than risks, so ``learning`` is wired for the same reason ``tasks`` and
+        # ``projects`` are: without it ``generate_learning`` is a silent no-op and
+        # the rules exist only for the test suite. ``stale_inactive_days`` is a
+        # setting rather than a constant because "dormant" is a judgement the
+        # deployment may reasonably make differently, not a constant the rule
+        # should be quietly hard-coding.
+        learning=learning,
+        stale_inactive_days=settings.career_stale_inactive_days,
     )
 
 
@@ -711,6 +787,154 @@ def get_risk_service(
 
 
 RiskServiceDep = Annotated[RiskDetectionService, Depends(get_risk_service)]
+
+
+def get_developer_service(
+    repositories: DeveloperRepositoryDep,
+    projects: ProjectRepositoryDep,
+    activity: ActivityServiceDep,
+    settings: SettingsDep,
+) -> DeveloperIntelligenceService:
+    """Provide a request-scoped Phase 8 developer-intelligence service.
+
+    **Four collaborators, and the list is short because Phase 8 reads one
+    account's own work rather than correlating it with anybody else's.**
+    :mod:`app.services.risk.detection` needs seven, most of them so a rule that
+    spans two tables has somewhere to read both; a scan reads a local directory
+    and writes rows against its owner, so the whole graph is Phase 8 storage, the
+    project table, the history sink and the settings.
+
+    ``repositories`` is the whole of :mod:`app.repositories.developer` — one
+    repository over ``git_repositories``, ``git_commits``, ``git_branches`` and
+    ``git_scan_runs``. It is passed positionally because it is the service's first
+    parameter, and it is the collaborator that carries every ``user_id`` predicate:
+    the API layer names no owner and no id it was given by the client, and a row
+    belonging to another account is never loaded in the first place, which is what
+    makes the answer a 404 rather than a 403.
+
+    ``projects`` is needed for two things only, both ownership checks the Phase 8
+    tables cannot make: proving a ``project_id`` belongs to the caller before it
+    is written onto a repository row, and reading the name
+    ``GET /developer/projects/{project_id}`` returns. A project belonging to
+    somebody else is *not found*, never a permission error.
+
+    ``activity`` is the history sink, and it is wired rather than left as the
+    service's documented ``None`` mode for the reason this module's docstring
+    gives in full: a scan or a registration that records nothing is a fact about
+    the account that nobody can later read back, and the feed is also the trail a
+    later phase learns from. ``None`` remains a real mode for exercising the
+    service against a hand-built snapshot — it is not the API layer.
+
+    Settings are injected rather than left to the service's own ``get_settings()``
+    fallback, so the repository cap, the scan's commit ceiling, the path allowlist
+    and the window bounds a request runs under are the ones resolved for that
+    request rather than whatever a module-level singleton happened to read first.
+    """
+    return DeveloperIntelligenceService(
+        repositories,
+        projects,
+        activity=activity,
+        settings=settings,
+    )
+
+
+DeveloperIntelligenceServiceDep = Annotated[
+    DeveloperIntelligenceService, Depends(get_developer_service)
+]
+
+
+def get_learning_service(
+    repositories: LearningRepositoryDep,
+    projects: ProjectRepositoryDep,
+    notes: NoteRepositoryDep,
+    activity: ActivityServiceDep,
+    settings: SettingsDep,
+) -> LearningIntelligenceService:
+    """Provide a request-scoped Phase 9 learning-intelligence service.
+
+    **Four collaborators, and the list is short because Phase 9 reads one
+    account's own record of what they meant to learn.** The goals, skills and
+    activities are one repository, and the two other repositories exist for one
+    job each: ``projects`` and ``notes`` prove a pointer a client supplied belongs
+    to the caller *before* it is written onto a goal. Both refusals are not-founds
+    rather than permission errors, because a 403 would confirm the id exists and
+    turn the learning page into a directory of other people's notes.
+
+    **The note repository is required rather than optional** for that reason. A
+    goal that silently accepted a foreign ``note_id`` would be the one write in
+    this phase that trusted an identifier from the request body, and it is exactly
+    the write nobody would notice failing.
+
+    ``activity`` is the history sink, and it is wired rather than left as the
+    service's documented ``None`` mode for the reason this module's docstring
+    gives in full: a goal created through the API that records nothing is a fact
+    about the account nobody can later read back. ``None`` stays a real mode for
+    exercising the service against a hand-built snapshot; it is not the API
+    layer.
+
+    Settings are injected rather than left to the service's own ``get_settings()``
+    fallback, so the goal and skill caps, the window bounds and the minimum
+    evidence before NEXUS will present its own estimate are the ones resolved for
+    this request.
+    """
+    return LearningIntelligenceService(
+        repositories,
+        projects,
+        notes,
+        activity=activity,
+        settings=settings,
+    )
+
+
+LearningIntelligenceServiceDep = Annotated[
+    LearningIntelligenceService, Depends(get_learning_service)
+]
+
+
+def get_career_service(
+    repositories: CareerRepositoryDep,
+    learning: LearningRepositoryDep,
+    projects: ProjectRepositoryDep,
+    developer: DeveloperRepositoryDep,
+    activity: ActivityServiceDep,
+    settings: SettingsDep,
+) -> CareerIntelligenceService:
+    """Provide a request-scoped Phase 9 career-intelligence service.
+
+    **Four collaborators, one per question the page asks.** The career tables are
+    one repository; ``learning`` supplies the recorded-activity count and the
+    ownership check on a ``skill_id`` an evidence row points at; ``projects``
+    supplies the project counts and the same ownership check for
+    ``project_id``; and ``developer`` supplies the repository count plus the one
+    join behind the ``project_activity`` feature. Reading Phase 8's repository
+    here rather than a second career-side copy of it is what stops the career page
+    and the developer page disagreeing about how many repositories an account has
+    registered.
+
+    **Nothing here writes a qualification.** Every collaborator exists to count
+    rows the user typed or a subsystem recorded, and to prove a pointer belongs to
+    the caller before it is stored. There is no generator in this graph, which is
+    what makes the rule a property of the wiring rather than an intention.
+
+    ``activity`` is wired for the same reason as every other service in this file:
+    a profile edit or a piece of evidence entered and then corrected is a fact
+    about the account, and an unrecorded one cannot be read back at all.
+
+    Settings are injected rather than left to the service's own ``get_settings()``
+    fallback, so the evidence cap and the window bounds a request runs under are
+    the ones resolved for this request.
+    """
+    return CareerIntelligenceService(
+        repositories,
+        learning=learning,
+        projects=projects,
+        developer=developer,
+        activity=activity,
+        settings=settings,
+    )
+
+
+CareerIntelligenceServiceDep = Annotated[CareerIntelligenceService, Depends(get_career_service)]
 
 
 def get_client_context(request: Request) -> tuple[str | None, str | None]:
@@ -865,6 +1089,10 @@ __all__ = [
     "BookmarkRepositoryDep",
     "CalendarEventRepository",
     "CalendarEventRepositoryDep",
+    "CareerIntelligenceService",
+    "CareerIntelligenceServiceDep",
+    "CareerRepository",
+    "CareerRepositoryDep",
     "CategoryRepository",
     "CategoryRepositoryDep",
     "ClientContext",
@@ -874,12 +1102,20 @@ __all__ = [
     "CurrentSessionId",
     "CurrentUser",
     "DbSession",
+    "DeveloperIntelligenceService",
+    "DeveloperIntelligenceServiceDep",
+    "DeveloperRepository",
+    "DeveloperRepositoryDep",
     "DocumentRepository",
     "DocumentRepositoryDep",
     "KnowledgeLinkRepository",
     "KnowledgeLinkRepositoryDep",
     "KnowledgeService",
     "KnowledgeServiceDep",
+    "LearningIntelligenceService",
+    "LearningIntelligenceServiceDep",
+    "LearningRepository",
+    "LearningRepositoryDep",
     "NoteRepository",
     "NoteRepositoryDep",
     "PasswordResetRepository",
@@ -933,14 +1169,20 @@ __all__ = [
     "get_availability_rule_repository",
     "get_bookmark_repository",
     "get_calendar_event_repository",
+    "get_career_repository",
+    "get_career_service",
     "get_category_repository",
     "get_client_context",
     "get_concept_repository",
     "get_current_session_id",
     "get_current_user",
+    "get_developer_repository",
+    "get_developer_service",
     "get_document_repository",
     "get_knowledge_link_repository",
     "get_knowledge_service",
+    "get_learning_repository",
+    "get_learning_service",
     "get_note_repository",
     "get_optional_user",
     "get_password_reset_repository",
