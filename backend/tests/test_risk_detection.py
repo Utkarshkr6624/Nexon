@@ -41,19 +41,31 @@ session is also the one that wrote the rows, so an entity read would hand back
 whatever the identity map cached, and an idempotency assertion would compare
 stale objects to fresh ones and pass for the wrong reason.
 
-On the half-point rounding in ``scoring._result``
+On the project detector's remaining-work floor
 -----------------------------------------------
-Several expectations below changed shape because a project holding exactly one
-unfinished task now measures **zero** rather than one. The arithmetic has not
-moved — ``0.10 x (1 / 20) x 100`` is exactly ``0.5`` — but
-:func:`app.services.risk.scoring._result` snaps to six decimals before rounding
-to an integer, and Python's banker's rounding then sends an exact ``0.5`` to
-``0``. That is the documented behaviour of a scoring function this file does not
-own, and it is the *right* answer for half a point: the detection service's "a
-measured zero writes nothing" rule cannot discard a score that rounds up to 1.
-The affected tests assert the smaller, exact set rather than tolerating the
-missing row, and the fixtures that genuinely need a surviving project risk give
-it a signal worth a point (:func:`_project_survivor`).
+The project sub-signal that counts unfinished tasks now starts above zero:
+:data:`app.services.risk.scoring.PROJECT_REMAINING_FLOOR` is ten, so two or three
+open tasks are the normal state of a healthy project rather than a fraction of a
+signal. Four expectations below changed shape because of it — a project holding
+one or two open tasks and nothing else used to measure 1 or 2 points and be stored
+as a ``low`` risk saying "N task(s) are unfinished", and now measures a genuine
+zero and is measured rather than stored.
+
+There is a second, older reason the same fixtures find no project row: at one
+unfinished task the score is ``0.10 x (1 / 20) x 100``, exactly ``0.5``, and
+:func:`app.services.risk.scoring._result` snaps to six decimals before rounding to
+an integer so that Python's banker's rounding sends the exact half to ``0``. That
+is the *right* answer for half a point — the detection service's "a measured zero
+writes nothing" rule cannot discard a score that rounds up to 1 — and the fixtures
+that genuinely need a surviving project risk give it a signal worth a point
+(:func:`_project_survivor`).
+
+On the caps a pass writes
+-------------------------
+Section (k) covers the rule that a bound on what a pass writes is not a
+measurement of what has gone away. Every fixture there is two passes on purpose:
+a risk that was never written cannot be falsely closed, so the regression needs a
+row that already exists and a second pass that skips it.
 
 On the window
 -------------
@@ -102,9 +114,10 @@ from app.repositories.risk import RiskRepository
 from app.repositories.task import TaskRepository
 from app.services.activity_service import ActivityService
 from app.services.analytics.service import AnalyticsService
+from app.services.risk import detection as detection_module
 from app.services.risk.detection import RiskDetectionService
 from app.services.risk.recommendation import RecommendationService
-from tests.analytics_fixtures import AnalyticsSeed, at, register_user
+from tests.analytics_fixtures import DAY, AnalyticsSeed, at, register_user
 
 pytestmark = pytest.mark.integration
 
@@ -1165,13 +1178,14 @@ async def test_a_blocked_task_is_a_task_risk_as_well_as_a_project_risk(
     assertion of the new behaviour: the same two blocked tasks are counted
     against their project **and** named one by one.
 
-    The project side keeps its arithmetic: ``0.25 x 2/5`` blocked plus
-    ``0.10 x 2/20`` remaining is exactly 11, ``low``. The task side is new, and
-    it is per row rather than per project — one ``task`` risk per blocked task,
-    each ``0.60 x 100 = 60``, each pointing at the task the suggestion has to
-    name. Asserting both halves in one fixture is the point: a detector that
-    replaced the project roll-up rather than sitting beside it would show up
-    here as a project row that had lost its blocked count.
+    The project side keeps its arithmetic: ``0.25 x 2/5`` blocked is worth 10 and
+    the two unfinished tasks are below :data:`PROJECT_REMAINING_FLOOR`, so the
+    remaining-work sub-signal contributes nothing at all — ``low``. The task side
+    is new, and it is per row rather than per project — one ``task`` risk per
+    blocked task, each ``0.60 x 100 = 60``, each pointing at the task the
+    suggestion has to name. Asserting both halves in one fixture is the point: a
+    detector that replaced the project roll-up rather than sitting beside it would
+    show up here as a project row that had lost its blocked count.
     """
     seed = await _seed(db_session)
     today = await _db_today(db_session)
@@ -1184,7 +1198,7 @@ async def test_a_blocked_task_is_a_task_risk_as_well_as_a_project_risk(
 
     rows = await _risks(db_session, seed.owner.id)
     project_risk = _only(rows, RiskType.PROJECT.value)
-    assert project_risk["score"] == 11
+    assert project_risk["score"] == 10
     assert project_risk["severity"] == "low"
     assert project_risk["entity_type"] == "project"
     assert project_risk["metadata_"]["blocked_tasks"] == 2
@@ -1213,9 +1227,10 @@ async def test_a_blocked_task_carries_its_own_score_evidence_and_wording(
     later.
 
     The project risk is asserted alongside rather than ignored — one blocked task
-    is ``0.25 x 1/5`` of the project's blocked signal plus half a point of
-    remaining work, so the two detectors are looking at the same row from
-    different sides and neither is a duplicate of the other.
+    is ``0.25 x 1/5`` of the project's blocked signal and nothing else, because a
+    single unfinished task is below the remaining-work floor, so the two detectors
+    are looking at the same row from different sides and neither is a duplicate of
+    the other.
     """
     seed = await _seed(db_session)
     today = await _db_today(db_session)
@@ -1259,7 +1274,7 @@ async def test_a_blocked_task_carries_its_own_score_evidence_and_wording(
     )
 
     assert _by_type(rows) == {"project": 1, "task": 1}
-    assert _only(rows, RiskType.PROJECT.value)["score"] == 6
+    assert _only(rows, RiskType.PROJECT.value)["score"] == 5
     assert summary.by_type == {"project": 1, "task": 1}
     assert summary.by_severity == {"low": 1, "high": 1}
 
@@ -1415,6 +1430,16 @@ async def test_a_task_moved_twice_is_not_a_task_risk(db_session: AsyncSession) -
     The pass says why as well. An empty Risk Center that cannot explain itself
     reads as "nothing is wrong", which is the failure the coverage notes exist
     to prevent.
+
+    The Risk Center is now empty rather than holding one ``project`` row, and
+    that is the same fix seen from the other end: two unfinished tasks in an
+    otherwise healthy project are the normal state of a project, and
+    ``0.10 x 2/20 = 1`` point of "pressure" from them was a false positive built
+    out of arithmetic. Two open tasks used to be worth a stored ``low`` risk and
+    a "review the open signals on this project" suggestion; below
+    :data:`PROJECT_REMAINING_FLOOR` they are worth neither, and what the project
+    actually holds — no overdue work, no blocked work, no target date — is
+    correctly nothing at all.
     """
     seed = await _seed(db_session)
     today = await _db_today(db_session)
@@ -1423,26 +1448,24 @@ async def test_a_task_moved_twice_is_not_a_task_risk(db_session: AsyncSession) -
     never = await seed.task(project_id=project.id, title="Review the access list")
     await _reschedules(seed, twice.id, 2, day=today - timedelta(days=2))
     # The two are distinct rows in the same project, which is the fixture's own
-    # claim: one task has a history and one does not, and the remaining-task count
-    # of 2 asserted below is what proves both of them are there to be judged.
+    # claim: one task has a history and one does not, and the fact that two rows
+    # are open in the project at all is what makes the project roll-up's own
+    # arithmetic — and the absence of a risk because of it — worth asserting.
     assert never.id != twice.id
 
     summary = await _service(db_session).evaluate(owner=seed.owner, today=today, window_days=WINDOW)
 
-    # The project is the only stored risk: two unfinished tasks and nothing else
-    # is `0.10 x 2/20 = 1` point of remaining work.
     rows = await _risks(db_session, seed.owner.id)
-    assert _by_type(rows) == {"project": 1}
-    assert _only(rows, RiskType.PROJECT.value)["metadata_"]["remaining_tasks"] == 2
+    assert rows == []
     assert RiskType.TASK.value not in summary.by_type
+    assert summary.by_type == {}
+    assert "measured no risk in this window" in (summary.reason_if_not_evaluated or "")
     suggestions = await _recommendations(db_session, seed.owner.id)
-    # One suggestion, and it is not about either task: the project's own risk
-    # reviews its open signals, while the two ``task`` rules had nothing to fire
-    # on. A detector that read Grace-style cross-account counts or dropped the
-    # threshold would file a suggestion against the task here instead.
-    assert _recommendation_types(suggestions) == {RecommendationType.REVIEW_PROJECT.value: 1}
-    assert all(row["entity_type"] != "task" for row in suggestions)
-    assert summary.recommendations_created == 1
+    # Nothing at all, and in particular nothing filed against either task: a
+    # detector that read Grace-style cross-account counts or dropped the
+    # reschedule threshold would file a "break this task up" suggestion here.
+    assert suggestions == []
+    assert summary.recommendations_created == 0
     assert (
         "Task: Not assessed: no open task is recorded as blocked or has 3 or more "
         "reschedules in its history."
@@ -1723,15 +1746,16 @@ async def test_the_summary_counts_add_up_and_the_run_is_timed(
     service = _service(db_session)
 
     opening = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
-    # Two deadline risks and one project risk, in three different bands. The
-    # 600-minute task has nothing booked against it at all: gap_ratio 1.0 x
-    # urgency 0.7 = 70, which is `high` (the ladder's `critical` floor is 75).
-    # The 300-minute one has 120 booked: gap_ratio 0.6 x 0.7 = 42, `medium`. The
-    # project leaves a single unfinished task, worth 1 and `low`.
-    assert opening.risks_found == 3
-    assert opening.risks_created == 3
+    # Two deadline risks, in two different bands. The 600-minute task has nothing
+    # booked against it at all: gap_ratio 1.0 x urgency 0.7 = 70, which is `high`
+    # (the ladder's `critical` floor is 75). The 300-minute one has 120 booked:
+    # gap_ratio 0.6 x 0.7 = 42, `medium`. The project contributes nothing: two
+    # unfinished tasks and no other signal is below the remaining-work floor, so
+    # it measures a genuine zero and is measured rather than stored.
+    assert opening.risks_found == 2
+    assert opening.risks_created == 2
     assert opening.risks_updated == 0
-    assert opening.by_severity == {"medium": 1, "high": 1, "low": 1}
+    assert opening.by_severity == {"medium": 1, "high": 1}
     assert opening.duration_ms >= 0
 
     # One of the two deadlines becomes an ordinary open task with no due date,
@@ -1743,14 +1767,27 @@ async def test_the_summary_counts_add_up_and_the_run_is_timed(
     await db_session.commit()
     mixed = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
 
-    assert mixed.risks_found == 2
+    assert mixed.risks_found == 1
     assert mixed.risks_created == 0
-    assert mixed.risks_updated == 2
+    assert mixed.risks_updated == 1
     assert mixed.risks_resolved == 1
     assert mixed.risks_found == mixed.risks_created + mixed.risks_updated
-    assert mixed.risks_resolved not in (0, mixed.risks_found)
-    assert mixed.by_severity == {"high": 1, "low": 1}
+    assert mixed.by_severity == {"high": 1}
     assert mixed.duration_ms >= 0
+
+    # `risks_found` and `risks_resolved` are disjoint *sets*, not merely
+    # different numbers — asserted on ids, because the two counters are equal
+    # here (one row refreshed, one row closed) and a reader would otherwise take
+    # the coincidence for the identity this test is about. The closed row is the
+    # 300-minute task whose due date was removed; the live one is the 600-minute
+    # task the pass re-detected.
+    mixed_rows = await _risks(db_session, seed.owner.id)
+    closed_rows = [row for row in mixed_rows if row["status"] == RiskStatus.RESOLVED.value]
+    live_rows = [row for row in mixed_rows if row["status"] == RiskStatus.ACTIVE.value]
+    assert len(closed_rows) == len(live_rows) == 1
+    assert closed_rows[0]["id"] != live_rows[0]["id"]
+    assert closed_rows[0]["entity_id"] == first_task.id
+    assert live_rows[0]["entity_id"] != first_task.id
 
     history = await _evaluations(db_session, seed.owner.id)
     assert len(history) == 2
@@ -1763,3 +1800,441 @@ async def test_the_summary_counts_add_up_and_the_run_is_timed(
         assert row["by_type"] == summary.by_type
         assert row["duration_ms"] == summary.duration_ms
         assert row["duration_ms"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# (k) A cap on what is written is not a claim that the rest has gone away
+# ---------------------------------------------------------------------------
+
+
+async def test_a_project_risk_beyond_the_write_cap_is_left_open_rather_than_closed(
+    db_session: AsyncSession,
+) -> None:
+    """Twenty-six projects at risk, twenty-five rows, and the other one still live.
+
+    One pass writes at most :data:`MAX_PROJECT_RISKS` project risks, keeping the
+    highest scores. The defect this pins is what happened to the rest: they were
+    dropped from the pass's output entirely, so the resolution sweep read their
+    absence as "the condition went away" and closed them with the recorded reason
+    *"the condition behind it was not detected in this evaluation"* — a sentence
+    about a condition NEXUS had just scored and simply had no room for. A
+    truncation is a limit on what is written, not a measurement of what is gone.
+
+    Two passes, because a risk that was never written cannot be falsely closed:
+    the regression needs a row that already exists. The first pass writes
+    twenty-five of the twenty-six; the project it left out is identified **from
+    the data** (the one project with no risk row) and then given a second overdue
+    task. Its score rises above the rest, so the cap now keeps it and displaces a
+    project that does have a row — which has to come out of the second pass
+    active, untouched, and unresolved.
+
+    Each project carries a single overdue task and nothing else, so every one of
+    them scores exactly ``0.30 x 1/10 x 100 = 3``: no blocked work, no target
+    date, no velocity, and one open task is below the remaining-work floor.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    projects = []
+    for index in range(26):
+        project = await seed.project(name=f"Atlas {index:02d}")
+        await seed.task(project_id=project.id, due_date=today - timedelta(days=3))
+        projects.append(project)
+
+    service = _service(db_session)
+    first = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    stored = [
+        row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "project"
+    ]
+
+    assert first.risks_found == first.risks_created == 25
+    assert len(stored) == 25
+    assert {row["score"] for row in stored} == {3}
+    held_back = [
+        project for project in projects if project.id not in {row["entity_id"] for row in stored}
+    ]
+    assert len(held_back) == 1
+
+    # A second overdue task lifts that project to 6, which puts it inside the cap
+    # and pushes one of the twenty-five out of it.
+    await seed.task(project_id=held_back[0].id, due_date=today - timedelta(days=5))
+    second = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    after = [
+        row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "project"
+    ]
+
+    assert second.risks_created == 1
+    assert second.risks_updated == 24
+    assert second.risks_resolved == 0
+    assert len(after) == 26
+    assert {row["status"] for row in after} == {RiskStatus.ACTIVE.value}
+    assert "were beyond the cap this pass writes" in (second.reason_if_not_evaluated or "")
+    # The promoted project is the new row, and the displaced one is the row the
+    # second pass did not touch: still there, still `active`, and still carrying
+    # the score the first pass measured rather than one from a pass that skipped
+    # it. `created == 1` and `updated == 24` against 26 rows is what says that.
+    promoted = [row for row in after if row["entity_id"] == held_back[0].id]
+    assert len(promoted) == 1
+    assert promoted[0]["score"] == 6
+
+
+async def test_a_blocked_task_beyond_the_write_cap_is_left_open_rather_than_closed(
+    db_session: AsyncSession,
+) -> None:
+    """Twenty-six blocked tasks, twenty-five rows, and the twenty-sixth still live.
+
+    The same defect on the task detector's own cap, and the case the audit names:
+    with thirty blocked tasks, five of them never appeared on any later pass.
+    Twenty-six blocked tasks all score ``0.60 x 100 = 60``, so the cap keeps
+    twenty-five of them and the one it drops is reported as no longer blocked —
+    every pass, forever, because a resolved risk is terminal until the condition
+    returns.
+
+    The promotion is three recorded reschedules rather than a second overdue
+    task, because it is what makes the displaced row *writable at all*: the task
+    that was left out now scores ``0.60 + 0.40 = 100`` and takes the cap's last
+    slot, so one of the twenty-five that does have a row falls off it. Its row is
+    the one the first pass wrote, and it must survive the second pass untouched.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    project = await seed.project(name="Atlas")
+    blocked = [
+        await seed.task(project_id=project.id, status=TaskStatus.BLOCKED.value) for _ in range(26)
+    ]
+
+    service = _service(db_session)
+    await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    stored = [row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "task"]
+
+    assert len(stored) == 25
+    assert {row["score"] for row in stored} == {60}
+    held_back = [task for task in blocked if task.id not in {row["entity_id"] for row in stored}]
+    assert len(held_back) == 1
+
+    await _reschedules(seed, held_back[0].id, 3, day=today - timedelta(days=2))
+    second = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    after = [row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "task"]
+
+    # 25 updates rather than 24: the twenty-four task risks the cap kept, plus
+    # the project's own risk, which is refreshed on every pass — which is also
+    # why this fixture's project is asserted through the task rows and not
+    # through the summary's counters alone.
+    assert second.risks_created == 1
+    assert second.risks_updated == 25
+    assert second.risks_resolved == 0
+    assert len(after) == 26
+    assert {row["status"] for row in after} == {RiskStatus.ACTIVE.value}
+    assert {row["score"] for row in after} == {60, 100}
+    assert "were beyond the cap this pass writes" in (second.reason_if_not_evaluated or "")
+
+
+async def test_a_deadline_risk_beyond_the_write_cap_is_left_open_rather_than_closed(
+    db_session: AsyncSession,
+) -> None:
+    """The nearest twenty-five deadlines are written; the twenty-sixth is not closed.
+
+    The deadline scan is ordered by due date and the write cap keeps the nearest
+    :data:`MAX_DEADLINE_TASKS`, so the task pushed out is normally the furthest one
+    — which the scoring function grades lowest anyway. That is a good reason to
+    keep the *nearest*, not a reason to close the rest: a task whose due date is
+    four weeks out today can be the closest one tomorrow, and a row closed for
+    not being in today's page cannot come back.
+
+    Twenty-six tasks in twenty-six projects keeps the fixture to one detector:
+    each project holds a single open task, which is below the remaining-work
+    floor, so the run writes deadline risks and nothing else and the summary's
+    counters are attributable to the cap alone. Every task scores
+    ``1.0 x 0.7 x 1.0 = 70`` — gap ratio 1.0 with nothing booked, against the
+    72-hour urgency rung, which a due date two days out always falls into
+    whatever hour of the day the suite happens to run at.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    tasks = []
+    for index in range(26):
+        project = await seed.project(name=f"Atlas {index:02d}")
+        tasks.append(
+            await seed.task(
+                project_id=project.id,
+                due_date=today + timedelta(days=2),
+                estimated_minutes=300,
+            )
+        )
+
+    service = _service(db_session)
+    await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    stored = [
+        row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "deadline"
+    ]
+
+    assert len(stored) == 25
+    assert {row["score"] for row in stored} == {70}
+    held_back = [task for task in tasks if task.id not in {row["entity_id"] for row in stored}]
+    assert len(held_back) == 1
+
+    # Pulling the held-back task's date forward puts it at the head of the
+    # nearest-first ordering, so the cap keeps it and displaces another row.
+    held_back[0].due_date = today
+    db_session.add(held_back[0])
+    await db_session.commit()
+    second = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    after = [
+        row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "deadline"
+    ]
+
+    assert second.risks_created == 1
+    assert second.risks_updated == 24
+    assert second.risks_resolved == 0
+    assert len(after) == 26
+    assert {row["status"] for row in after} == {RiskStatus.ACTIVE.value}
+    assert "were beyond the cap this pass writes" in (second.reason_if_not_evaluated or "")
+
+
+async def test_a_candidate_scan_that_cannot_reach_its_end_leaves_that_type_alone(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task that leaves the scanned page is not a task that stopped needing one.
+
+    The write caps are only half of it: the *reads* are bounded too, and a
+    candidate beyond the page is one this pass never judged. The deadline scan
+    reads :data:`DEADLINE_SCAN_LIMIT` open, estimated tasks, so an account with
+    more than that would have had every deadline risk behind the page reported as
+    "the condition behind it was not detected" — for a task whose due date had
+    not changed at all.
+
+    The limit is lowered to one so the fixture needs three tasks rather than two
+    hundred; the defect is the page boundary and not the number. Three tasks are
+    written on the first pass, one of them then loses its due date, and the
+    second pass — reading a page of one out of two candidates — must leave all
+    three rows alone and say why. Closing the cleared task would be right by
+    accident here and wrong by design in general: with a page of one and two
+    candidates, NEXUS cannot tell which condition went away.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    project = await seed.project(name="Atlas")
+    tasks = [
+        await seed.task(
+            project_id=project.id,
+            title=title,
+            due_date=today + timedelta(days=2),
+            estimated_minutes=300,
+        )
+        for title in ("First", "Second", "Third")
+    ]
+
+    service = _service(db_session)
+    await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    stored = [
+        row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "deadline"
+    ]
+    assert len(stored) == 3
+
+    monkeypatch.setattr(detection_module, "DEADLINE_SCAN_LIMIT", 1)
+    tasks[2].due_date = None
+    db_session.add(tasks[2])
+    await db_session.commit()
+    summary = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    after = [
+        row for row in await _risks(db_session, seed.owner.id) if row["risk_type"] == "deadline"
+    ]
+
+    assert summary.risks_resolved == 0
+    assert len(after) == 3
+    assert {row["status"] for row in after} == {RiskStatus.ACTIVE.value}
+    assert (
+        "Deadline: 1 open task(s) due inside this window were beyond the scan limit of 1 "
+        "and were not assessed, so open deadline risks were left as they are."
+    ) in (summary.reason_if_not_evaluated or "")
+
+
+async def test_a_project_past_the_target_date_page_is_still_scored_against_its_target_date(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project created before the page boundary keeps its ``days_to_deadline``.
+
+    The project roll-up is unbounded — it carries a row for every project the
+    owner has, including one with no tasks — while the target-date read paged once
+    and stopped. So past the first hundred projects every one of them was graded
+    as though it had declared no target date at all: ``days_to_deadline`` ``None``,
+    the deadline sub-signal absent, twenty of its points gone. The same project
+    measured 20 with a target date and 0 without one, decided purely by how early
+    it happened to be created — a score determined by insertion order rather than
+    by the project.
+
+    The page is lowered to two rather than raising a hundred and one projects,
+    because the defect is the page and not the number: the read now walks to a
+    short page, so the third project is picked up by the second query. The
+    projects carry ``created_at`` values a day apart because the page is ordered
+    newest-first and a tie would make "which project was past the page" arbitrary
+    rather than reproducible.
+
+    The score is 20: five days to the target with work outstanding is the top
+    deadline rung at ``0.20 x 1.0 x 100``, and one open task is below the
+    remaining-work floor.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    projects = []
+    for index in range(3):
+        project = await seed.project(
+            name=f"Atlas {index:02d}", created_at=at(DAY + timedelta(days=index))
+        )
+        project.target_date = today + timedelta(days=5)
+        db_session.add(project)
+        projects.append(project)
+    await db_session.commit()
+    # The oldest project is the one the first page of two cannot reach, so it is
+    # the one whose target date used to disappear.
+    oldest = projects[0]
+    await seed.task(project_id=oldest.id)
+
+    monkeypatch.setattr(detection_module, "PROJECT_TARGET_PAGE_SIZE", 2)
+    summary = await _service(db_session).evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+
+    stored = _only(await _risks(db_session, seed.owner.id), RiskType.PROJECT.value)
+    assert stored["entity_id"] == oldest.id
+    assert stored["score"] == 20
+    assert stored["metadata_"]["days_to_deadline"] == 5
+    assert summary.risks_found == 1
+    # Nothing was left unread, so nothing about the boundary is reported: the
+    # walk reached the end of a set of three.
+    assert "target-date scan limit" not in (summary.reason_if_not_evaluated or "")
+
+
+async def test_a_project_whose_target_date_the_scan_never_read_is_not_closed_as_resolved(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project measured without its target date is a gap, not a resolution.
+
+    The consequence of the page boundary, and the one that reaches the training
+    data. A project past the scan limit measures a *lower* score — no deadline
+    sub-signal at all — so a project whose only pressure was its approaching
+    target date scores zero when its column is missing, and the sweep reads that
+    zero as the condition having gone away and closes a live risk.
+
+    So a truncated read marks ``RiskType.PROJECT`` unexamined for the pass: the
+    project risk from the first pass survives the second one, and the run summary
+    says that open project risks were left as they are and why. A stale row costs
+    the user one extra card for one pass; a resolved risk says something false
+    about their project, permanently.
+
+    Both the page and the ceiling are lowered to two rather than raising a
+    thousand and one projects: the ceiling is checked between pages, so a page of
+    a hundred would still have read the whole set. The defect is the boundary and
+    not its value.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    projects = []
+    for index in range(3):
+        project = await seed.project(
+            name=f"Atlas {index:02d}", created_at=at(DAY + timedelta(days=index))
+        )
+        project.target_date = today + timedelta(days=5)
+        db_session.add(project)
+        projects.append(project)
+    await db_session.commit()
+    oldest = projects[0]
+    await seed.task(project_id=oldest.id)
+
+    service = _service(db_session)
+    await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    opened = _only(await _risks(db_session, seed.owner.id), RiskType.PROJECT.value)
+    assert (opened["score"], opened["status"]) == (20, RiskStatus.ACTIVE.value)
+
+    monkeypatch.setattr(detection_module, "PROJECT_TARGET_PAGE_SIZE", 2)
+    monkeypatch.setattr(detection_module, "PROJECT_TARGET_SCAN_LIMIT", 2)
+    summary = await service.evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+    after = _only(await _risks(db_session, seed.owner.id), RiskType.PROJECT.value)
+
+    assert summary.risks_resolved == 0
+    assert after["id"] == opened["id"]
+    assert after["status"] == RiskStatus.ACTIVE.value
+    assert after["score"] == 20
+    assert (
+        "Project: 1 project(s) were beyond the target-date scan limit of 2 and are scored "
+        "without their target date, so open project risks were left as they are."
+    ) in (summary.reason_if_not_evaluated or "")
+
+
+async def test_a_brand_new_project_with_a_handful_of_open_tasks_is_not_at_risk(
+    db_session: AsyncSession,
+) -> None:
+    """Three open tasks, nothing overdue, nothing blocked, no target date: no risk.
+
+    The false positive the project detector raised from its remaining-work
+    sub-signal. A project created this morning holds three tasks, they are all on
+    time, and the count of them is evidence of nothing — but ``0.10 x 3/20 x 100
+    = 1.5`` rounds to a stored score of 2, ``low``, whose entire description was
+    "3 task(s) are unfinished". Inside a training matrix that is the worst kind of
+    row there is: it attaches "this account is at risk" to a healthy account,
+    which is a label rather than an observation.
+
+    Below :data:`PROJECT_REMAINING_FLOOR` the sub-signal is absent rather than
+    small, so the project measures a genuine zero: nothing is written, and the
+    run summary still names the detectors that measured nothing, which is what
+    separates an empty Risk Center that is an answer from one that is a silence.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    project = await seed.project(name="Atlas")
+    for _ in range(3):
+        await seed.task(project_id=project.id)
+
+    summary = await _service(db_session).evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+
+    assert await _risks(db_session, seed.owner.id) == []
+    assert summary.risks_found == 0
+    assert summary.by_type == {}
+    assert summary.by_severity == {}
+    assert "measured no risk in this window" in (summary.reason_if_not_evaluated or "")
+    assert await _recommendations(db_session, seed.owner.id) == []
+
+
+async def test_a_task_due_today_tomorrow_and_in_three_days_names_its_own_due_date(
+    db_session: AsyncSession,
+) -> None:
+    """Three due dates, three suggestions, each naming the right one — first pass.
+
+    The ``BLOCK_TIME`` title and reason are built from the date on the **task
+    row**. They used to be rebuilt from ``deadline_in_hours`` — a gap measured at
+    the start of the pass — added to ``detected_at``, the instant the row was
+    written afterwards. Those are two different clocks, and adding a length taken
+    from one to a timestamp taken from the other gives ``due_date + (written_at -
+    measured_at)``: correct on an ordinary pass and a day out on one that began
+    before midnight and wrote its rows after it. The wrong day was not merely
+    displayed — the reason is persisted, so it was stored.
+
+    Three tasks with nothing booked against them, so each fires the rule: 300
+    minutes remaining, 0 booked, a gap of 5h. The dates are derived in the
+    assertions from the database's own ``today`` rather than read back from the
+    stored string, because the point is that the stored string *is* that date.
+    """
+    seed = await _seed(db_session)
+    today = await _db_today(db_session)
+    project = await seed.project(name="Atlas")
+    offsets = {"Due today": 0, "Due tomorrow": 1, "Due in three days": 3}
+    for title, offset in offsets.items():
+        await seed.task(
+            project_id=project.id,
+            title=title,
+            due_date=today + timedelta(days=offset),
+            estimated_minutes=300,
+        )
+
+    summary = await _service(db_session).evaluate(owner=seed.owner, today=today, window_days=WINDOW)
+
+    suggestions = await _recommendations(db_session, seed.owner.id)
+    assert _recommendation_types(suggestions) == {RecommendationType.BLOCK_TIME.value: 3}
+    assert summary.recommendations_created == 3
+    by_title = {str(row["title"]): row for row in suggestions}
+
+    for title, offset in offsets.items():
+        due = f"{today + timedelta(days=offset):%d %b %Y}"
+        row = by_title[f"Schedule another 5h for {title} before {due}"]
+        assert due in str(row["description"])
+        assert due in str(row["reason"])
+        # One pass only. The date is read from the task's own column, so it is
+        # right the first time and stays right after the user moves the date.
+        assert row["status"] == "new"

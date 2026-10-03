@@ -15,6 +15,9 @@ whether it was rendered by the web client, a script or the API docs. It is
 derived here from the row, so there is one definition. The comparison is
 **date-based, not timestamp-based**: a task due today is not overdue at 09:00
 and not overdue at 23:00 either. "Overdue" means the due date is *behind* today.
+And "today" is the **UTC** day, because every stored timestamp is UTC —
+see :func:`utc_today` for why the host's local calendar must never decide it,
+and :meth:`TaskRead.build` for how the service hands in the database's clock.
 
 **``status`` is not settable through :class:`TaskUpdate`.** Every transition
 carries rules a blanket PATCH would bypass — completing stamps ``completed_at``,
@@ -26,7 +29,7 @@ reason spelled out on :class:`~app.schemas.user.UserUpdate`.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated, Any, Self
 from uuid import UUID
 
@@ -46,6 +49,8 @@ __all__ = [
     "TaskStatusChange",
     "TaskSummary",
     "TaskUpdate",
+    "is_past_due",
+    "utc_today",
 ]
 
 #: Must match ``tasks.title`` in ``app.models.task``.
@@ -69,6 +74,52 @@ EstimatedMinutes = Annotated[
 #: being asked for, and flagging either as overdue is noise that trains people to
 #: ignore the flag.
 _NOT_OVERDUE_STATUSES = (TaskStatus.COMPLETED, TaskStatus.CANCELLED)
+
+
+def utc_today() -> date:
+    """Return the current day **in UTC**.
+
+    **Never ``date.today()``.** Every stored timestamp in this schema is
+    timezone-aware UTC, so "today" has to be the UTC day too. ``date.today()``
+    reads the *host's* local calendar, and a host ahead of UTC — the development
+    box runs at +05:30 — disagrees with the database clock for five and a half
+    hours a day. In that window a task due today is reported overdue and a task
+    due tomorrow is not, while ``created_at`` on the very same row says
+    yesterday. The two cannot both be right, and the one that is wrong is the
+    badge users learn to ignore.
+
+    This is the *fallback*, for a row validated straight from the ORM with
+    nobody to ask. Every path this repository owns passes the database's own
+    ``now()`` instead — see :meth:`TaskRead.build` and
+    :meth:`~app.services.task_service.TaskService.stats`, which is what keeps
+    ``is_overdue`` and ``TaskStats.overdue`` describing the same day. What is
+    forbidden either way is the host's local calendar.
+    """
+    return datetime.now(UTC).date()
+
+
+def is_past_due(*, due_date: date | None, status: str, today: date) -> bool:
+    """Report whether one task's due date is strictly behind ``today``.
+
+    **Date-based, not timestamp-based.** A task due today is not overdue at
+    09:00 and not overdue at 23:00 either: "overdue" means the due date is
+    *behind* today, so a deadline is never flagged before the day has passed.
+    Comparing against an instant would flag it from midnight, which is the
+    single most common way an "overdue" badge becomes something users learn to
+    ignore.
+
+    A task that is done or cancelled is never overdue — see
+    :data:`_NOT_OVERDUE_STATUSES` for why.
+
+    Args:
+        due_date: The stored due date, or ``None`` for an un-deadlined task.
+        status: The stored status string.
+        today: The day to measure against, in UTC.
+
+    Returns:
+        Whether the task is late and still open.
+    """
+    return due_date is not None and due_date < today and status not in _NOT_OVERDUE_STATUSES
 
 
 class _TaskTextNormaliser:
@@ -230,6 +281,18 @@ class TaskRead(BaseModel):
     second needs a join, the first needs to know what "today" is to the server —
     so both are set by whoever assembles the response, and both mean the same
     thing to every client that asks this endpoint.
+
+    **The defaults are a fallback, not an answer.** ``tag_ids=[]`` and
+    ``has_blocked_dependencies=False`` are what a row reads as when nobody ran
+    the join for it. That is the right value for a task that genuinely has no
+    tags and is genuinely unblocked, and it is a lie for a task that has three
+    tags or is waiting on unfinished work — and it used to be printed as one.
+    A single-entity read that skipped the join answered ``false`` while the list
+    containing the same row answered ``true``, which is the quiet disagreement
+    this whole surface is built to avoid. Every route that returns a
+    ``TaskRead`` therefore goes through :meth:`build` with the join actually
+    run; the default survives only for a caller that has run nothing and knows
+    it.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -265,16 +328,19 @@ class TaskRead(BaseModel):
 
     @model_validator(mode="after")
     def _derive_is_overdue(self) -> Self:
-        # Date-based on purpose. ``due_date`` is a DATE, so ``due_date ==
-        # today`` is a task due today and is not yet overdue; only a date
-        # strictly behind today counts. Comparing against ``datetime.now()``
-        # would mark it overdue from midnight, which is the single most common
-        # way an "overdue" badge becomes something users learn to ignore.
-        self.is_overdue = (
-            self.due_date is not None
-            and self.due_date < date.today()
-            and self.status not in _NOT_OVERDUE_STATUSES
-        )
+        # An explicit value wins, and the guard is what makes that true twice.
+        # FastAPI validates the response model *again* on the way out, so a
+        # builder that only patched the instance after the fact would have its
+        # answer overwritten by the validator on the way through the response.
+        # ``model_fields_set`` records that the value was supplied rather than
+        # derived, and survives both ``model_copy`` and re-validation, so the
+        # clock the caller handed to :meth:`build` is the clock that answers.
+        #
+        # What remains here is the fallback, for a row nobody built: the UTC
+        # day, never the host's local one — see :func:`utc_today`.
+        if "is_overdue" in self.model_fields_set:
+            return self
+        self.is_overdue = is_past_due(due_date=self.due_date, status=self.status, today=utc_today())
         return self
 
     @classmethod
@@ -284,6 +350,7 @@ class TaskRead(BaseModel):
         *,
         tag_ids: list[UUID] | None = None,
         has_blocked_dependencies: bool = False,
+        today: date | None = None,
     ) -> TaskRead:
         """Build a task from a row plus the data that needs extra queries.
 
@@ -294,16 +361,31 @@ class TaskRead(BaseModel):
                 unfinished. Computed by the service from ``task_dependencies``;
                 defaulting to ``False`` is the honest answer for a row read
                 without that join.
+            today: The UTC day to measure ``is_overdue`` against. Supply it
+                whenever a clock is available — the service reads the
+                database's, which is the same clock
+                :meth:`~app.services.task_service.TaskService.stats` cuts its
+                overdue window on, so the badge on a card and the count in the
+                totals cannot describe two different days. Supplying it makes
+                the value *explicit*, which is what stops the response model's
+                re-validation on the way out from re-deriving it. Left
+                ``None``, the row's own validator falls back to
+                :func:`utc_today`.
 
         Returns:
             The task, with ``is_overdue`` derived and the two supplied values set.
         """
-        return cls.model_validate(row).model_copy(
-            update={
-                "tag_ids": tag_ids or [],
-                "has_blocked_dependencies": has_blocked_dependencies,
-            }
-        )
+        update: dict[str, Any] = {
+            "tag_ids": tag_ids or [],
+            "has_blocked_dependencies": has_blocked_dependencies,
+        }
+        if today is not None:
+            update["is_overdue"] = is_past_due(
+                due_date=getattr(row, "due_date", None),
+                status=getattr(row, "status", ""),
+                today=today,
+            )
+        return cls.model_validate(row).model_copy(update=update)
 
 
 class TaskSummary(BaseModel):
@@ -332,12 +414,21 @@ class TaskSummary(BaseModel):
 
     @model_validator(mode="after")
     def _derive_is_overdue(self) -> Self:
-        """Same rule as :class:`TaskRead`, kept here so the two cannot disagree."""
-        self.is_overdue = (
-            self.due_date is not None
-            and self.due_date < date.today()
-            and self.status not in _NOT_OVERDUE_STATUSES
-        )
+        """Same rule as :class:`TaskRead`, kept here so the two cannot disagree.
+
+        The same guard, so an ``is_overdue`` supplied by a caller survives the
+        response model being validated again on the way out. Where there is no
+        caller — the subtask, dependency and dependency-response routes serve
+        these straight from the ORM row — the flag is measured against
+        :func:`utc_today`, the UTC day. That is the same day
+        :class:`TaskRead` is measured against on every route that goes through
+        :meth:`TaskRead.build`, so a card and its summary cannot disagree; it is
+        simply the process clock rather than the database's, and the two agree
+        because both are UTC.
+        """
+        if "is_overdue" in self.model_fields_set:
+            return self
+        self.is_overdue = is_past_due(due_date=self.due_date, status=self.status, today=utc_today())
         return self
 
 

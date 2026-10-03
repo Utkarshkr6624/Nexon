@@ -54,6 +54,11 @@ REDACTED_KEYS: Final[frozenset[str]] = frozenset(
         "hashed_password",
         "new_password",
         "old_password",
+        # The password-change payload names the field ``current_password``
+        # (``schemas/security.py``). It was missing from this set, so enabling
+        # ``log_request_body`` wrote the account's current password to the
+        # access log in plaintext. Same secret as ``password``; different key.
+        "current_password",
         "confirm_password",
         "token",
         "access_token",

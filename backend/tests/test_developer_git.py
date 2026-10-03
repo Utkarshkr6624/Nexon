@@ -42,11 +42,13 @@ from __future__ import annotations
 import ast
 import asyncio
 import os
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from app.services.developer import git as git_engine
 from app.services.developer.git import (
     DEFAULT_GIT_TIMEOUT_SECONDS,
     LANGUAGE_BY_EXTENSION,
@@ -170,6 +172,57 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # must not change the language distribution or the tracked file count.
     (root / "notes.txt").write_text("scratch\n", encoding="utf-8")
     return root
+
+
+# ---------------------------------------------------------------------------
+# Async fixtures
+#
+# The two helpers below exist because the ones above cannot be used from an
+# ``async def`` test: they call ``asyncio.run``, which raises inside a running
+# loop. A test that needs a repository of its own and also needs to read it has
+# to build it with ``await``.
+# ---------------------------------------------------------------------------
+
+
+async def _init_async(root: Path) -> None:
+    """Create an empty ``main``-branched repository, awaiting each git call.
+
+    ``git init`` is given the path rather than run inside it, so the directory is
+    created by git and this helper contains no blocking filesystem call of its
+    own — a synchronous ``Path.mkdir`` at the top of an async function is exactly
+    the kind of thing the engine module goes out of its way not to do.
+
+    The identity is a fixture rather than the machine's global config, so the
+    scanned author is the same everywhere.
+    """
+    await run_git(root.parent, "init", "-b", "main", str(root))
+    await run_git(root, "config", "user.email", "test@example.invalid")
+    await run_git(root, "config", "user.name", "Test Person")
+
+
+async def _commit_at_async(repo: Path, message: str, *, name: str, body: str, when: datetime):
+    """Write a file, stage it, and commit it at a fixed instant.
+
+    Both dates are exported to the environment rather than passed as flags,
+    because git has an author-date flag and no committer-date one. That matters
+    more than it looks: ``git log --since`` filters on the *committer* date, so a
+    commit with only its author date moved would fall outside a window built from
+    author dates — which is exactly what the windowing tests below assert about.
+    """
+    stamp = when.isoformat()
+    keys = ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE")
+    previous = {key: os.environ.get(key) for key in keys}
+    os.environ.update(dict.fromkeys(keys, stamp))
+    try:
+        (repo / name).write_text(body, encoding="utf-8")
+        await run_git(repo, "add", "-A")
+        await run_git(repo, "commit", "-m", message, "--no-gpg-sign")
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +581,66 @@ async def test_the_limit_caps_the_commits_returned(repo: Path):
     assert snapshot.commits[0].message == "Extend the helper"
 
 
+@requires_git
+async def test_the_commits_the_ceiling_leaves_out_are_never_returned_by_any_scan(
+    tmp_path: Path,
+):
+    """A repository larger than the ceiling records its newest commits, permanently.
+
+    Expected figures, derived from the fixture rather than from a run: five
+    commits are made at 10, 8, 6, 4 and 2 days before a fixed reference. A scan
+    with ``limit=2`` therefore returns exactly two commits — the ones at 2 and 4
+    days, newest first — and the three older ones are in neither it nor any
+    scan that follows it. The follow-up scan is given ``since`` at the stored
+    high-water mark, which is that newest commit's own instant, so it is asking
+    for commits *at or after* 2 days ago: git's ``--since`` is inclusive, so the
+    newest commit itself comes back and the three older ones do not. One row,
+    not four.
+    This is the honest consequence of a ceiling applied to a newest-first log,
+    and it is asserted rather than left to a comment. The alternative reading —
+    that the next scan picks the rest up — is not how ``-n`` behaves and never
+    was: the commits below the ceiling are older than the mark, so no later
+    scan asks for them and a full re-scan asks for the same newest two.
+    """
+    reference = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    root = tmp_path / "oversized"
+    await _init_async(root)
+    for days in (10, 8, 6, 4, 2):
+        await _commit_at_async(
+            root,
+            f"Step at {days} days",
+            name="a.py",
+            body=f"x = {days}\n",
+            when=reference - timedelta(days=days),
+        )
+
+    everything = await read_repository(root)
+    below_the_ceiling = {commit.commit_hash for commit in everything.commits[2:]}
+    assert len(everything.commits) == 5
+
+    capped = await read_repository(root, limit=2)
+
+    assert [commit.committed_at for commit in capped.commits] == [
+        everything.commits[0].committed_at,
+        everything.commits[1].committed_at,
+    ]
+
+    incremental = await read_repository(root, since=capped.commits[0].committed_at, limit=2)
+
+    # `--since` is inclusive, so the newest commit comes back — and the upsert
+    # that stores it is a no-op. What does not come back is anything older.
+    assert [commit.commit_hash for commit in incremental.commits] == [
+        capped.commits[0].commit_hash
+    ], "one row, the newest commit itself, and not the three the ceiling left out"
+    assert below_the_ceiling.isdisjoint(commit.commit_hash for commit in capped.commits)
+    full = await read_repository(root, limit=MAX_COMMITS_PER_SCAN)
+    assert below_the_ceiling.issubset({commit.commit_hash for commit in full.commits}), (
+        "no ceiling, no truncation: all five are there, which is what makes the "
+        "ceiling a statement about what NEXUS records rather than about the "
+        "repository's history"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Branches
 # ---------------------------------------------------------------------------
@@ -595,6 +708,72 @@ async def test_a_commit_reachable_from_no_branch_is_attributed_to_nothing(
     assert snapshot.current_branch is None
     assert snapshot.commits  # the commit is still readable
     assert all(commit.branch is None for commit in snapshot.commits)
+
+
+@requires_git
+async def test_branch_attribution_reads_only_the_commits_the_window_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An incremental scan attributes its commits without walking the history.
+
+    Expected figures, derived from the fixture rather than from a run: five
+    commits are made at 10, 8, 6, 4 and 2 days before a fixed reference — the
+    last two on a second branch — and the scan is given ``since`` three days
+    before the reference with a ceiling of ten. Exactly one commit falls inside
+    that window (the one at 2 days), so the attribution pass must read exactly
+    one commit. Without ``-n`` and ``--since`` on that pass it reads all five,
+    which is the whole incremental-scan claim undone: a re-scan of a repository
+    with years of history would cost more than the first one, every time.
+
+    The commit is on the second branch on purpose. A windowed walk that could
+    not reach a branch's own tip would attribute nothing, and ``None`` is a
+    legal-looking answer, so the test would pass with the fix made too narrow.
+    The walk is also recorded rather than replaced: git still runs, so the
+    arguments asserted here are arguments git accepted.
+    """
+    reference = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    since = reference - timedelta(days=3)
+    root = tmp_path / "windowed"
+    await _init_async(root)
+
+    for days in (10, 8, 6):
+        await _commit_at_async(
+            root,
+            f"Main step {days}",
+            name="a.py",
+            body=f"x = {days}\n",
+            when=reference - timedelta(days=days),
+        )
+    await run_git(root, "checkout", "-b", "feature")
+    for days in (4, 2):
+        await _commit_at_async(
+            root,
+            f"Feature step {days}",
+            name="b.py",
+            body=f"y = {days}\n",
+            when=reference - timedelta(days=days),
+        )
+
+    walked: dict[str, object] = {}
+    real_run_git = git_engine.run_git
+
+    async def recording_run_git(repo_path, *args, **kwargs):
+        output = await real_run_git(repo_path, *args, **kwargs)
+        if "--source" in args:
+            walked["args"] = args
+            walked["commits"] = sum(1 for line in output.splitlines() if line.strip())
+        return output
+
+    monkeypatch.setattr(git_engine, "run_git", recording_run_git)
+
+    snapshot = await read_repository(root, since=since, limit=10)
+
+    assert [commit.message for commit in snapshot.commits] == ["Feature step 2"]
+    assert snapshot.commits[0].branch == "feature"
+    assert walked["commits"] == 1, "one commit is inside the window, not five"
+    args = list(walked["args"])
+    assert args[args.index("-n") + 1] == "10", "the attribution pass takes the same ceiling"
+    assert f"--since={since.isoformat()}" in args, "the attribution pass takes the same window"
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1169,124 @@ def test_an_allowlist_root_that_does_not_exist_yet_is_still_usable(tmp_path: Pat
     future = tmp_path / "repos" / "not-created-yet"
 
     assert parse_path_allowlist(str(future)) == (future.resolve(),)
+
+
+@requires_git
+def test_an_allowlist_whose_every_entry_failed_to_parse_permits_nothing(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured allowlist that resolved to no root denies every path.
+
+    ``parse_path_allowlist`` drops an entry it cannot resolve rather than
+    failing the whole setting, which is right for one bad entry — dropping it
+    only ever permits *less*. But when the last entry goes too, what remains
+    permits nothing, and the check that consumed the empty result is skipped
+    entirely: the operator who wrote an allowlist gets an open door because
+    every entry in it was unusable. So a configured list that produced no roots
+    is a list that permits no paths, with the same sentence a path outside the
+    roots gets.
+
+    The failure itself is simulated. A malformed entry is not portable to
+    provoke — on Windows every unusable string still resolves to something —
+    and what is under test is this module's branch, not the filesystem's. The
+    replacement raises only for the marked entry, so the repository under test
+    resolves through the real ``Path.resolve``.
+    """
+    original_resolve = Path.resolve
+
+    def exploding_resolve(self: Path, *args, **kwargs):
+        if "unresolvable-entry" in str(self):
+            raise OSError("this entry could not be resolved")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", exploding_resolve)
+
+    assert parse_path_allowlist("unresolvable-entry") == ()
+    with pytest.raises(GitRepositoryError, match="outside the directories"):
+        validate_repository_path(repo, allowlist=["unresolvable-entry"])
+
+
+@requires_git
+def test_an_empty_allowlist_sequence_is_a_configured_list_not_an_absent_one(repo: Path) -> None:
+    """``[]`` is a caller that supplied an allowlist and named no roots in it.
+
+    ``None`` is the documented "no allowlist configured" and stays unrestricted.
+    An empty sequence is not the same statement: something was configured and
+    it permits nothing, so every path is outside it. Collapsing the two is how a
+    deployment that meant to lock itself down ends up reading any directory on
+    the machine.
+    """
+    with pytest.raises(GitRepositoryError, match="outside the directories"):
+        validate_repository_path(repo, allowlist=[])
+    assert validate_repository_path(repo, allowlist=None) == repo.resolve()
+
+
+@requires_git
+async def test_reading_a_repository_enforces_the_allowlist_the_scan_was_given(
+    tmp_path: Path,
+) -> None:
+    """A scan refuses a repository outside the allowlist it was handed.
+
+    Registration is where an allowlist is enforced today, and registration is
+    the wrong *only* place for it: the path a scan reads is a stored string
+    resolved days later, and a stored string is not a promise about what it
+    resolves to now. So the engine takes the list as an argument and applies it
+    on the way in, which means a scan of a path that is no longer permitted
+    fails as a sentence instead of quietly reading somewhere else.
+
+    The control below is the same read with no allowlist configured, which is
+    the default and must keep working: the fix is that the list is honoured
+    when there is one, not that scanning is restricted always.
+    """
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    await _init_async(outside)
+
+    with pytest.raises(GitRepositoryError, match="outside the directories"):
+        await read_repository(outside, allowlist=[allowed])
+
+    assert (await read_repository(outside)).tracked_file_count == 0
+
+
+@requires_git
+async def test_a_registered_path_that_became_a_symlink_elsewhere_is_refused_at_scan_time(
+    tmp_path: Path,
+) -> None:
+    """A repository that moved out of the allowlist by symlink is not read.
+
+    The registered directory is deleted and replaced by a link pointing at a
+    real repository outside the permitted root. The stored string is unchanged
+    and still exists, so every check that reads the string rather than what it
+    resolves to would pass it — and the scan would then read, in full, a
+    directory the operator never allowed. The refusal is the same sentence a
+    registration outside the root gets.
+
+    Skipped where the platform will not create a directory symlink: the
+    behaviour under test needs the path to resolve somewhere other than where it
+    was, and a machine that cannot express that cannot demonstrate it. The test
+    above pins the same check without needing the symlink.
+    """
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    registered = allowed / "demo"
+    await _init_async(registered)
+    assert (await read_repository(registered, allowlist=[allowed])).path == registered.resolve()
+
+    elsewhere = tmp_path / "elsewhere"
+    await _init_async(elsewhere)
+    try:
+        shutil.rmtree(registered)
+        registered.symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:  # pragma: no cover - platform
+        pytest.skip(f"this platform will not create a directory symlink: {error}")
+
+    with pytest.raises(GitRepositoryError, match="outside the directories"):
+        await read_repository(registered, allowlist=[allowed])
+    assert (await read_repository(registered)).path == elsewhere.resolve(), (
+        "without an allowlist the same path is read, which is why the configured "
+        "one has to be passed through the scan"
+    )
 
 
 # ---------------------------------------------------------------------------

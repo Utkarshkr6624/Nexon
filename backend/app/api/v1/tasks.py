@@ -27,21 +27,24 @@ Both are properties of the service layer, not of this router, and both are
 stated here because a response model that cannot tell a client is worse than one
 that admits it:
 
-* **Single-task responses carry no tags and no dependency flag.**
-  :class:`~app.schemas.task.TaskRead` has ``tag_ids`` and
-  ``has_blocked_dependencies``, neither of which is a property of the ``tasks``
-  row. The service fills both in for *list* responses (see
-  ``TaskService._page``, which does the tag join for the whole page in one
-  query) but its detail methods return the ORM row. FastAPI therefore
-  serialises ``tag_ids: []`` and ``has_blocked_dependencies: false`` on
-  ``GET /tasks/{id}``, on the PATCH and on every transition — even when the task
-  really is waiting on unfinished work. ``is_overdue`` *is* correct everywhere,
-  because it is derived inside the response model. The fix is a service change
-  (a ``get_read`` that assembles the same way ``_page`` does), not a router one.
 * **``parent_id`` is not a filter on the listing.** ``TaskService.list`` does
   not accept it although ``TaskRepository.list_for_user`` supports the column,
   so the parameter is not declared here rather than declared and silently
   ignored. One service signature is all that is missing.
+
+The gap that used to be second of the two — **single-task responses carrying no
+tags and no dependency flag** — is closed. ``GET /tasks/{id}`` returned
+``tag_ids: []`` and ``has_blocked_dependencies: false`` for a task that had
+three tags and was waiting on unfinished work, while ``GET /tasks`` returned the
+real values for the same row in the same request. Every single-task route here
+now goes through ``TaskService.read``/``get_read``, which assembles a row the
+way ``_page`` assembles a page, and the ``is_overdue`` flag is measured against
+the database's own clock rather than the host's local calendar.
+
+Every edge of the lifecycle is reachable here too. ``cancelled`` was listed in
+``TaskService._LEGAL_TRANSITIONS`` from the first commit and no route could take
+any edge into it, so ``TaskStats.cancelled`` read a hard zero for every account
+in the repository — indistinguishable from a user who never abandons work.
 
 Pagination
 ----------
@@ -216,6 +219,11 @@ async def create_task(
     ``status`` is accepted here and nowhere else after this, because an imported
     backlog may legitimately arrive already under way or already blocked.
 
+    ``tag_ids`` and ``has_blocked_dependencies`` come back empty here because
+    they are *measured* zeros rather than unmeasured ones: the row was created
+    by this very request, so it carries no tag edges and no dependency edges. No
+    join is worth running to confirm it.
+
     Errors: 404 for a project or parent that is not the caller's; 422 for a
     parent in another project or one that is itself a subtask.
     """
@@ -232,7 +240,7 @@ async def get_task(
     task_id: UUID,
     current_user: AuthenticatedUser,
     tasks: TaskServiceDep,
-) -> Task:
+) -> TaskRead:
     """Return one of the caller's tasks.
 
     **404 for another account's task, never 403** — the id is resolved through
@@ -240,9 +248,16 @@ async def get_task(
     is byte-for-byte the one a nonexistent id gets. See this module's docstring
     for why that distinction is load-bearing.
 
+    **``tag_ids`` and ``has_blocked_dependencies`` are real here**, joined for
+    this one row the same way the listing joins a page. They used to be the
+    schema's ``[]``/``false`` defaults on this route and only the listing's real
+    values, so a client could fetch a blocked card and be told it was ready. An
+    absent measurement is not a measured zero, and a card waiting on unfinished
+    work reported as unblocked is the more expensive of the two mistakes.
+
     Errors: 404 when the caller owns no task with this id.
     """
-    return await tasks.get(task_id=task_id, owner=current_user)
+    return await tasks.get_read(task_id=task_id, owner=current_user)
 
 
 @router.patch(
@@ -256,7 +271,7 @@ async def update_task(
     payload: TaskUpdate,
     current_user: AuthenticatedUser,
     tasks: TaskServiceDep,
-) -> Task:
+) -> TaskRead:
     """Apply a partial update to a task the caller owns.
 
     **A field is written if the client named it**, and an omitted field is left
@@ -279,7 +294,8 @@ async def update_task(
     another project or is itself a subtask.
     """
     task = await tasks.get(task_id=task_id, owner=current_user)
-    return await tasks.update(task=task, data=payload, owner=current_user)
+    updated = await tasks.update(task=task, data=payload, owner=current_user)
+    return await tasks.read(task=updated, owner=current_user)
 
 
 @router.delete(
@@ -300,6 +316,21 @@ async def delete_task(
     that was abandoned, so a row only disappears when its user asked for it to.
     Subtasks, dependency edges and tag edges cascade; the activity rows do not.
 
+    **Tracked time goes with it, and that is the consequence worth reading.**
+    ``work_sessions.task_id`` and ``calendar_events.task_id`` are ``ON DELETE
+    CASCADE`` (``app/models/planner.py:149-151`` and ``:272-280``), so this one
+    call removes every minute the user actually recorded against the task and
+    every calendar entry reserved for it. Silently, and with no way back: the
+    Phase 6 analytics that read those rows then report fewer hours worked, which
+    is indistinguishable from the user having worked less.
+
+    **So cancel rather than delete, wherever cancelling will do.** A cancelled
+    task keeps its sessions, its bookings, its history and its place in the
+    stats; it just stops being work anyone is waiting on. Recommend to the owner
+    that this route be made opt-in — a confirmation naming the minutes and
+    bookings about to be destroyed — rather than that the cascade be removed,
+    which would leave sessions pointing at a task nobody can name.
+
     Errors: 404 for a task that is not the caller's, or that does not exist.
     """
     task = await tasks.get(task_id=task_id, owner=current_user)
@@ -317,7 +348,7 @@ async def complete_task(
     task_id: UUID,
     current_user: AuthenticatedUser,
     tasks: TaskServiceDep,
-) -> Task:
+) -> TaskRead:
     """Finish a task, stamping ``completed_at``.
 
     Two rules, and the second is the reason this is not an alias for setting the
@@ -332,7 +363,9 @@ async def complete_task(
     that is not the caller's.
     """
     task = await tasks.get(task_id=task_id, owner=current_user)
-    return await tasks.complete(task=task, owner=current_user)
+    return await tasks.read(
+        task=await tasks.complete(task=task, owner=current_user), owner=current_user
+    )
 
 
 @router.post(
@@ -345,7 +378,7 @@ async def reopen_task(
     task_id: UUID,
     current_user: AuthenticatedUser,
     tasks: TaskServiceDep,
-) -> Task:
+) -> TaskRead:
     """Take a completed task back, clearing ``completed_at``.
 
     Reopening returns the card to ``todo`` and **clears the stamp**, so a task
@@ -362,7 +395,9 @@ async def reopen_task(
     Errors: 422 when the task was cancelled; 404 when it is not the caller's.
     """
     task = await tasks.get(task_id=task_id, owner=current_user)
-    return await tasks.reopen(task=task, owner=current_user)
+    return await tasks.read(
+        task=await tasks.reopen(task=task, owner=current_user), owner=current_user
+    )
 
 
 @router.post(
@@ -375,7 +410,7 @@ async def start_task(
     task_id: UUID,
     current_user: AuthenticatedUser,
     tasks: TaskServiceDep,
-) -> Task:
+) -> TaskRead:
     """Move a task into ``IN_PROGRESS``.
 
     The state machine only allows ``COMPLETED`` from ``IN_PROGRESS`` or
@@ -385,7 +420,9 @@ async def start_task(
     that looked exactly like a user who completes nothing.
     """
     task = await tasks.get(task_id=task_id, owner=current_user)
-    return await tasks.start(task=task, owner=current_user)
+    return await tasks.read(
+        task=await tasks.start(task=task, owner=current_user), owner=current_user
+    )
 
 
 @router.post(
@@ -399,7 +436,7 @@ async def block_task(
     current_user: AuthenticatedUser,
     tasks: TaskServiceDep,
     payload: _BlockRequest | None = None,
-) -> Task:
+) -> TaskRead:
     """Mark a task blocked, recording why.
 
     **The body is optional, and ``note`` is its only meaningful field.** It
@@ -419,8 +456,55 @@ async def block_task(
     than ``blocked``; 404 for a task that is not the caller's.
     """
     task = await tasks.get(task_id=task_id, owner=current_user)
-    return await tasks.block(
-        task=task, owner=current_user, reason=payload.note if payload else None
+    return await tasks.read(
+        task=await tasks.block(
+            task=task, owner=current_user, reason=payload.note if payload else None
+        ),
+        owner=current_user,
+    )
+
+
+@router.post(
+    "/{task_id}/cancel",
+    response_model=TaskRead,
+    summary="Cancel a task",
+    dependencies=[Depends(require_permission(Permission.TASKS_WRITE))],
+)
+async def cancel_task(
+    task_id: UUID,
+    current_user: AuthenticatedUser,
+    tasks: TaskServiceDep,
+) -> TaskRead:
+    """Cancel a task: work that is abandoned rather than finished.
+
+    **The last open state in the lifecycle, and the one the wire could not
+    reach.** ``TaskService._LEGAL_TRANSITIONS`` has allowed ``cancelled`` from
+    ``todo``, ``in_progress`` and ``blocked`` since the first commit, and no
+    route could take any of those edges — so ``TaskStats.cancelled`` was a hard
+    zero for every account, which is indistinguishable from a user who never
+    abandons work.
+
+    **Cancelling is not completing.** ``completed_at`` is not stamped, the card
+    does not count as done, and it does not start satisfying the things that
+    wait on it: a cancelled prerequisite is a dropped prerequisite, which is why
+    a task blocked behind one stays blocked until the edge is removed.
+
+    **And it is not deleting.** ``cancelled`` keeps the row, its history and
+    everything filed against it. A completed task cannot be cancelled — the
+    work happened, and relabelling it would erase a fact rather than record one;
+    deleting it is the path for that, and see this router's docstring for what
+    that costs.
+
+    ``reason``, when given, rides on the activity event and never on the card:
+    "not doing this any more" is history, not a current fact every client would
+    read.
+
+    Errors: 422 when the status cannot move to ``cancelled`` (a completed task);
+    404 for a task that is not the caller's.
+    """
+    task = await tasks.get(task_id=task_id, owner=current_user)
+    return await tasks.read(
+        task=await tasks.cancel(task=task, owner=current_user), owner=current_user
     )
 
 
@@ -435,7 +519,7 @@ async def set_task_priority(
     payload: TaskPriorityChange,
     current_user: AuthenticatedUser,
     tasks: TaskServiceDep,
-) -> Task:
+) -> TaskRead:
     """Move a task to a different grade on the priority scale.
 
     Separate from the detail PATCH because a re-triage is its own moment: the
@@ -447,7 +531,8 @@ async def set_task_priority(
     not the caller's.
     """
     task = await tasks.get(task_id=task_id, owner=current_user)
-    return await tasks.set_priority(task=task, priority=payload.priority, owner=current_user)
+    updated = await tasks.set_priority(task=task, priority=payload.priority, owner=current_user)
+    return await tasks.read(task=updated, owner=current_user)
 
 
 @router.get(

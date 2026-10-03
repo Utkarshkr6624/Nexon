@@ -75,7 +75,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.models.analytics import DailyMetric
 from app.models.enums import ActivityEvent, TaskStatus
@@ -221,6 +221,49 @@ async def _series(
 def _by_day(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """``/series`` rows keyed by their ``metric_date``."""
     return {row["metric_date"]: row for row in rows}
+
+
+async def _snapshot(
+    session: Any, client: Any, headers: dict[str, str], task_id: uuid.UUID
+) -> dict[str, Any]:
+    """The 15 numeric features of one task's snapshot, wrapper asserted.
+
+    ``/analytics/feature-snapshot`` answers a **wrapper** around the feature
+    matrix — ``schema_version``, ``generated_at``, ``task_id`` and a ``features``
+    object holding the numbers — rather than the bare mapping it used to return.
+    A Phase-10 training row has to be attributable to the extraction that
+    produced it, and a version string smuggled *inside* the matrix becomes a
+    column a model is then asked to fit, so the provenance travels beside the
+    numbers rather than among them.
+
+    The three wrapper assertions live here rather than in each caller because
+    every caller here reads the matrix and none of them is about provenance;
+    this is the one place that says what the wrapper must contain. It also pins
+    ``generated_at`` to the **database** clock, since this host is not on UTC and
+    a wrapper stamped from ``date.today()`` would be a day ahead of the clock
+    every feature in it was derived from.
+
+    Args:
+        session: The test's session, used to read the database's ``now()``.
+        client: The authenticated HTTP client.
+        headers: The caller's authorization headers.
+        task_id: The task to describe.
+
+    Returns:
+        The ``features`` mapping: the same 15 keys, in the same order, whatever
+        the data says.
+    """
+    response = await client.get(
+        "/api/v1/analytics/feature-snapshot", params={"task_id": str(task_id)}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {"schema_version", "generated_at", "task_id", "features"}
+    assert body["schema_version"] == "analytics_features.v1"
+    assert body["task_id"] == str(task_id)
+    today = (await session.scalar(select(func.now()))).date()
+    assert body["generated_at"] == today.isoformat()
+    return body["features"]
 
 
 def _counters(row: dict[str, Any]) -> dict[str, int]:
@@ -1423,11 +1466,7 @@ async def test_an_in_progress_task_with_tracked_time_still_counts_that_time(clie
     assert entry["avg_task_actual_minutes"] is None
     assert entry["avg_task_minutes"] == 90.0
 
-    snapshot = await client.get(
-        "/api/v1/analytics/feature-snapshot", params={"task_id": str(task.id)}, headers=auth
-    )
-    assert snapshot.status_code == 200, snapshot.text
-    vector = snapshot.json()
+    vector = await _snapshot(db_session, client, auth, task.id)
     assert vector["actual_minutes"] == 90
     assert vector["work_session_count"] == 1
     assert vector["recent_work_minutes"] == 90
@@ -1495,11 +1534,7 @@ async def test_task_minutes_with_no_session_are_never_counted_as_worked_time(cli
     assert entry["work_minutes"] == 0
     assert entry["total_work_minutes"] == 0
 
-    snapshot = await client.get(
-        "/api/v1/analytics/feature-snapshot", params={"task_id": str(task.id)}, headers=auth
-    )
-    assert snapshot.status_code == 200, snapshot.text
-    vector = snapshot.json()
+    vector = await _snapshot(db_session, client, auth, task.id)
     assert vector["actual_minutes"] is None
     assert vector["recent_work_minutes"] is None
     assert vector["work_session_count"] == 0

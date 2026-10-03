@@ -112,6 +112,16 @@ DEFAULT_PAGE_SIZE = 50
 #: evidence of finishing. The table below is what :meth:`ProjectService.set_status`
 #: enforces, and it is the only door to a status change.
 #:
+#: **Every edge below is reachable over HTTP, and that is a property of the
+#: router rather than of the table.** An edge no endpoint can walk is a
+#: description of an intent. ``ON_HOLD`` listed here since the first commit and
+#: was reached by nothing: ``app/api/v1/projects.py`` called ``set_status``
+#: only with ``COMPLETED``, so ``ProjectStats.on_hold`` read a hard zero for
+#: every account in the repository — a number indistinguishable from a user who
+#: never pauses a project. ``/activate`` and ``/hold`` and ``/resume`` are the
+#: doors those edges needed; ``/activate`` additionally unblocks ``/complete``,
+#: which is only legal *from* ``ACTIVE``.
+#:
 #: The rules it encodes:
 #:
 #: * ``PLANNED`` may start or be shelved, but may not be *completed* directly —
@@ -467,6 +477,95 @@ class ProjectService:
         )
         return updated
 
+    async def activate(self, *, project: Project, owner: User) -> Project:
+        """Move a planned project into the working set.
+
+        The ``PLANNED -> ACTIVE`` edge of :data:`_LEGAL_TRANSITIONS`, and the
+        door it was missing. Without it a project could only ever become
+        ``active`` as a side effect of :meth:`restore`, so "start this project"
+        had no route — and ``COMPLETED`` is only reachable *from* ``ACTIVE``, so
+        ``/complete`` was unreachable for every project the user had not
+        archived and un-archived first. The edge existed, the rule was written
+        down, and nothing could walk it.
+
+        Args:
+            project: The project, already resolved for this owner.
+            owner: The authenticated caller.
+
+        Returns:
+            The active project, or the unchanged one when it already was.
+
+        Raises:
+            NotFoundError: If the row does not belong to the caller.
+            ValidationError: If the status may not become ``active`` — an
+                ``on_hold`` project resumes (:meth:`resume`), a ``completed`` one
+                reopens through ``/complete``'s own edge, and ``archived`` is
+                terminal through this method.
+        """
+        return await self.set_status(
+            project=project, status=ProjectStatus.ACTIVE.value, owner=owner
+        )
+
+    async def hold(self, *, project: Project, owner: User) -> Project:
+        """Shelve a project: stop working on it, keep it in the working set.
+
+        **This is what makes ``ON_HOLD`` a state rather than an aspiration.**
+        :data:`_LEGAL_TRANSITIONS` has allowed ``PLANNED -> ON_HOLD`` and
+        ``ACTIVE -> ON_HOLD`` from the first commit, and until now no endpoint
+        could take either edge: ``set_status`` was only ever called with
+        ``COMPLETED``. ``ProjectStats.on_hold`` therefore read a hard zero for
+        every account — indistinguishable from a user who never pauses a
+        project, which is the same false signal ``/start`` used to send about
+        task completion.
+
+        A hold is not an archive. The project stays in the working set, keeps
+        its tasks and its window, and comes back through :meth:`resume`.
+        Completing straight out of a hold is refused by the table, because the
+        point of shelving is that the work paused.
+
+        Args:
+            project: The project, already resolved for this owner.
+            owner: The authenticated caller.
+
+        Returns:
+            The held project, or the unchanged one when it already was.
+
+        Raises:
+            NotFoundError: If the row does not belong to the caller.
+            ValidationError: If the status may not become ``on_hold`` — a
+                ``completed`` or ``archived`` project cannot be shelved.
+        """
+        return await self.set_status(
+            project=project, status=ProjectStatus.ON_HOLD.value, owner=owner
+        )
+
+    async def resume(self, *, project: Project, owner: User) -> Project:
+        """Take a held project back into the working set.
+
+        The ``ON_HOLD -> ACTIVE`` edge, and the only way out of a hold that is
+        not an archive. It lands on ``ACTIVE`` rather than on whatever the
+        project held before — the schema records no pre-hold status, the same
+        trade :data:`_RESTORED_STATUS` makes for :meth:`restore`.
+
+        Resuming a project that is not on hold is a no-op rather than a 422,
+        for the same reason every other idempotent write in this service is
+        one: a retried click is a retry, not a mistake.
+
+        Args:
+            project: The project, already resolved for this owner.
+            owner: The authenticated caller.
+
+        Returns:
+            The resumed project, or the unchanged one.
+
+        Raises:
+            NotFoundError: If the row does not belong to the caller.
+            ValidationError: If the row's status has drifted to an unknown value.
+        """
+        return await self.set_status(
+            project=project, status=ProjectStatus.ACTIVE.value, owner=owner
+        )
+
     async def archive(self, *, project: Project, owner: User) -> Project:
         """Archive a project: hide it from the working set, keep its history.
 
@@ -568,6 +667,25 @@ class ProjectService:
         it. That is why the event below is written **after** the delete — the
         foreign key no longer has to resolve, and a failure of the delete leaves
         no event claiming it happened.
+
+        **And that is where the cascade reaches further than it looks.** The
+        tasks going with it are themselves the foreign key on the Phase 4 tables
+        (``WorkSession.task_id`` and ``CalendarEvent.task_id``, both ``ON DELETE
+        CASCADE`` at ``app/models/planner.py:149-151`` and ``:272-280``), and
+        those tables also carry a direct ``project_id`` cascade of their own. So
+        one ``DELETE /projects/{id}`` removes **every tracked minute and every
+        calendar booking filed under that project**, transitively, with nothing
+        warning the owner and no way back. Nothing about it is recoverable: the
+        Phase 6 analytics read those rows, so a later window reports fewer hours
+        worked, which is indistinguishable from the user having worked less.
+
+        Same recommendation as :meth:`app.services.task_service.TaskService.delete`,
+        one level up: **leave the cascade, make the destructive path opt-in.**
+        A confirmation that names what is about to go — the task count, the
+        minutes recorded — costs nothing and is honest; removing the cascade
+        would orphan sessions pointing at a project nobody can name, which is
+        the shape the planner model explicitly avoids. Archiving is the answer
+        for everything except data that should not exist.
 
         Args:
             project: The project, already resolved for this owner.

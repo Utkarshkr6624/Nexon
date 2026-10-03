@@ -69,13 +69,15 @@ from app.schemas.planner import (
     SuggestionResponse,
 )
 from app.services.planner_service import resolve_timezone
+from app.services.scheduling_service import MAX_CONFLICTS
 
 router = APIRouter(prefix="/planner", tags=["planner"])
 
 #: The conflict list's page metadata. Nothing here is paged — the span bounds
 #: the answer — but :class:`~app.schemas.planner.ConflictList` carries ``meta``,
 #: and a fabricated ``limit`` would be a claim the endpoint does not honour.
-MAX_CONFLICT_LIMIT = 100
+#: ``MAX_CONFLICTS`` is imported from the engine rather than re-declared, so
+#: ``meta.limit`` always reports the cap that was actually applied.
 
 _TZ_DESCRIPTION = (
     "IANA zone the day boundaries are computed in; defaults to "
@@ -279,16 +281,27 @@ async def list_conflicts(
 
     **An empty list means nothing was wrong**, not that nothing was checked — a
     span with no events and no sessions has no conflicts, and saying so is the
-    correct answer.
+    correct answer. A truncated span is never an empty one, so the two cannot be
+    confused.
+
+    **The answer is bounded, and says so.** Overlap detection is pairwise, so a
+    span holding 500 mutually overlapping sessions would name 124,750 pairs —
+    roughly 63.5 MB of JSON. The scan stops at
+    :data:`app.services.scheduling_service.MAX_CONFLICTS` and the response
+    carries ``truncated: true`` with the reason, so a partial list is never
+    presented as a complete one. ``meta.total`` is then a floor on the number of
+    conflicts that exist rather than a count of them.
 
     Errors: 422 for a malformed date or an unknown ``tz``.
     """
     zone = resolve_timezone(tz, settings=scheduling.settings)
-    conflicts = await scheduling.conflicts(owner=current_user, start=start, end=end, tz=tz)
+    scan = await scheduling.conflicts(owner=current_user, start=start, end=end, tz=tz)
     return ConflictList(
         window=PlannerWindow(start_date=start, end_date=end, timezone=str(zone)),
-        conflicts=conflicts,
-        meta=PageMeta(total=len(conflicts), limit=MAX_CONFLICT_LIMIT, offset=0),
+        conflicts=scan.conflicts,
+        truncated=scan.truncated,
+        truncated_reasons=list(scan.reasons),
+        meta=PageMeta(total=len(scan.conflicts), limit=MAX_CONFLICTS, offset=0),
     )
 
 

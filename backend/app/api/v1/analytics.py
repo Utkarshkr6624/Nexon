@@ -46,7 +46,7 @@ they are actually read.
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Response, status
@@ -584,7 +584,7 @@ async def feature_snapshot(
     current_user: AuthenticatedUser,
     analytics: AnalyticsServiceDep,
     task_id: Annotated[UUID, Query(description="The task to describe.")],
-) -> dict[str, float | int | None]:
+) -> dict[str, Any]:
     """Return the named feature vector for one of the caller's tasks.
 
     **404 for another account's task, never 403.** The id is resolved through an

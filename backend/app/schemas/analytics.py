@@ -31,6 +31,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, model_validator
 
 __all__ = [
+    "ANALYTICS_FEATURE_SCHEMA_VERSION",
     "DEFAULT_ANALYTICS_WINDOW_DAYS",
     "MAX_ANALYTICS_RANGE_DAYS",
     "PRODUCTIVITY_SCORE_LABEL",
@@ -124,6 +125,16 @@ SCORE_DISCLAIMER = (
     "A NEXUS-derived metric computed from your own recorded activity. "
     "It is not a scientific or clinical measure."
 )
+
+#: The version stamped on a task feature vector. A single string rather than an
+#: enum because this is the *contract* with whatever trains on it, and it is the
+#: same shape as ``FEATURE_SCHEMA_VERSION`` in :mod:`app.schemas.developer`
+#: (``developer_features.v1``) and the ``career``/``learning`` equivalents: a v2
+#: must not be able to typecheck against v1 column meanings. A training row that
+#: carries no such key cannot be attributed to the extraction that produced it,
+#: and a column whose meaning changed between two extraction runs is
+#: indistinguishable from a feature that moved.
+ANALYTICS_FEATURE_SCHEMA_VERSION = "analytics_features.v1"
 
 
 def percent_change(current: float | None, previous: float | None) -> float | None:
@@ -401,16 +412,57 @@ class EstimationAccuracyRead(BaseModel):
 
     @model_validator(mode="after")
     def _sync_aliases(self) -> Self:
-        self.mean_absolute_error = self.absolute_error or self.mean_absolute_error
-        self.absolute_error = self.absolute_error or self.mean_absolute_error
-        self.mean_percentage_error = self.percentage_error or self.mean_percentage_error
-        self.percentage_error = self.percentage_error or self.mean_percentage_error
-        self.pairs_compared = self.sample_count or self.pairs_compared
-        self.sample_count = self.sample_count or self.pairs_compared
-        self.underestimation_rate = self.under_estimation_rate or self.underestimation_rate
-        self.under_estimation_rate = self.under_estimation_rate or self.underestimation_rate
-        self.overestimation_rate = self.over_estimation_rate or self.overestimation_rate
-        self.over_estimation_rate = self.overestimation_rate or self.overestimation_rate
+        """Make each alias agree with its twin, keeping a measured zero.
+
+        An explicit ``is None`` test rather than ``or``: ``or`` cannot tell a
+        measured ``0.0`` — "the estimates were exactly right", which is a real and
+        interesting observation — from an absent one, so it would replace a
+        genuine zero with ``None`` and turn an observation into an absence. Each
+        line only fills in a value that is genuinely missing, so the two
+        spellings end up agreeing whichever one the caller set.
+        """
+        self.mean_absolute_error = (
+            self.absolute_error if self.absolute_error is not None else self.mean_absolute_error
+        )
+        self.absolute_error = (
+            self.absolute_error if self.absolute_error is not None else self.mean_absolute_error
+        )
+        self.mean_percentage_error = (
+            self.percentage_error
+            if self.percentage_error is not None
+            else self.mean_percentage_error
+        )
+        self.percentage_error = (
+            self.percentage_error
+            if self.percentage_error is not None
+            else self.mean_percentage_error
+        )
+        self.pairs_compared = (
+            self.sample_count if self.sample_count is not None else self.pairs_compared
+        )
+        self.sample_count = (
+            self.sample_count if self.sample_count is not None else self.pairs_compared
+        )
+        self.underestimation_rate = (
+            self.under_estimation_rate
+            if self.under_estimation_rate is not None
+            else self.underestimation_rate
+        )
+        self.under_estimation_rate = (
+            self.under_estimation_rate
+            if self.under_estimation_rate is not None
+            else self.underestimation_rate
+        )
+        self.overestimation_rate = (
+            self.over_estimation_rate
+            if self.over_estimation_rate is not None
+            else self.overestimation_rate
+        )
+        self.over_estimation_rate = (
+            self.over_estimation_rate
+            if self.over_estimation_rate is not None
+            else self.overestimation_rate
+        )
         return self
 
 
@@ -586,6 +638,12 @@ class TaskAnalyticsRead(BaseModel):
     reason_if_unavailable: str | None = None
     estimation: EstimationAccuracyRead | None = None
     top_overdue: list[OverdueTaskRead] = Field(default_factory=list)
+    top_overdue_truncated: bool = Field(
+        default=False,
+        description="True when `top_overdue` carries the most overdue open tasks and "
+        "there were more of them than the list holds. Without it a capped list "
+        "reads as 'these are all of them'.",
+    )
     by_status: dict[str, int] = Field(default_factory=dict)
     by_priority: dict[str, int] = Field(default_factory=dict)
     range: MetricRange | None = None

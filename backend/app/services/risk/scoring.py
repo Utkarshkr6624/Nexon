@@ -761,6 +761,26 @@ PROJECT_OVERDUE_SATURATION = 10
 PROJECT_BLOCKED_SATURATION = 5
 #: Remaining task count that saturates its share.
 PROJECT_REMAINING_SATURATION = 20
+#: Remaining task count **below which unfinished work is not a signal at all**.
+#:
+#: The floor is what makes this sub-signal honest, and it is the whole difference
+#: between a size indicator and a risk. Unfinished work is the *normal* state of
+#: an active project: a project created this morning holds two open tasks, they
+#: are both on time, and nothing about them is wrong. Measuring ``n / 20`` from
+#: zero said otherwise, and the weight of 0.10 could not absorb it — two tasks is
+#: ``0.10 x 2/20 x 100 = 1`` point, which rounds to an integer and is stored, so
+#: *every* project with two or more open tasks became a ``low`` risk describing
+#: "2 task(s) are unfinished". A brand-new healthy project was flagged at risk by
+#: arithmetic alone.
+#:
+#: Ten is the count at which the outstanding work stops being the size of a plan
+#: and starts being a backlog, and it is deliberately half the saturation count:
+#: from ten to twenty each further task is worth exactly one point, so the signal
+#: earns its row gradually instead of appearing out of nowhere. Above the floor
+#: nothing about the shape changes — the sub-signal is still linear to
+#: :data:`PROJECT_REMAINING_SATURATION` — so this is a deadband at the bottom,
+#: not a different formula.
+PROJECT_REMAINING_FLOOR = 10
 
 
 def project_risk(
@@ -781,7 +801,7 @@ def project_risk(
         blocked   = min(1, blocked_tasks / 5)
         deadline  = 1.0 if <= 7d and work remains else 0.7 if <= 14d else 0.4 if <= 30d else 0
         velocity  = (required - recent) / required, when both are known
-        remaining = min(1, remaining_tasks / 20)
+        remaining = 0 if remaining_tasks <= 10 else min(1, (remaining_tasks - 10) / 10)
 
         score = round(100 * (0.30*overdue + 0.25*blocked + 0.20*deadline
                              + 0.15*velocity + 0.10*remaining))
@@ -792,6 +812,25 @@ def project_risk(
     Velocity is weighted lowest among the "pressure" signals because it needs
     two periods of history to compute and is therefore the signal most likely to
     be missing.
+
+    **The remaining-work signal starts above zero.** It is the one sub-signal
+    whose input is a size rather than a fault: two open tasks in a project
+    created this morning are two tasks on time, and the count of them says
+    nothing is wrong. A share measured from zero cannot express that, because it
+    reads the normal state of an active project as a fraction of one — and at a
+    weight of 0.10 each task is worth half a point, so two tasks rounded to a
+    stored score of 1 and *every* project holding two or more open tasks became a
+    ``low`` risk whose entire description was "2 task(s) are unfinished". That
+    is a false positive built out of arithmetic: inside a training matrix it is
+    worse than a missing risk, because it attaches the label "this account is at
+    risk" to a healthy account.
+    :data:`PROJECT_REMAINING_FLOOR` is the statement that unfinished work is not
+    evidence of anything until there is enough of it to be a backlog. Below the
+    floor the sub-signal is **absent** rather than small, which is the
+    difference the whole scoring module is built on: an absence of measurement
+    (``None``/no signal) and a measurement of nothing (``0``) must never be
+    confused, and a deadband that reported "0.1 of a signal" for two tasks would
+    have done exactly that.
 
     Every sub-signal that contributed at least a point appears as its own
     evidence line, so the breakdown in the UI is this list rather than a
@@ -882,7 +921,16 @@ def project_risk(
                 )
             )
 
-    remaining = _share(remaining_tasks, PROJECT_REMAINING_SATURATION)
+    # Deadband first, then the same linear ramp: `n <= FLOOR` contributes nothing
+    # at all, and above the floor each further task is worth
+    # `0.10 * 100 / (SATURATION - FLOOR)` points, reaching the full weight at the
+    # saturation count. Written rather than folded into `_share` so that the zero
+    # below the floor reads as "this sub-signal is absent", not as "this
+    # sub-signal measured nothing wrong".
+    remaining = _share(
+        max(0, remaining_tasks - PROJECT_REMAINING_FLOOR),
+        PROJECT_REMAINING_SATURATION - PROJECT_REMAINING_FLOOR,
+    )
     if remaining:
         signals["remaining"] = remaining
         evidence.append(

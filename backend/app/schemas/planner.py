@@ -249,21 +249,33 @@ class WorkSessionCreate(_WindowChecker, BaseModel):
 class WorkSessionUpdate(BaseModel):
     """Partial update of a work session.
 
-    ``actual_minutes`` is writable because stopping a timer is the moment the
-    elapsed figure is decided, and the session is the only place that decision
-    can be recorded. ``status`` is writable here too, unlike a task's: a
-    session has no lifecycle rules that a blanket write could bypass — starting
-    and stopping are routed, but cancelling a slot is an ordinary edit.
+    ``actual_start``, ``actual_end`` and ``actual_minutes`` are **not fields**,
+    and that is the fix rather than an omission. They used to be declared here
+    and dropped by the service, so ``PATCH {"actual_minutes": 600}`` answered
+    200 and changed nothing — a write the caller was told had happened, which
+    is the worst of the three options available (persist it, remove it, or
+    discard it silently).
+
+    They are **removed**, not persisted, because they are the product of the
+    routed ``POST /work-sessions/{id}/start`` and ``/stop`` pair and of nothing
+    else. Those two read the **database** clock, so the figure they write is a
+    measurement; a PATCH-supplied one would be an assertion, and every surface
+    that reports time to a user — the session card, the day totals, and the
+    analytics Phase 10 will train on — reads these same three columns. The
+    contract is now enforced at the edge: ``extra="forbid"`` turns the old
+    request into a **422 naming the field**, which is a loud, actionable answer
+    rather than a lie.
+
+    ``status`` is writable here, unlike a task's: a session has no lifecycle
+    rules that a blanket write could bypass — starting and stopping are routed
+    because the clock is involved, but cancelling a slot is an ordinary edit.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     scheduled_start: Instant | None = None
     scheduled_end: Instant | None = None
-    actual_start: Instant | None = None
-    actual_end: Instant | None = None
     estimated_minutes: NonNegativeMinutes | None = None
-    actual_minutes: NonNegativeMinutes | None = None
     status: WorkSessionStatus | None = None
     task_id: UUID | None = None
     project_id: UUID | None = None
@@ -276,12 +288,6 @@ class WorkSessionUpdate(BaseModel):
             and self.scheduled_end <= self.scheduled_start
         ):
             raise ValueError("scheduled_end must be after scheduled_start.")
-        if (
-            self.actual_start is not None
-            and self.actual_end is not None
-            and self.actual_end < self.actual_start
-        ):
-            raise ValueError("actual_end must not be before actual_start.")
         return self
 
 
@@ -508,10 +514,24 @@ class Conflict(BaseModel):
 
 
 class ConflictList(BaseModel):
-    """Every conflict found over a span, in the order they were detected."""
+    """Every conflict found over a span, in the order they were detected.
+
+    ``truncated`` and ``truncated_reasons`` exist because the scan is bounded:
+    overlap detection is pairwise, so the conflicts a span can produce grow with
+    the square of the rows in it, and a cap that was not reported would be a
+    response indistinguishable from a complete one. ``meta.total`` is the number
+    of conflicts **returned**, and with ``truncated`` set it is a floor on the
+    number that exist rather than a count of them.
+    """
 
     window: PlannerWindow
     conflicts: list[Conflict] = Field(default_factory=list)
+    truncated: bool = Field(
+        default=False, description="True when the scan stopped before covering the whole span."
+    )
+    truncated_reasons: list[str] = Field(
+        default_factory=list, description="Why the scan is incomplete; empty when it is not."
+    )
     meta: PageMeta = Field(
         default_factory=lambda: PageMeta(total=0, limit=MAX_PAGE_LIMIT, offset=0)
     )

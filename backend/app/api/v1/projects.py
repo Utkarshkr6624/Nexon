@@ -30,10 +30,21 @@ The lifecycle has its own endpoints rather than a status field
 posting one is a 422 naming the field rather than a silent drop. That is not
 fussiness: reaching ``completed`` stamps a timestamp and writes an event, and a
 blanket PATCH able to set the column would let a client create a project that
-claims to be finished and carries no evidence of finishing. ``/complete``,
-``/archive`` and ``/restore`` are the only doors, and they are also the only
-places the legal transitions are enforced — a ``planned`` project goes through
-``active``, and ``archived`` is terminal except through ``/restore``.
+claims to be finished and carries no evidence of finishing. ``/activate``,
+``/complete``, ``/hold``, ``/resume``, ``/archive`` and ``/restore`` are the only
+doors, and they are also the only places the legal transitions are enforced — a
+``planned`` project goes through ``active``, and ``archived`` is terminal
+except through ``/restore``.
+
+**Every edge of the legality table has a route here.** That is not a detail: an
+edge no endpoint can walk is a description rather than a rule. ``ON_HOLD`` was
+listed in the service since the first commit and was reached by nothing, so
+``ProjectStats.on_hold`` read a hard zero for every account — a number
+indistinguishable from a user who never pauses a project. And ``COMPLETED`` is
+only legal *from* ``ACTIVE``, so without ``/activate`` the completion endpoint
+was unreachable for every project that had not been archived and restored first.
+A state nothing can enter is not a feature; it is a metric that always reads
+zero.
 
 Pagination
 ----------
@@ -274,6 +285,23 @@ async def delete_project(
     NULL``, so the record of what happened inside a deleted project outlives it
     with a null reference, which is more useful than a hole in the feed.
 
+    **But tracked time does go, and this route does not say so.** The tasks that
+    cascade carry the Phase 4 rows with them (``work_sessions`` and
+    ``calendar_events`` both point at ``tasks.id`` with ``ON DELETE CASCADE``,
+    ``app/models/planner.py:149-151`` and ``:272-280``), and both tables also
+    cascade on ``project_id`` directly. So this one call removes **every minute
+    the user actually spent in the project and every calendar entry reserved for
+    it** — silently, and irreversibly. The analytics that read those rows then
+    report fewer hours, which looks exactly like working less.
+
+    The advice, which is the reason this paragraph exists: **archive rather than
+    delete.** A held or archived project keeps its sessions, its bookings and its
+    history, and analytics stop counting it as active work while its minutes stay
+    on the record. Recommend to the owner that the destructive path be made
+    opt-in — a confirmation naming the task count and the minutes about to be
+    destroyed — rather than that the cascade be removed, which would leave
+    sessions pointing at a project nobody can name.
+
     Errors: 404 for a project that is not the caller's, or that does not exist.
     """
     project = await projects.get(project_id=project_id, owner=current_user)
@@ -310,6 +338,91 @@ async def complete_project(
     return await projects.set_status(
         project=project, status=ProjectStatus.COMPLETED.value, owner=current_user
     )
+
+
+@router.post(
+    "/{project_id}/activate",
+    response_model=ProjectRead,
+    summary="Move a planned project into the working set",
+    dependencies=[Depends(require_permission(Permission.PROJECTS_WRITE))],
+)
+async def activate_project(
+    project_id: UUID,
+    current_user: AuthenticatedUser,
+    projects: ProjectServiceDep,
+) -> Project:
+    """Start a project: ``planned`` to ``active``.
+
+    **The door that makes ``/complete`` reachable at all.** A project may only
+    be completed *from* ``active`` — work nobody started does not get to claim
+    it finished — so until a planned project had a way to start, a user who had
+    not archived and restored it first could never finish it, and the completion
+    endpoint answered 422 on every call. The edge was always in the service's
+    legality table; no route walked it.
+
+    Activating an already-active project is a no-op rather than an error, so a
+    retried click or a double-submitted form gets the project it asked for.
+
+    Errors: 422 for an illegal transition; 404 for a project that is not the
+    caller's.
+    """
+    project = await projects.get(project_id=project_id, owner=current_user)
+    return await projects.activate(project=project, owner=current_user)
+
+
+@router.post(
+    "/{project_id}/hold",
+    response_model=ProjectRead,
+    summary="Shelve a project",
+    dependencies=[Depends(require_permission(Permission.PROJECTS_WRITE))],
+)
+async def hold_project(
+    project_id: UUID,
+    current_user: AuthenticatedUser,
+    projects: ProjectServiceDep,
+) -> Project:
+    """Pause a project without archiving it.
+
+    **Not an archive.** The project stays in the working set with its tasks and
+    its window, and comes back through ``/resume``. Archiving hides it and
+    stamps ``archived_at``; holding does neither, which is the whole difference
+    and the reason the state is not redundant.
+
+    Completing a held project straight away is refused, because the point of
+    shelving is that the work paused.
+
+    Errors: 422 for an illegal transition (a completed or archived project
+    cannot be shelved); 404 for a project that is not the caller's.
+    """
+    project = await projects.get(project_id=project_id, owner=current_user)
+    return await projects.hold(project=project, owner=current_user)
+
+
+@router.post(
+    "/{project_id}/resume",
+    response_model=ProjectRead,
+    summary="Take a held project back into the working set",
+    dependencies=[Depends(require_permission(Permission.PROJECTS_WRITE))],
+)
+async def resume_project(
+    project_id: UUID,
+    current_user: AuthenticatedUser,
+    projects: ProjectServiceDep,
+) -> Project:
+    """Return a project on hold to ``active``.
+
+    The one way out of a hold that is not an archive. Resuming anything that is
+    not on hold is a no-op, for the same reason every other idempotent write
+    here is one.
+
+    It lands on ``active`` rather than on whatever the project held before it
+    was shelved: there is no column recording that, the same lossy answer
+    ``/restore`` gives and the same service-level trade behind it.
+
+    Errors: 404 for a project that is not the caller's.
+    """
+    project = await projects.get(project_id=project_id, owner=current_user)
+    return await projects.resume(project=project, owner=current_user)
 
 
 @router.post(

@@ -65,6 +65,31 @@ being filed under another account's project, and :meth:`TaskService.create` is
 where that is stopped. And a tag id is *not* authorisation of anything: tags are
 per-user rows, so every tag this module acts on is resolved through
 ``get_by_id_for_user`` before it is written.
+
+Subtask linkage
+---------------
+``tasks.parent_id`` and ``tasks.project_id`` are two independent foreign keys,
+and the schema cannot keep them consistent with each other: a subtask may name a
+parent in project ``P1`` while the subtask's own row says ``P2``. Nothing about
+such a row is *invalid* — both columns hold real ids — so it commits, it is
+served from P2's board, and it is only discovered when somebody deletes P1. That
+delete takes P1's own tasks with it, the parent card among them, and the parent
+card's deletion then cascades through ``tasks.parent_id`` to the subtask that now
+lives in P2. An ordinary edit would have destroyed a task that was, until that
+moment, on a live board.
+
+So the linkage is a rule of this module rather than a hope about the schema:
+
+* a subtask's project **is** its parent's project, and :meth:`update` refuses a
+  move that would separate the two (see :data:`_SUBTASK_PROJECT_MOVE`);
+* the tree is one level deep, in **both** directions: a parent must be a root
+  card *and* a task that already has children must stay a root card
+  (see :data:`_MAX_SUBTASK_DEPTH`).
+
+Both refusals are 422s naming the reason. Moving the offending parent instead
+would be the alternative, and it is deliberately rejected: a user who renames a
+card must never come back to find their card, their board and their backlog
+rearranged by an edit they did not make.
 """
 
 from __future__ import annotations
@@ -75,6 +100,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import Settings, get_settings
@@ -110,6 +136,17 @@ DEFAULT_PAGE_SIZE = 50
 #: blocking records why. :class:`~app.schemas.task.TaskUpdate` deliberately has
 #: no ``status`` field, so :meth:`TaskService.set_status` is the only door, and
 #: this table is the whole of what it will open onto.
+#:
+#: **Every edge below is reachable over HTTP, and that is a property of the
+#: router rather than of the table.** A legality table an endpoint cannot walk
+#: is a description of an intent, not a rule: ``TODO``/``IN_PROGRESS``/
+#: ``BLOCKED`` all listing ``CANCELLED`` meant nothing at all while
+#: ``app/api/v1/tasks.py`` offered only ``/start``, ``/complete``, ``/reopen``
+#: and ``/block``. ``TaskStats.cancelled`` then read a hard zero for every
+#: account in the repository, which is indistinguishable from a user who never
+#: abandons work — the same false signal that once sat on every completion
+#: metric when ``/start`` was missing. ``POST /tasks/{id}/cancel`` is the door
+#: that edge now has; :meth:`TaskService.cancel` is its mouth.
 #:
 #: * ``TODO`` may start, be blocked, or be cancelled. It cannot be *completed*
 #:   directly: work nobody started does not get to claim it was finished. It has
@@ -197,6 +234,28 @@ _PROJECT_NOT_FOUND = "Project not found."
 _TAG_NOT_FOUND = "Tag not found."
 _SELF_DEPENDENCY = "A task cannot depend on itself."
 
+#: Why a subtask may not be filed under a different project than its parent.
+#:
+#: Written for the person who pressed save, because they are the one who can
+#: still do something about it, and because the alternative — silently moving the
+#: parent to the destination project as well — would take a card they did not
+#: touch off a board they still look at. The sentence names the way out that
+#: actually exists on this API rather than one that sounds nicer.
+_SUBTASK_PROJECT_MOVE = (
+    "A subtask cannot be moved to another project on its own, because its parent "
+    "would stay behind on the old one. Detach it from its parent first, then move it."
+)
+
+#: Why a task that already has children may not become a child itself.
+#:
+#: The same rule as the nesting refusal in :func:`_check_parent`, seen from the
+#: other end of the edge. Between them they make the tree one level deep: a task
+#: may not be a parent of a task that is also a parent.
+_PARENT_WITH_SUBTASKS_CANNOT_NEST = (
+    "This task already has subtasks of its own, so it cannot become a subtask "
+    "itself; nesting is limited to one level."
+)
+
 #: How deep a subtask tree may go: exactly one level.
 #:
 #: A subtask's parent must itself be a root card. Two levels is where the cost
@@ -205,6 +264,14 @@ _SELF_DEPENDENCY = "A task cannot depend on itself."
 #: parent's progress would have to decide what a grandchild means. A rule the UI
 #: cannot render is a rule enforced here rather than left to the client, and the
 #: error names the reason so the caller is not left guessing.
+#:
+#: **The rule has two directions, and :func:`_check_parent` only covers one of
+#: them.** Refusing a *parent* that is itself a subtask prevents a grandchild
+#: being created; it says nothing about the child that is *being moved*, which
+#: may already have children of its own. ``PATCH`` with a ``parent_id`` on such a
+#: task therefore produced ``C -> A -> B`` — a depth the board cannot render and
+#: every roll-up would have to special-case. :meth:`TaskService.update` closes it
+#: with :data:`_PARENT_WITH_SUBTASKS_CANNOT_NEST`.
 _MAX_SUBTASK_DEPTH = 1
 
 
@@ -345,6 +412,66 @@ class TaskService:
             raise NotFoundError(_TASK_NOT_FOUND)
         return task
 
+    async def get_read(self, *, task_id: uuid.UUID, owner: User) -> TaskRead:
+        """Resolve one of the caller's tasks **as the listing renders it**.
+
+        :meth:`get` hands back the ORM row, and a row carries neither the task's
+        tags nor whether it is waiting on unfinished work. Serialising that row
+        through :class:`~app.schemas.task.TaskRead` fills those two fields with
+        the schema's defaults — ``tag_ids: []`` and
+        ``has_blocked_dependencies: false`` — which are honest for a task with
+        no tags that is genuinely unblocked and false for everything else.
+        ``GET /tasks/{id}`` printed that false while ``GET /tasks`` reported
+        ``true`` for the *same row in the same request*, so a client could not
+        tell which endpoint it believed.
+
+        This closes it at the only place that can: it runs the same two lookups
+        :meth:`_page` runs, for one row instead of a page. The cost is one tag
+        query and one dependency query, which is what a single-card fetch is
+        worth.
+
+        Args:
+            task_id: The task to fetch.
+            owner: The authenticated caller.
+
+        Returns:
+            The task, assembled the same way a page of them is.
+
+        Raises:
+            NotFoundError: If the caller owns no task with this id.
+        """
+        return await self.read(task=await self.get(task_id=task_id, owner=owner), owner=owner)
+
+    async def read(self, *, task: Task, owner: User) -> TaskRead:
+        """Assemble one already-resolved task into a :class:`TaskRead`.
+
+        The single-row counterpart of :meth:`_page`, and it exists so that every
+        route answering with a single task — the fetch, the detail PATCH, every
+        transition — produces the same object the listing produces. A mutation
+        returns what it changed, and a client that re-reads the card afterwards
+        must not see a different ``has_blocked_dependencies`` than the one it
+        was just handed.
+
+        Args:
+            task: The task, already resolved for this owner.
+            owner: The authenticated caller.
+
+        Returns:
+            The task with its tag ids, its blocked flag and a UTC-day overdue
+            flag taken from the database clock.
+
+        Raises:
+            NotFoundError: If the row does not belong to the caller.
+        """
+        self._owned(task, owner)
+        today = await self._today()
+        return TaskRead.build(
+            task,
+            tag_ids=await self._tag_ids(task),
+            has_blocked_dependencies=await self._has_open_dependencies(task.id, owner),
+            today=today,
+        )
+
     async def list(
         self,
         *,
@@ -483,6 +610,23 @@ class TaskService:
           PATCH that moves one of them has to be checked against the stored
           other.
 
+        A fourth is not a property of the payload at all, which is why it does not
+        fit that list: **a subtask's project is its parent's project**, and it
+        stays that way. A PATCH that moves a subtask to a project its parent is
+        not in is refused with :data:`_SUBTASK_PROJECT_MOVE`, because the row it
+        would write is valid in isolation and the next ``DELETE`` of the project
+        it left destroys it through its parent's cascade — see this module's
+        docstring. The mirror rule holds for depth: naming a parent for a task
+        that already has subtasks is refused with
+        :data:`_PARENT_WITH_SUBTASKS_CANNOT_NEST`, because :func:`_check_parent`
+        only inspects the *proposed* parent and not what the task being moved
+        already parents.
+
+        Both refusals are conditional on the PATCH *changing* the stored linkage.
+        Sending the ``parent_id`` a task already has is a no-op, and making a
+        client re-send a field it merely echoed would refuse an edit that had
+        nothing to do with the subtask tree.
+
         Status is not writable here and not present on the schema; ``position``
         is likewise absent. See :data:`_UPDATABLE_FIELDS`.
 
@@ -498,8 +642,11 @@ class TaskService:
         Raises:
             NotFoundError: If the row, the destination project or the new parent
                 is not the caller's.
-            ValidationError: If the resulting window ends before it starts, or
-                the new parent is in another project or is itself a subtask.
+            ValidationError: If the resulting window ends before it starts, the
+                new parent is in another project or is itself a subtask, the
+                task is itself a subtask and is being moved to a project its
+                parent is not in, or the task already has subtasks and is being
+                made one.
         """
         self._owned(task, owner)
         sent = data.model_dump(exclude_unset=True)
@@ -511,20 +658,65 @@ class TaskService:
             )
             if destination is None:
                 raise NotFoundError(_PROJECT_NOT_FOUND)
-            if destination.id != task.project_id and await self.repository.count_subtasks(task.id):
-                # The repository cannot know this: whether a task has children is
-                # a relationship, and moving the parent out from under them would
-                # leave rows whose ``parent_id`` points into another project —
-                # the exact condition ``_check_parent`` refuses to create and one
-                # PATCH must not be able to produce behind its back.
-                raise ValidationError(
-                    "Move or delete this task's subtasks before moving the task itself."
-                )
+            if destination.id != task.project_id:
+                if await self.repository.count_subtasks(task.id):
+                    # The repository cannot know this: whether a task has children
+                    # is a relationship, and moving the parent out from under them
+                    # would leave rows whose ``parent_id`` points into another
+                    # project — the exact condition ``_check_parent`` refuses to
+                    # create and one PATCH must not be able to produce behind its
+                    # back.
+                    raise ValidationError(
+                        "Move or delete this task's subtasks before moving the task itself."
+                    )
+                if task.parent_id is not None and "parent_id" not in fields:
+                    # The other direction of the same broken linkage, and the one
+                    # that *destroys* rather than merely renders oddly. This task is
+                    # somebody's subtask, so moving it would leave ``parent_id``
+                    # naming a card in the project it just left. Nothing downstream
+                    # objects: the row is perfectly valid, it renders on the new
+                    # board, and it disappears the first time anybody deletes the
+                    # old project — that delete removes the old parent card, whose
+                    # own ``ON DELETE CASCADE`` on ``tasks.parent_id`` then takes a
+                    # live task in the new project with it.
+                    #
+                    # Refused rather than repaired. Repairing would mean either
+                    # moving the parent (a user's rename would silently rearrange a
+                    # board) or clearing ``parent_id`` (an ordinary edit would
+                    # silently dissolve a parent/child relationship); both invent a
+                    # change the caller did not ask for, and one of them destroys
+                    # the other. Naming the parent would leak its id, so the
+                    # sentence names the operation instead.
+                    #
+                    # The exemption is deliberate and narrow: a PATCH that *also*
+                    # sets ``parent_id`` re-establishes the linkage inside the
+                    # destination project, and ``_check_parent`` below holds that
+                    # new parent to the destination. Sending ``parent_id: null``
+                    # detaches the task into a root card, which is consistent too.
+                    # Only a PATCH that keeps the old parent across a project
+                    # boundary is refused.
+                    raise ValidationError(_SUBTASK_PROJECT_MOVE)
             effective_project_id = destination.id
         if "parent_id" in fields and fields["parent_id"] is not None:
             parent = await self.repository.get_by_id_for_user(fields["parent_id"], owner.id)
             if parent is None:
                 raise NotFoundError(_TASK_NOT_FOUND)
+            # ``_check_parent`` looks *up* the new parent and refuses a parent
+            # that is itself a subtask, which is the only way a grandchild can be
+            # created by naming a parent. It cannot see the other end of the edge:
+            # that this task may already *be* a parent. Naming one here without
+            # this check writes ``C -> A -> B``, which is a depth the board cannot
+            # render and every progress roll-up would have to special-case.
+            subtasks = (
+                await self.repository.count_subtasks(task.id)
+                if fields["parent_id"] != task.parent_id
+                else 0
+            )
+            if subtasks:
+                raise ValidationError(
+                    _PARENT_WITH_SUBTASKS_CANNOT_NEST,
+                    details={"max_depth": _MAX_SUBTASK_DEPTH, "subtasks": subtasks},
+                )
             _check_parent(parent, project_id=effective_project_id, task=task)
         start_date = fields.get("start_date", task.start_date)
         due_date = fields.get("due_date", task.due_date)
@@ -732,6 +924,49 @@ class TaskService:
         """
         return await self.set_status(task=task, status=TaskStatus.BLOCKED, owner=owner, note=reason)
 
+    async def cancel(self, *, task: Task, owner: User, reason: str | None = None) -> Task:
+        """Cancel a task: work that is abandoned rather than finished.
+
+        The last open status in :data:`_LEGAL_TRANSITIONS`, and the reason
+        ``TaskStats.cancelled`` is a bucket rather than always zero. ``TODO``,
+        ``IN_PROGRESS`` and ``BLOCKED`` may all be cancelled; ``COMPLETED``
+        cannot, because the work happened and cancelling it would be erasing a
+        fact rather than recording one — a completed task that is no longer
+        wanted is deleted (:meth:`delete`), not relabelled.
+
+        Cancelling is **not** completing. ``completed_at`` is not stamped, and
+        the row does not stop satisfying a dependency, because
+        :data:`_SATISFIES_DEPENDENCY` deliberately refuses to count a dropped
+        prerequisite as a met one.
+
+        ``ActivityEvent`` has no ``TASK_CANCELLED`` member, and inventing one
+        here would put a value in a vocabulary shared with the analytics phase
+        on the say-so of the one service that wants it. The edge therefore rides
+        on ``TASK_UPDATED`` with ``from``/``to`` in the metadata — the same
+        accommodation :meth:`unschedule` and
+        :meth:`add_dependency` already make, for the same reason. Adding the
+        member belongs to whoever owns ``app.models.enums``. Flagged for review.
+
+        Args:
+            task: The task, already resolved for this owner.
+            owner: The authenticated caller.
+            reason: Optional context recorded on the resulting activity event.
+                Like a block reason, it rides on the event and never on the
+                card: "not doing this any more" is history, not a current fact
+                every client would read.
+
+        Returns:
+            The cancelled task.
+
+        Raises:
+            NotFoundError: If the row does not belong to the caller.
+            ValidationError: If the task's status may not be cancelled — a
+                completed task, or a cancelled one that has drifted.
+        """
+        return await self.set_status(
+            task=task, status=TaskStatus.CANCELLED, owner=owner, note=reason
+        )
+
     async def set_priority(self, *, task: Task, priority: str | TaskPriority, owner: User) -> Task:
         """Re-prioritise a task.
 
@@ -768,10 +1003,41 @@ class TaskService:
 
         A real delete rather than a status change: ``cancelled`` already exists
         for work that was abandoned, so a row only disappears when the user
-        asked for it to. Subtasks, dependency edges and tag edges cascade; the
-        activity rows do not — ``activity_events.task_id`` is ``ON DELETE SET
-        NULL``, so deleting a task does not erase the record of what happened to
-        it.
+        asked for it to.
+
+        **What cascades, and what does not.** In this module's own tables:
+        subtasks (via ``tasks.parent_id``), dependency edges both ways, and tag
+        edges. The activity rows do **not** go — ``activity_events.task_id`` is
+        ``ON DELETE SET NULL``, so deleting a task does not erase the record of
+        what happened to it; the join is dropped and the row survives.
+
+        **This is where tracked time is destroyed, silently.** The task id is
+        the foreign key on the two Phase 4 tables as well
+        (``app.models.planner.WorkSession.task_id`` and
+        ``CalendarEvent.task_id``, both ``ON DELETE CASCADE`` at
+        ``app/models/planner.py:149-151`` and ``:272-280``). Deleting a task
+        therefore takes with it every work session recorded against it — every
+        minute the user actually spent on it — and every calendar entry
+        reserved for it. Nothing warns them, nothing is soft-deleted, and the
+        history is not recoverable: the Phase 6 analytics that read those
+        minutes report a smaller total afterwards, which looks exactly like the
+        user working less.
+
+        That is a property of the schema, not a choice this module made, and
+        **the advice for an owner is therefore: cancel, do not delete.** A
+        cancelled task keeps its sessions, keeps its bookings, keeps reporting
+        ``cancelled`` in the stats, and can still be seen by an audit. This
+        method exists because a local-first product that cannot delete its own
+        data is lying to its user; the docstring on the route says the same
+        thing, so the consequence is visible at the boundary that causes it.
+        **Recommendation to the owner: leave the cascade alone and make the
+        destructive path opt-in** — a confirmation that names the sessions and
+        entries about to go, or a soft delete that hides the card while keeping
+        its time. Removing the cascade outright would orphan sessions pointing
+        at a task nobody can name, which is the shape ``work_sessions`` was
+        explicitly designed to avoid. See :meth:`ProjectService.delete
+        <app.services.project_service.ProjectService.delete>` for the same
+        cascade one level up.
 
         The id is captured before the delete because the object is no longer
         usable afterwards, and the event is written after it so a failed delete
@@ -1161,7 +1427,10 @@ class TaskService:
         Overdue is *strictly* behind today, matching the rule
         :class:`~app.schemas.task.TaskRead` derives client-side, so the badge a
         server-built response shows and the one a client builds from the same row
-        cannot disagree.
+        cannot disagree. **Both are measured against the same UTC day**, read
+        from the database by :meth:`_today` — not the host's local calendar,
+        which on a +05:30 box is a different day for five and a half hours and
+        makes this total disagree with the badges on the cards it is counting.
 
         Args:
             owner: The authenticated caller.
@@ -1170,7 +1439,7 @@ class TaskService:
             The counts.
         """
         counts = await self.repository.stats_for_user(owner.id)
-        cutoff = date.today() - timedelta(days=1)
+        cutoff = await self._today() - timedelta(days=1)
         overdue = 0
         for status in (TaskStatus.TODO, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED):
             _, bucket = await self.repository.list_for_user(
@@ -1188,6 +1457,30 @@ class TaskService:
         )
 
     # -- Internals -----------------------------------------------------------
+
+    async def _today(self) -> date:
+        """Return the current **UTC** day, read from the database.
+
+        Every stored timestamp in this schema is timezone-aware UTC — see
+        ``TimestampMixin`` — so "today" has to be the UTC day too. It is read
+        here with ``now()`` rather than in Python because the alternative is the
+        *host's* calendar, and on a host ahead of UTC (the development box runs
+        at +05:30) those disagree for five and a half hours a day. In that
+        window a task due today reports overdue while the ``created_at`` on the
+        very same row says yesterday, and ``TaskStats.overdue`` disagrees with
+        the badges on the cards it is counting.
+
+        One query per call, shared by :meth:`stats`, :meth:`_page` and
+        :meth:`read`, which is what makes those three describe the same day by
+        construction rather than by coincidence. Same seam as
+        :meth:`app.services.developer.service.DeveloperIntelligenceService._now`.
+        """
+        now = await self.repository.session.scalar(select(func.now()))
+        if now is None:  # pragma: no cover - ``now()`` is never null
+            return datetime.now(UTC).date()
+        if now.tzinfo is None:  # pragma: no cover - asyncpg returns aware UTC
+            return now.date()
+        return now.astimezone(UTC).date()
 
     async def _would_cycle(
         self, *, task_id: uuid.UUID, depends_on_id: uuid.UUID, owner_id: uuid.UUID
@@ -1291,18 +1584,26 @@ class TaskService:
         reports a blocked card as ready is wrong rather than slow, and the fix —
         a bulk ``blocked_task_ids(task_ids)`` on the repository — is a
         repository change rather than a service one. Flagged for review.
+
+        A third value is passed rather than derived: ``today``, from the
+        database clock (see :meth:`_today`), so every row on the page answers
+        "is this late?" against one instant and the same instant :meth:`stats`
+        cuts its overdue window on. :meth:`read` is this method for one row,
+        which is why the two agree on the same task in the same request.
         """
         task_ids = [row.id for row in rows]
         tags = await self.tag_repository.list_tags_for_tasks(task_ids)
         blocked = await asyncio.gather(
             *(self._has_open_dependencies(row.id, owner) for row in rows)
         )
+        today = await self._today()
         return Page[TaskRead](
             items=[
                 TaskRead.build(
                     row,
                     tag_ids=[tag.id for tag in tags.get(row.id, [])],
                     has_blocked_dependencies=is_waiting,
+                    today=today,
                 )
                 for row, is_waiting in zip(rows, blocked, strict=True)
             ],
@@ -1392,10 +1693,21 @@ def _check_parent(parent: Task, *, project_id: uuid.UUID, task: Task | None = No
     covers a ``parent_id`` the service is *moving* a task onto rather than
     creating it with.
 
+    **What this cannot see.** All three rules are about the proposed ``parent``
+    and about the edge above it. None of them knows whether ``task`` is *itself*
+    a parent, because that is a relationship and this function is synchronous —
+    the query lives in :meth:`TaskService.update`, which is why the depth rule
+    is stated in two places rather than one. Anything that reaches a grandchild
+    has to be checked by the caller.
+
     Args:
         parent: The proposed parent.
         project_id: The project the child will live in.
         task: The child, when it already exists and is being re-parented.
+
+    Raises:
+        ValidationError: If ``parent`` is ``task``, is in another project, or is
+            itself a subtask.
     """
     if task is not None and parent.id == task.id:
         raise ValidationError("A task cannot be its own parent.")

@@ -1402,7 +1402,7 @@ async def test_the_activity_series_zero_fills_every_day_in_the_window(
 async def test_the_feature_vector_is_null_not_zero_for_a_repository_with_no_commits(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
-    """A never-committed repository reports ``null`` age and ``null`` inactivity.
+    """A scanned-but-empty repository reports ``null`` age and ``null`` inactivity.
 
     Zero would assert "committed today", and inside a training matrix a fabricated
     zero is indistinguishable from an observed one once a later trainer has
@@ -1411,17 +1411,30 @@ async def test_the_feature_vector_is_null_not_zero_for_a_repository_with_no_comm
     question, and the two are asserted separately so the test cannot pass with the
     nullable values quietly coerced to 0.
 
-    The account-level row is the control. Repository B does have commits, so the
-    account row's age and inactivity are integers, and ``project_association`` is
-    false because neither repository was linked to a project. The vector is
-    stamped ``developer_features.v1`` because that string is the contract with
-    whatever trains on it later: a v2 must not be able to typecheck against v1's
-    column meanings.
+    The repository that counts as "empty" here is one that **was scanned** and
+    found nothing. A repository that was registered and never scanned is a
+    different fact — nobody has looked — and it is given no row at all rather
+    than a row of the same seven zeros, because a trainer reading that row would
+    conclude the developer committed nothing rather than that NEXUS never
+    measured. Both are asserted here: the scanned-and-empty repository keeps real
+    zeros, and the never-scanned one is absent.
+
+    The account-level row is the control. The third repository does have commits,
+    so the account row's age and inactivity are integers, and
+    ``project_association`` is false because no repository was linked to a
+    project. The vector is stamped ``developer_features.v1`` because that string
+    is the contract with whatever trains on it later: a v2 must not be able to
+    typecheck against v1's column meanings.
 
     Nothing here is a model. No prediction, no probability, no fitted parameter.
     """
     owner = await _owner(db_session)
-    service, empty_id = await _registered_repository(db_session, tmp_path, owner, name="never-used")
+    service, unscanned_id = await _registered_repository(
+        db_session, tmp_path, owner, name="never-scanned"
+    )
+    empty_repo = _init(tmp_path, "scanned-and-empty")
+    empty = await service.register_repository(owner=owner, local_path=str(empty_repo))
+    await service.scan_repository(owner=owner, repository_id=empty.id)
     used_repo = _init(tmp_path, "with-history")
     used = await service.register_repository(owner=owner, local_path=str(used_repo))
     now = await _db_now(db_session)
@@ -1434,9 +1447,13 @@ async def test_the_feature_vector_is_null_not_zero_for_a_repository_with_no_comm
     assert vector.window_days == WINDOW
     assert vector.generated_at is not None
     by_id = {row.repository_id: row for row in vector.repositories}
-    assert set(by_id) == {uuid.UUID(empty_id), used.id}
+    assert set(by_id) == {empty.id, used.id}
+    assert uuid.UUID(unscanned_id) not in by_id, (
+        "a repository nobody has scanned has no figures, and a row of zeros for "
+        "it would be a claim about the developer rather than about the scan"
+    )
 
-    silent = by_id[uuid.UUID(empty_id)]
+    silent = by_id[empty.id]
     assert silent.commits_last_7d == 0
     assert silent.commits_last_30d == 0
     assert silent.active_days_7d == 0

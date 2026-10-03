@@ -31,7 +31,12 @@ computed becomes ``available=False`` with a reason and a null ``value``; a
 repository with no commits gets ``repository_age_days = None`` rather than 0,
 because 0 would assert it was created today. Both directions matter, and the
 second one is inside a feature vector where a fabricated zero is
-indistinguishable from an observed one once it reaches a trainer.
+indistinguishable from an observed one once it reaches a trainer. The sharpest
+case is a repository that has **never been scanned**: publishing a row of zeros
+for it would tell a model "this developer committed nothing", when the truth is
+"we have not looked". The feature vector omits those repositories entirely
+(:func:`_has_measurement`) — the schema has no ``available`` column to mark them
+with, and a row that exists is a row that was measured.
 
 Why the event feed is written this way
 --------------------------------------
@@ -61,7 +66,7 @@ than an oversight; see :data:`_UNRECORDED_FILE_PATH`.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
@@ -71,7 +76,7 @@ from sqlalchemy import func, select
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
-from app.models.developer import GitRepository
+from app.models.developer import GitCommit, GitRepository
 from app.models.enums import ActivityEvent, GitScanStatus
 from app.repositories.developer import DeveloperRepository
 from app.repositories.project import ProjectRepository
@@ -115,6 +120,10 @@ from app.services.developer.metrics import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from app.models.user import User
 
 __all__ = ["DeveloperIntelligenceService"]
@@ -138,13 +147,6 @@ _MAX_COMMIT_EVENTS = 20
 #: How many ``BRANCH_CREATED`` / ``BRANCH_CHANGED`` rows one scan may append.
 #: Repositories with more branches than this have a branch listing, not a feed.
 _MAX_BRANCH_EVENTS = 20
-#: How many repositories the branch-growth metric is resolved for on an
-#: account-wide read. Branch first-seen is per repository (two repositories both
-#: having ``main`` is one group, not two), and resolving it for every repository
-#: an account owns would put one query per repository in front of every metrics
-#: request. Repositories past this point are left out and the metric under-counts
-#: rather than inventing a branch.
-_MAX_GROWTH_REPOSITORIES = 20
 #: The window a repository's own history is projected over when the feature
 #: vector is extracted: 7 and 30 days are the schema's fixed column names and are
 #: not derived from the requested window.
@@ -313,7 +315,7 @@ class DeveloperIntelligenceService:
         try:
             resolved = validate_repository_path(
                 local_path,
-                allowlist=parse_path_allowlist(self.settings.developer_path_allowlist) or None,
+                allowlist=self._path_allowlist(),
             )
         except GitRepositoryError as error:
             raise ValidationError(str(error)) from error
@@ -518,7 +520,21 @@ class DeveloperIntelligenceService:
 
         The write is incremental: ``since`` is the repository's stored
         ``latest_commit_at``, so a re-scan of an unchanged repository transfers
-        nothing and reports ``commits_added=0``.
+        nothing and reports ``commits_added=0``. That high-water mark is also why
+        :data:`~app.services.developer.git.MAX_COMMITS_PER_SCAN` truncates a
+        repository's history permanently rather than a scan at a time — the
+        commits past the ceiling are older than the mark, so nothing asks for
+        them again.
+
+        **The configured allowlist is enforced on the scan, not only at
+        registration.** The path scanned here is a *stored* path read back days
+        later, and a stored string is not a promise about what the path resolves
+        to today: delete the registered directory and put a symlink in its place
+        and the same string now resolves somewhere else entirely. Registration
+        proved the path was permitted on the day it was written; only a check
+        against the path as it resolves now proves it is still permitted. The
+        refusal is a sentence that becomes an ``error`` scan run, like any other
+        unreadable repository — never a traceback.
 
         Args:
             owner: The caller. Also the owner recorded on every commit, branch,
@@ -543,6 +559,7 @@ class DeveloperIntelligenceService:
                 repository.local_path,
                 since=None if full else _as_utc(repository.latest_commit_at),
                 limit=self.settings.developer_max_commits_per_scan,
+                allowlist=self._path_allowlist(),
             )
         except (GitError, OSError) as exc:
             return await self._failed_scan(
@@ -1173,6 +1190,21 @@ class DeveloperIntelligenceService:
         training matrix a fabricated zero is indistinguishable from an observed
         one.
 
+        **A repository that has never been successfully scanned has no row at
+        all** — see :func:`_has_measurement`. Publishing seven zeros for it would
+        claim "this repository recorded no commits in the last seven days", which
+        is not what happened: nobody has looked. A row that exists means the scan
+        ran and found nothing, which is a real measurement; a row that is absent
+        means there is no measurement, which is what the schema has no column to
+        say. A scanned-and-empty repository keeps its row and its real zeros, so
+        the ``available`` semantics of ``/learning``-style surfaces survive here
+        in the only form this schema can express them.
+
+        The account-level row aggregates the recorded commits and nothing else, so
+        it says what the *record* contains rather than what the account did; an
+        unscanned repository contributes no commits to it, exactly as a directory
+        NEXUS has never been pointed at contributes nothing.
+
         Two reads serve the whole vector: one flat projection of the account's
         recorded commits, which yields every per-repository figure as well as
         the account's, and one exact aggregate for the account's own commit
@@ -1203,6 +1235,11 @@ class DeveloperIntelligenceService:
 
         per_repository: list[RepositoryFeatureVectorRead] = []
         for repository in repositories:
+            if not _has_measurement(repository):
+                # Absent, not zeroed. See the docstring: an unscanned repository
+                # has no figures, and a row of zeros would be a claim about a
+                # repository nobody has read.
+                continue
             scoped = [sample for sample in samples if sample.repository_id == str(repository.id)]
             values = _feature_values(
                 scoped,
@@ -1241,6 +1278,15 @@ class DeveloperIntelligenceService:
         list them without a second request and cannot show a total that
         disagrees with the rows beneath it.
 
+        The history figures come from **one grouped statement covering every
+        repository in the project**, not one aggregate per repository. A project
+        with fifteen repositories is a page a user opens, and issuing sixteen
+        round trips to render it is the shape of a screen that gets slower the
+        more work somebody does. The grouped read is the same arithmetic — the
+        per-repository counts summed, the per-repository latest instants folded
+        into one maximum — so nothing about the answer changed, only how many
+        trips it takes to reach it.
+
         Args:
             owner: The caller.
             project_id: The project to describe. Another account's is a 404.
@@ -1262,12 +1308,11 @@ class DeveloperIntelligenceService:
             owner.id, project_id=project_id, limit=_OWNERSHIP_PAGE_SIZE
         )
         identifiers = {row.id for row in repositories}
-        history_total = 0
-        latest: datetime | None = None
-        for row in repositories:
-            totals = await self.repositories.commit_totals(owner.id, repository_id=row.id)
-            history_total += totals.commits
-            latest = _latest(latest, totals.latest_committed_at)
+        totals = await _commit_totals_by_repository(
+            self.repositories.session, owner_id=owner.id, repository_ids=identifiers
+        )
+        history_total = sum(count for count, _latest_at in totals.values())
+        latest = _max_optional(_latest_at for _count, _latest_at in totals.values())
 
         window_rows = await self.repositories.commit_rows(
             owner.id, since=window_start, until=window_end
@@ -1316,6 +1361,32 @@ class DeveloperIntelligenceService:
             raise NotFoundError(_REPOSITORY_NOT_FOUND)
         return repository
 
+    def _path_allowlist(self) -> tuple[Path, ...] | None:
+        """The configured repository roots, or ``None`` when none are configured.
+
+        **The distinction between "not configured" and "configured to nothing" is
+        the whole point of returning a tuple that may be empty.** ``or None`` — the
+        obvious one-liner — reads "the operator wrote an allowlist, every entry in
+        it was unusable, therefore there is no allowlist" and hands the deployment
+        an open door because one of its settings values had a NUL byte in it.
+        :func:`~app.services.developer.git.validate_repository_path` treats a
+        configured-but-empty list as *permit nothing*, so the honest translation
+        of the setting is passed straight through, unfiltered.
+
+        Both registration and the scan path call this, which is what keeps a
+        registered repository inside the configured roots for as long as the row
+        exists — registration alone would only prove it about the path as it
+        resolved on the day it was written.
+
+        Returns:
+            The parsed roots, ``None`` only when the setting is blank, and an
+            empty tuple when the setting names roots that could not be parsed.
+        """
+        raw = self.settings.developer_path_allowlist
+        if not raw or not raw.strip():
+            return None
+        return parse_path_allowlist(raw)
+
     async def _known_branch_heads(
         self, owner_id: uuid.UUID, repository_id: uuid.UUID
     ) -> tuple[dict[str, str | None], bool]:
@@ -1347,10 +1418,31 @@ class DeveloperIntelligenceService:
         every branch that merely had a commit in the window as brand new and turn
         ``repository_growth`` into a restatement of ``commit_activity``.
 
-        Resolved per repository, because branch names are only unique inside one:
-        two repositories both having ``main`` is two branches, not one. That costs
-        one query per repository touched in the window, which is why the set is
-        bounded by :data:`_MAX_GROWTH_REPOSITORIES`.
+        Resolved **per repository**, because branch names are only unique inside
+        one: two repositories both having ``main`` is two branches, not one, and
+        grouping ``main`` across both would date the branch by whichever
+        repository happened to start it first — so a repository created last week
+        with its own ``main`` would report no growth at all.
+
+        The grouping happens in the database, in one statement, for every
+        repository at once. One query per repository was the obvious way to write
+        this and it made the statement count grow with the number of repositories
+        a user owns — including on the account-wide path, which is the one every
+        ``/learning``-style read of this service sits behind. Grouping by
+        ``(repository_id, branch)`` gives exactly the per-repository minima the
+        loop produced, so the metric's answer is unchanged and its cost is not.
+
+        Args:
+            owner_id: Whose branches to read.
+            samples: The commits in the window, from which the repositories to
+                resolve are taken when the call is not already scoped.
+            window_start: Inclusive start of the window.
+            window_end: Exclusive end of the window.
+            repository_id: One repository to resolve, or ``None`` for every
+                repository touched inside the window.
+
+        Returns:
+            The branch names first recorded inside the window, as a set.
         """
         scopes = (
             [repository_id]
@@ -1361,13 +1453,14 @@ class DeveloperIntelligenceService:
                 if window_start <= sample.committed_at < window_end
             ]
         )
+        first_seen = await _branch_first_seen_by_repository(
+            self.repositories.session,
+            owner_id=owner_id,
+            repository_ids=set(dict.fromkeys(scopes)),
+        )
         names: set[str] = set()
-        for identifier in dict.fromkeys(scopes):
-            if len(names) >= _MAX_GROWTH_REPOSITORIES and repository_id is None:
-                break
-            for name, first in await self.repositories.branch_first_seen(
-                owner_id, repository_id=identifier
-            ):
+        for branches in first_seen.values():
+            for name, first in branches.items():
                 moment = _as_utc(first)
                 if moment is not None and window_start <= moment < window_end:
                     names.add(name)
@@ -1489,6 +1582,127 @@ def _samples_from_rows(rows: Sequence[tuple[Any, ...]]) -> list[MetricSample]:
             )
         )
     return samples
+
+
+def _has_measurement(repository: GitRepository) -> bool:
+    """Whether this repository's figures were actually measured.
+
+    **A successful scan, and only a successful scan.** ``last_scanned_at is
+    None`` means the row was written and nobody has ever read the directory, and
+    ``last_scan_status == 'error'`` means the last attempt to read it failed, so
+    whatever commits are in the table are older than the last look. Either way
+    the repository's activity figures are unknown rather than zero, and the
+    feature vector must not publish them.
+
+    The distinction this makes is the whole point of the Phase 10 precondition:
+    a scanned repository with no commits *did* record no commits, and its zeros
+    are measurements; an unscanned one was never looked at, and its zeros would
+    be a claim about a developer that NEXUS has no evidence for.
+
+    Args:
+        repository: The repository row as the repository listing returned it.
+
+    Returns:
+        ``True`` when the repository has a completed, successful scan behind it.
+    """
+    return (
+        repository.last_scanned_at is not None
+        and repository.last_scan_status == GitScanStatus.OK.value
+    )
+
+
+async def _commit_totals_by_repository(
+    session: AsyncSession,
+    *,
+    owner_id: uuid.UUID,
+    repository_ids: Collection[uuid.UUID],
+) -> dict[uuid.UUID, tuple[int, datetime | None]]:
+    """``{repository id: (recorded commits, newest commit instant)}`` in one statement.
+
+    The grouped form of :meth:`~app.repositories.developer.DeveloperRepository.commit_totals`,
+    and the reason it exists here rather than in the repository layer is that the
+    per-repository loop it replaces issued one aggregate per repository: a project
+    page's cost grew with the number of repositories on it. ``GROUP BY
+    repository_id`` gives the same per-repository answers the loop read, so the
+    caller can still sum the counts and fold the instants — it just does it in the
+    database rather than in a loop.
+
+    Ownership is a predicate on the statement, never a filter applied to the rows
+    afterwards: another account's commits must not be counted here and then
+    discarded, they must not be read at all.
+
+    Args:
+        session: The session to read through.
+        owner_id: Whose commits to count. Always asserted in the ``WHERE`` clause.
+        repository_ids: The repositories to count, already narrowed by the caller
+            to the ones the caller owns.
+
+    Returns:
+        One entry per repository that has at least one recorded commit. A
+        repository in ``repository_ids`` with none recorded is **absent**, which
+        is the same answer ``commit_totals`` gives for it — zero commits, no
+        instants — and sums and maxima treat it identically.
+    """
+    if not repository_ids:
+        return {}
+    rows = await session.execute(
+        select(
+            GitCommit.repository_id,
+            func.coalesce(func.count(GitCommit.id), 0),
+            func.max(GitCommit.committed_at),
+        )
+        .where(
+            GitCommit.user_id == owner_id,
+            GitCommit.repository_id.in_(repository_ids),
+        )
+        .group_by(GitCommit.repository_id)
+    )
+    return {row[0]: (int(row[1] or 0), _as_utc(row[2])) for row in rows.all()}
+
+
+async def _branch_first_seen_by_repository(
+    session: AsyncSession,
+    *,
+    owner_id: uuid.UUID,
+    repository_ids: Collection[uuid.UUID],
+) -> dict[uuid.UUID, dict[str, datetime]]:
+    """``{repository id: {branch name: earliest recorded commit}}``, one statement.
+
+    Whole history, deliberately: the question is when a branch was *first
+    recorded*, so narrowing the read to a window would make every branch that
+    merely had a commit inside the window look brand new. Commits with no
+    resolved branch are excluded rather than grouped under a placeholder name,
+    which is the repository layer's own rule and is kept here so the two reads
+    cannot disagree about what a branch is.
+
+    Args:
+        session: The session to read through.
+        owner_id: Whose branches to read. Always asserted in the ``WHERE`` clause.
+        repository_ids: The repositories to resolve. Grouping inside the database
+            rather than in a loop is what keeps the statement count constant in
+            the number of repositories an account owns.
+
+    Returns:
+        One entry per repository that has a branch on a recorded commit, mapping
+        each of its branches to the earliest commit recorded for it.
+    """
+    if not repository_ids:
+        return {}
+    rows = await session.execute(
+        select(GitCommit.repository_id, GitCommit.branch, func.min(GitCommit.committed_at))
+        .where(
+            GitCommit.user_id == owner_id,
+            GitCommit.repository_id.in_(repository_ids),
+            GitCommit.branch.is_not(None),
+        )
+        .group_by(GitCommit.repository_id, GitCommit.branch)
+    )
+    grouped: dict[uuid.UUID, dict[str, datetime]] = {}
+    for repository_row, name, first in rows.all():
+        moment = _as_utc(first)
+        if name and moment is not None:
+            grouped.setdefault(repository_row, {})[name] = moment
+    return grouped
 
 
 def _feature_values(

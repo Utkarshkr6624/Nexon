@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import func, select
@@ -122,6 +123,48 @@ async def db_today(session: AsyncSession) -> date:
     return (await session.scalar(select(func.now()))).date()
 
 
+async def snapshot_for(
+    session: AsyncSession,
+    client: Any,
+    headers: dict[str, str],
+    *,
+    task_id: uuid.UUID,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """One task's feature snapshot, its wrapper asserted, for the matrix's sake.
+
+    ``/analytics/feature-snapshot`` answers a wrapper — ``schema_version``,
+    ``generated_at``, ``task_id`` and a ``features`` object holding the fifteen
+    numbers — rather than the bare mapping it used to return. A Phase-10 training
+    row has to be attributable to the extraction that produced it, and a version
+    string smuggled *inside* the matrix becomes a column a model is asked to
+    fit, so the provenance travels beside the numbers and never among them. The
+    matrix itself is untouched: the same fifteen keys, in the same order, on
+    every call whatever the data says.
+
+    Args:
+        session: The test's session, used to read the database's ``now()``.
+        client: The authenticated HTTP client.
+        headers: The caller's authorization headers.
+        task_id: The task to describe.
+        today: The database's current date, when the caller already has it.
+
+    Returns:
+        The whole body, wrapper included. Callers read ``["features"]`` for the
+        matrix; the three other keys are this helper's business.
+    """
+    response = await client.get(
+        "/api/v1/analytics/feature-snapshot", params={"task_id": str(task_id)}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {"schema_version", "generated_at", "task_id", "features"}
+    assert body["schema_version"] == "analytics_features.v1"
+    assert body["task_id"] == str(task_id)
+    assert body["generated_at"] == (today or await db_today(session)).isoformat()
+    return body
+
+
 # -- LEARNING ANALYTICS FOUNDATION -------------------------------------------
 
 
@@ -193,13 +236,21 @@ async def test_learning_counts_knowledge_interactions_and_notes_from_the_event_f
 
 
 async def test_learning_reports_no_learning_related_tasks_and_says_why(client, db_session):
-    """``knowledge_linked_tasks`` is 0, and the response says it is not measured.
+    """``knowledge_linked_tasks`` is null, and the response says it is not measured.
 
     NEXUS records no learning flag and Phase 5 writes its knowledge events with
     no ``task_id`` and no ``project_id``, so "tasks completed in projects the
     user was also writing about" cannot be computed from the rows that exist.
-    The figure is reported as 0 with the reason in ``basis`` rather than being
-    quietly presented as a measurement.
+    The figure is therefore **null, not zero**, with the reason in ``basis``.
+
+    The zero this replaces was the dishonest half of that pair. The fixture has
+    a completed task and a note in the same window, so a reader cannot tell from
+    the numbers whether ``0`` means "the correlation was measured and came back
+    empty" — which would be a claim about the user's work — or "nobody measured
+    it". The fixture makes that concrete: the one figure it *can* measure,
+    ``knowledge_interactions``, is 1 from the note event, so the window is not
+    silent and the null really is about the correlation rather than the data.
+    Absence of measurement is null; a measured zero would be ``0``.
     """
     seed, auth = await seeded_client(client, db_session)
     project = await seed.project()
@@ -210,7 +261,10 @@ async def test_learning_reports_no_learning_related_tasks_and_says_why(client, d
 
     body = response.json()
     assert response.status_code == 200, response.text
-    assert body["knowledge_linked_tasks"] == 0
+    assert body["knowledge_linked_tasks"] is None
+    # The window was not silent, so the null is about the correlation and not
+    # about there being nothing recorded.
+    assert body["knowledge_interactions"] == 1
     assert "NOT measurable" in body["basis"]
 
 
@@ -600,18 +654,18 @@ async def test_the_feature_snapshot_is_an_exactly_derived_row_for_one_task(clien
     because the anchor is a Monday, ``project_velocity`` 2 completed inside the
     30-day window, and ``overdue_count`` / ``task_age_days`` /
     ``deadline_distance_days`` from the database clock against the due date.
+
+    The matrix is compared against exactly the fifteen keys below, and the
+    wrapper is asserted around it by :func:`snapshot_for` — so this test remains
+    the *values* claim it was written as, rather than a second statement about
+    the shape.
     """
     seed, auth = await seeded_client(client, db_session)
     task_id, today = await _feature_fixture(seed)
 
-    response = await client.get(
-        "/api/v1/analytics/feature-snapshot", params={"task_id": str(task_id)}, headers=auth
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
+    body = await snapshot_for(db_session, client, auth, task_id=task_id, today=today)
     age = (today - DAY).days
-    assert body == {
+    assert body["features"] == {
         "priority": 3,
         "task_age_days": age,
         "estimated_minutes": 60,
@@ -637,6 +691,13 @@ async def test_the_feature_snapshot_keys_are_stable_across_two_calls(client, db_
     and not the next — or drifted to a different position — would produce a
     feature matrix whose columns mean different things per row, which is the
     failure this endpoint exists to make impossible.
+
+    The guarantee is about the **matrix**, so it is asserted against
+    ``features``: the fifteen keys in one order on both calls, with identical
+    values. The wrapper is a fixed four-key envelope around that and cannot
+    drift per row, and the whole-body comparison is kept as well so the two
+    extractions are shown to be identical objects — ``generated_at`` being the
+    database's current date, which two calls in one test resolve alike.
     """
     seed, auth = await seeded_client(client, db_session)
     task_id, _ = await _feature_fixture(seed)
@@ -649,8 +710,15 @@ async def test_the_feature_snapshot_keys_are_stable_across_two_calls(client, db_
     )
 
     assert first.status_code == second.status_code == 200, first.text
-    assert list(first.json()) == list(second.json())
-    assert first.json() == second.json()
+    first_body, second_body = first.json(), second.json()
+    assert len(first_body["features"]) == 15
+    assert list(first_body["features"]) == list(second_body["features"])
+    assert first_body["features"] == second_body["features"]
+    assert first_body["schema_version"] == second_body["schema_version"] == "analytics_features.v1"
+    assert first_body["task_id"] == second_body["task_id"] == str(task_id)
+    assert first_body["generated_at"] == second_body["generated_at"]
+    assert list(first_body) == list(second_body)
+    assert first_body == second_body
 
 
 async def test_the_feature_snapshot_is_null_where_nothing_was_observed(client, db_session):
@@ -675,30 +743,26 @@ async def test_the_feature_snapshot_is_null_where_nothing_was_observed(client, d
     project = await seed.project()
     task = await seed.task(project_id=project.id, title="bare task", created_at=at(DAY))
 
-    response = await client.get(
-        "/api/v1/analytics/feature-snapshot", params={"task_id": str(task.id)}, headers=auth
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
     today = await db_today(db_session)
-    assert body["estimated_minutes"] is None
-    assert body["actual_minutes"] is None
-    assert body["recent_work_minutes"] is None
-    assert body["time_of_day"] is None
-    assert body["deadline_distance_days"] is None
+    body = await snapshot_for(db_session, client, auth, task_id=task.id, today=today)
+    vector = body["features"]
+    assert vector["estimated_minutes"] is None
+    assert vector["actual_minutes"] is None
+    assert vector["recent_work_minutes"] is None
+    assert vector["time_of_day"] is None
+    assert vector["deadline_distance_days"] is None
     # ...while the ones the row really does carry stay present and measured.
-    assert body["priority"] == 2
-    assert body["task_age_days"] == (today - DAY).days
-    assert body["reschedule_count"] == 0
-    assert body["work_session_count"] == 0
-    assert body["overdue_count"] == 0
+    assert vector["priority"] == 2
+    assert vector["task_age_days"] == (today - DAY).days
+    assert vector["reschedule_count"] == 0
+    assert vector["work_session_count"] == 0
+    assert vector["overdue_count"] == 0
     # Project-derived, so observable even for a brand-new project: the only task
     # in it is this one, nothing has been completed, and it is the sole open task.
-    assert body["historical_completion_rate"] == 0.0
-    assert body["project_velocity"] == 0
-    assert body["project_open_task_count"] == 1
-    assert body["project_overdue_task_count"] == 0
+    assert vector["historical_completion_rate"] == 0.0
+    assert vector["project_velocity"] == 0
+    assert vector["project_open_task_count"] == 1
+    assert vector["project_overdue_task_count"] == 0
 
 
 async def test_the_feature_snapshot_is_owner_scoped(client, db_session, assert_error_envelope):
@@ -738,7 +802,9 @@ async def test_every_read_answers_two_hundred_for_a_user_with_no_activity(client
     "Never crash because there is no activity" is the brief's data-quality
     rule. Both aggregate reads answer ``available=False`` with the shared
     "Not enough activity yet" wording rather than a zero, and the feature
-    snapshot answers a row of nulls for a task that was only ever created.
+    snapshot answers a matrix of nulls for a task that was only ever created —
+    wrapped, as it always is, in the provenance keys that say which extraction
+    and which task the row belongs to.
     """
     seed, auth = await seeded_client(client, db_session)
     # A task is always in a project — `tasks.project_id` is NOT NULL — and an
@@ -767,8 +833,8 @@ async def test_every_read_answers_two_hundred_for_a_user_with_no_activity(client
     assert knowledge.json()["most_used_tags"] == []
 
     assert snapshot.status_code == 200, snapshot.text
-    assert snapshot.json()["estimated_minutes"] is None
-    assert snapshot.json()["actual_minutes"] is None
+    assert snapshot.json()["features"]["estimated_minutes"] is None
+    assert snapshot.json()["features"]["actual_minutes"] is None
 
 
 async def test_a_study_block_alone_makes_learning_available(client, db_session):

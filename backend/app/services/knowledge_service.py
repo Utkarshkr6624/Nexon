@@ -31,6 +31,22 @@ to establish that a supplied tag id belongs to the caller before writing it — 
 way to attach somebody else's label to your own note. Wiring :class:`TagRepository`
 into this service is the fix; until then the fields are inert rather than a hole.
 
+Null is a value, not an absence
+-------------------------------
+An **absent** key and a key sent as ``null`` are different requests, and
+``model_dump(exclude_unset=True)`` is what keeps them apart. On a nullable
+column — ``summary``, ``description``, ``parent_id``, a resource's ``url`` —
+``null`` is the documented way to clear the value, and it is honoured.
+
+On a ``NOT NULL`` column it cannot mean anything, and the update models cannot
+express the difference: they type every one of their fields ``str | None`` so
+that *omitting* a key stays legal, which also makes ``{"title": null}`` a valid
+payload. Left alone that reaches the database and comes back as a
+``NotNullViolation`` — a 500 for a missing quote — and, worse for the
+``except IntegrityError`` handlers below, as a **409 claiming a name conflict the
+caller never had**. :func:`_refuse_null` answers those requests with the 422 they
+were written for, before anything is written.
+
 Revisions
 ---------
 A revision is a **point-in-time copy** of title, content and summary, not a diff.
@@ -47,7 +63,10 @@ status flip, a ``document_id`` re-point and a no-op PATCH are not revisions: the
 change no text, and a history that recorded them would fill with entries
 distinguishing nothing. :meth:`KnowledgeService.update_note` compares against the
 *persisted* values rather than merely against which keys the payload named,
-because a client that sends the same title back is not an edit.
+because a client that sends the same title back is not an edit. When one is
+written it is written **unconditionally** — including for a note whose body is
+still empty, because ``title`` is always present and a rename of an unwritten
+note is an edit whose previous state would otherwise be unrecoverable.
 
 **Restoring writes a new revision** of the current state before it overwrites the
 note, so the history is append-only and a restore is itself undoable. Consuming
@@ -184,11 +203,39 @@ _SORT_KEYS: dict[str, frozenset[str]] = {
 }
 _SORT_ORDERS = frozenset({"asc", "desc"})
 
-#: Which entity types the graph and the search iterate over. Named once so the
-#: "no filter" branch of both is a list rather than a hand-written OR chain.
-#: Categories are absent on purpose: they have no free text to search and the
-#: graph is about what links to what.
-_ENTITY_TABLES = ("note", "concept", "resource")
+#: Which entity types the **search** iterates over, named once so the "no filter"
+#: branch is a list rather than a hand-written OR chain. Categories are absent on
+#: purpose: they have no free text to search.
+#:
+#: **Bookmarks belong here and did not used to.** This list used to be the
+#: *graph's* list of node types, and a bookmark is rightly not a node — a graph
+#: node is ``(id, type, label)`` and a bookmark has no label and no edge — so the
+#: search silently inherited the omission and answered every unfiltered query
+#: with an empty ``bookmarks`` list. The spec names bookmarks as one of the
+#: things knowledge search covers, the response model carries the field, and the
+#: branch below it was unreachable code, so "no bookmark matched" and "no bookmark
+#: was ever looked for" were indistinguishable to every caller. The graph keeps
+#: its own, narrower set — see :func:`app.repositories.knowledge._entity_types`.
+_SEARCH_TABLES = ("note", "concept", "resource", "bookmark")
+
+#: The fields a PATCH may not set to JSON ``null``, per entity.
+#:
+#: Every ``*Update`` model types these as ``str | None`` — Pydantic has no way to
+#: say "optional but not nullable", and a field with no default has to accept
+#: ``None`` to stay optional — while the columns behind them are ``NOT NULL``. So
+#: ``{"title": null}`` validates, reaches the repository, and is a 500 from the
+#: database rather than the 422 the caller wrote it for. The nullable columns
+#: (``summary``, ``description``, ``parent_id``, ``resource_type``, a note's
+#: ``document_id``) are absent from this map on purpose: clearing one of those is
+#: a real request, and ``"summary": null`` is the documented way to say so.
+_NOT_CLEARABLE_FIELDS: Mapping[str, frozenset[str]] = {
+    "note": frozenset({"content", "title"}),
+    "concept": frozenset({"name"}),
+    "resource": frozenset({"title"}),
+    "bookmark": frozenset({"url"}),
+    "document": frozenset({"filename"}),
+    "category": frozenset({"name"}),
+}
 
 #: Fields whose change makes an edit *meaningful* and therefore worth a revision.
 #: A status flip or a ``document_id`` re-point changes no text, and a history that
@@ -324,7 +371,11 @@ class KnowledgeService:
         return note
 
     async def get_note(self, *, note_id: uuid.UUID, owner: User) -> Note:
-        """Return one of the caller's notes.
+        """Return one of the caller's notes, with its history and tag counts on it.
+
+        The returned row carries :attr:`NoteRead.revision_count` and
+        ``tag_ids`` — see :meth:`_annotate` for why they are put on the row
+        rather than left for the response model to default.
 
         Raises:
             NotFoundError: If the caller owns no note with this id. Another
@@ -335,7 +386,7 @@ class KnowledgeService:
         note = await self.notes.get_by_id_for_user(note_id, owner.id)
         if note is None:
             raise NotFoundError(_NOTE_NOT_FOUND)
-        return note
+        return await self._annotate(note)
 
     async def update_note(self, *, note: Note, data: NoteUpdate, owner: User) -> Note:
         """Apply a partial update to a note the caller owns.
@@ -351,6 +402,12 @@ class KnowledgeService:
         edit and a status-only change leaves the history alone. The revision holds
         the *previous* values, so history is preserved by the write that displaced
         it rather than by a save button the user has to remember.
+
+        **A field the column cannot hold is a 422 before the snapshot.** The
+        update models type ``title`` and ``content`` as ``str | None`` while the
+        columns are ``NOT NULL``; see :func:`_refuse_null` for why that is
+        answered here rather than left to become a 500 — and why it has to happen
+        before the revision, so a refused edit leaves no history behind.
         """
         self._own_note(note, owner)
         fields = {
@@ -358,10 +415,14 @@ class KnowledgeService:
             for key, value in data.model_dump(exclude_unset=True).items()
             if key != "document_id"
         }
+        # Before the snapshot, not after it: a refused edit must leave no trace,
+        # and a revision written for an edit that then failed would be a history
+        # entry describing a state the note was never in.
+        _refuse_null(fields, entity="note")
         if "document_id" in data.model_fields_set:
             fields["document_id"] = await self._own_document(data.document_id, owner)
         if not fields:
-            return note
+            return await self._annotate(note)
 
         meaningful = any(
             name in fields and fields[name] != getattr(note, name) for name in _REVISION_FIELDS
@@ -374,7 +435,7 @@ class KnowledgeService:
             owner=owner,
             metadata={"fields": sorted(fields)},
         )
-        return updated
+        return await self._annotate(updated)
 
     async def delete_note(self, *, note: Note, owner: User) -> None:
         """Delete a note, its revisions and its edges.
@@ -397,21 +458,21 @@ class KnowledgeService:
         """
         self._own_note(note, owner)
         if note.status == NoteStatus.PUBLISHED.value:
-            return note
+            return await self._annotate(note)
         updated = await self.notes.update_fields(note, status=NoteStatus.PUBLISHED.value)
         await self._record(
             ActivityEvent.NOTE_PUBLISHED, owner=owner, metadata={"title": note.title}
         )
-        return updated
+        return await self._annotate(updated)
 
     async def archive_note(self, *, note: Note, owner: User) -> Note:
         """Set a note aside, keeping it, its revisions and its edges."""
         self._own_note(note, owner)
         if note.status == NoteStatus.ARCHIVED.value:
-            return note
+            return await self._annotate(note)
         updated = await self.notes.update_fields(note, status=NoteStatus.ARCHIVED.value)
         await self._record(ActivityEvent.NOTE_ARCHIVED, owner=owner, metadata={"title": note.title})
-        return updated
+        return await self._annotate(updated)
 
     async def restore_note(self, *, note: Note, owner: User) -> Note:
         """Return an archived note to the working set as a **draft**.
@@ -423,10 +484,10 @@ class KnowledgeService:
         """
         self._own_note(note, owner)
         if note.status != NoteStatus.ARCHIVED.value:
-            return note
+            return await self._annotate(note)
         updated = await self.notes.update_fields(note, status=NoteStatus.DRAFT.value)
         await self._record(ActivityEvent.NOTE_RESTORED, owner=owner, metadata={"title": note.title})
-        return updated
+        return await self._annotate(updated)
 
     # -- Revisions ----------------------------------------------------------
 
@@ -484,7 +545,7 @@ class KnowledgeService:
             owner=owner,
             metadata={"revision_id": str(revision.id)},
         )
-        return updated
+        return await self._annotate(updated)
 
     # -- Concepts -----------------------------------------------------------
 
@@ -556,9 +617,16 @@ class KnowledgeService:
         Renaming to the name the concept *already* has is a no-op rather than a
         conflict: it collides with itself, and answering a retried rename with a
         409 would make the idempotent path the one that fails.
+
+        **A ``name`` sent as ``null`` is a 422, not a 409.** The model types it
+        ``str | None``, the column is ``NOT NULL``, and without this check the
+        write raises ``IntegrityError`` which the handler below turns into "you
+        already have a concept with that name" — a confident statement about a
+        conflict the caller did not have. See :func:`_refuse_null`.
         """
         self._own_row(concept, owner, _CONCEPT_NOT_FOUND)
         fields = data.model_dump(exclude_unset=True)
+        _refuse_null(fields, entity="concept")
         if "name" in fields and fields["name"] == concept.name:
             fields.pop("name")
         if "name" in fields:
@@ -640,9 +708,16 @@ class KnowledgeService:
     async def update_resource(
         self, *, resource: Resource, data: ResourceUpdate, owner: User
     ) -> Resource:
-        """Apply a partial update to a resource, re-validating a supplied URL."""
+        """Apply a partial update to a resource, re-validating a supplied URL.
+
+        ``description`` and ``url`` are nullable columns, so ``null`` clears them
+        and is honoured. ``title`` is not nullable, so a ``null`` title is a 422
+        rather than a ``NotNullViolation`` from the database — see
+        :func:`_refuse_null`.
+        """
         self._own_row(resource, owner, _RESOURCE_NOT_FOUND)
         fields = data.model_dump(exclude_unset=True)
+        _refuse_null(fields, entity="resource")
         if "url" in fields:
             fields["url"] = _check_url(fields["url"], required=False)
         if "resource_type" in fields and fields["resource_type"] is not None:
@@ -737,12 +812,19 @@ class KnowledgeService:
         correct and is not. A PATCH that does not name ``url`` leaves ``domain``
         alone, because the URL it was derived from is unchanged.
 
+        ``title`` and ``description`` are nullable and a ``null`` clears them. A
+        ``url`` sent as ``null`` is refused with a 422 rather than ignored: a
+        bookmark is exactly its URL, there is no empty one, and silently dropping
+        the field would answer a request to change it with a success.
+
         Raises:
             ConflictError: If the new URL is one this user already saved on a
                 *different* bookmark.
+            ValidationError: If ``url`` is sent as ``null``.
         """
         self._own_row(bookmark, owner, _BOOKMARK_NOT_FOUND)
         fields = data.model_dump(exclude_unset=True)
+        _refuse_null(fields, entity="bookmark")
         if "url" in fields and fields["url"] is not None:
             url = _check_url(fields["url"], required=True)
             if url != bookmark.url:
@@ -830,9 +912,13 @@ class KnowledgeService:
         Notes citing this document keep pointing at it: ``notes.document_id`` is
         ``ON DELETE SET NULL`` rather than ``CASCADE``, so losing a bibliography
         entry detaches the notes rather than deleting them with it.
+
+        Every other field here is nullable, so ``null`` clears it. ``filename``
+        is the exception and is refused with a 422 — see :func:`_refuse_null`.
         """
         self._own_row(document, owner, _DOCUMENT_NOT_FOUND)
         fields = data.model_dump(exclude_unset=True)
+        _refuse_null(fields, entity="document")
         if not fields:
             return document
         return await self.documents.update_fields(document, **fields)
@@ -925,6 +1011,7 @@ class KnowledgeService:
         """
         self._own_row(category, owner, _CATEGORY_NOT_FOUND)
         fields = data.model_dump(exclude_unset=True)
+        _refuse_null(fields, entity="category")
         if "parent_id" in fields:
             parent = await self._own_category(fields["parent_id"], owner, what="parent category")
             # The walk stops when it revisits a node, so a pre-existing cycle in
@@ -1167,6 +1254,13 @@ class KnowledgeService:
         types and sorting by ``created_at``) would answer a different question from
         the one asked.
 
+        **All four kinds are searched when no ``entity_type`` is given** —
+        notes, concepts, resources *and* bookmarks. Bookmarks were previously
+        unreachable here, because this method shared the graph's list of node
+        types and a bookmark is not a node; the result was a permanently empty
+        ``bookmarks`` group that a caller could not tell apart from a bookmark
+        that matched nothing. See :data:`_SEARCH_TABLES`.
+
         **One bounded query per entity type**, never a ``SELECT *`` filtered in
         Python. ``ILIKE`` and not ``pg_trgm``: this is a portable build where the
         extension may not be installed, so relying on it would make search the
@@ -1186,7 +1280,7 @@ class KnowledgeService:
         if limit < 1 or limit > MAX_SEARCH_ROWS:
             raise ValidationError(f"limit must be between 1 and {MAX_SEARCH_ROWS}.")
         entity = _entity_or_none(entity_type)
-        wanted = {entity.value} if entity is not None else set(_ENTITY_TABLES)
+        wanted = {entity.value} if entity is not None else set(_SEARCH_TABLES)
 
         result = KnowledgeSearchResult(query=term, limit=limit)
         if "note" in wanted:
@@ -1259,13 +1353,54 @@ class KnowledgeService:
             meta=PageMeta(total=total, limit=limit, offset=offset),
         )
 
+    async def _annotate(self, note: Note) -> Note:
+        """Put the two answers that live in other tables onto the row itself.
+
+        **``revision_count`` was a false zero on every single-note route.**
+        :attr:`NoteRead.revision_count` and ``tag_ids`` are not columns on
+        ``notes``, and Pydantic fills a field from its default when the object it
+        is validating does not carry it. The list and search paths build
+        :class:`NoteRead` explicitly through :meth:`_note_read`, so they were
+        right; the routes that hand a note straight back — the read, the PATCH,
+        ``/publish``, ``/archive``, ``/restore`` and ``/restore-revision`` —
+        returned the bare row, and every one of them answered ``revision_count:
+        0`` for a note holding fifty revisions. Zero is the answer for a note
+        that has *never* been edited, and it is not the answer for one that has,
+        which is exactly the confusion this repository's own rule forbids: an
+        absence of measurement must not be rendered as a measured zero.
+
+        Pydantic reads an attribute off the source object before it falls back to
+        the field default, so setting the two names here is what the response
+        model picks up — two queries, the same pair :meth:`_note_read` runs.
+        They are not mapped columns and are never written: nothing flushes after
+        this runs, and :meth:`NoteRepository.update_fields` allowlists every
+        column a write may touch.
+
+        :meth:`create_note` is the one note-returning method that does not call
+        this, and it is not an oversight: a note that has just been created has
+        no revisions and no tags, which is precisely what the defaults say.
+
+        Args:
+            note: The row about to be serialised.
+
+        Returns:
+            The same row, carrying ``revision_count`` and ``tag_ids``.
+        """
+        tags = await self.notes.list_tags_for_notes([note.id])
+        counts = await self.notes.revision_counts([note.id])
+        note.tag_ids = [tag.id for tag in tags.get(note.id, [])]
+        note.revision_count = counts.get(note.id, 0)
+        return note
+
     async def _note_read(self, note: Note) -> NoteRead:
         """Build a :class:`NoteRead` from a row plus the two joins it needs.
 
         ``tag_ids`` and ``revision_count`` are answers from other tables, which is
         why :class:`NoteRead` cannot be produced by ``model_validate`` on the row
         alone — the counts come from one query each for the whole page rather than
-        one per row.
+        one per row. :meth:`_annotate` is the same pair of queries for the one-row
+        case, and exists because the single-note routes return the row rather than
+        a built model.
         """
         tags = await self.notes.list_tags_for_notes([note.id])
         counts = await self.notes.revision_counts([note.id])
@@ -1355,12 +1490,21 @@ class KnowledgeService:
 
         **A copy of the state being displaced**, which is what makes an edit
         reversible: the write that overwrites the text is the same write that
-        preserved it. No-op for a note with no text yet — a revision of an empty
-        note describes nothing, and the first edit's revision is the creation state
-        the user actually wants back.
+        preserved it.
+
+        **Every call snapshots, whatever the note currently holds.** An earlier
+        version skipped this for a note with no body and no summary, on the
+        reasoning that "a revision of an empty note describes nothing". But
+        :attr:`Note.title` is ``NOT NULL`` and is one of the three columns a
+        revision stores, so the note that guard spared was not empty — it was a
+        titled note whose body had not been written yet, and the edit it skipped
+        was a *rename*. The title a user typed before the first keystroke of the
+        body was therefore destroyed by the rename with nothing to restore it
+        from, while the caller had been told the change was meaningful. The
+        creation state is exactly what the first edit wants back, so it is
+        written; the history is bounded at
+        :data:`~app.models.knowledge.MAX_REVISIONS_PER_NOTE` regardless.
         """
-        if not note.content and not note.summary:
-            return
         await self.notes.create_revision(
             note_id=note.id,
             owner_id=note.owner_id,
@@ -1400,6 +1544,49 @@ class KnowledgeService:
         if self.activity is None:
             return
         await self.activity.record(event.value, user_id=owner.id, metadata=metadata)
+
+
+def _refuse_null(fields: Mapping[str, object], *, entity: str) -> None:
+    """Refuse a PATCH that sets a ``NOT NULL`` column to JSON ``null``.
+
+    **This is the 422 a client wrote the request for, and it is the service's
+    job rather than the schema's.** Every ``*Update`` model types its required
+    text fields as ``str | None`` — an absent key and a ``None`` are the same
+    value to Pydantic unless every field is given a default, and giving
+    ``title`` a default would make it optional rather than required on the
+    create path — so ``{"title": null}`` passes validation and reaches
+    :meth:`NoteRepository.update_fields`. There it sets a ``NOT NULL`` column to
+    ``None`` and the database answers with a ``NotNullViolation`` the service
+    does not catch: a 500 with a traceback, for a request whose only fault is a
+    missing quote.
+
+    The alternative — coercing ``None`` to the column's default — invents a
+    state the client did not ask for. ``content`` would become ``""``, which
+    reads as "the note has no body" and silently destroys the prose the note
+    had; and for ``title`` there is no default at all, only a violation. Refusing
+    is the fail-closed answer, and it is the same one :meth:`_check_sort` gives a
+    sort key it cannot resolve.
+
+    Only the columns that cannot hold ``None`` are listed in
+    :data:`_NOT_CLEARABLE_FIELDS`. A nullable one — ``summary``, ``description``,
+    ``parent_id`` — is cleared by ``null`` on purpose, and that request reaches
+    the repository untouched.
+
+    Args:
+        fields: The deconstructed update payload, before anything is written.
+        entity: The kind of row being updated, naming the entry in
+            :data:`_NOT_CLEARABLE_FIELDS`.
+
+    Raises:
+        ValidationError: If any named field is present and ``None``.
+    """
+    required = _NOT_CLEARABLE_FIELDS[entity]
+    cleared = sorted(name for name in required if name in fields and fields[name] is None)
+    if cleared:
+        raise ValidationError(
+            f"{entity} {', '.join(cleared)} cannot be null.",
+            details={"fields": cleared},
+        )
 
 
 def _page(rows: list, total: int, limit: int, offset: int, model):

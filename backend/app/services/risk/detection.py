@@ -37,6 +37,29 @@ Without both rules the Risk Center is a list of everything, which is the same as
 a list of nothing. With them it is a list of what is currently true, and the
 sweep in :meth:`RiskDetectionService._resolve_stale` is what keeps it honest.
 
+**A cap is a limit on what is written, never a claim that the rest is fine.**
+
+A pass writes at most :data:`MAX_DEADLINE_TASKS` deadline risks,
+:data:`MAX_PROJECT_RISKS` project risks and :data:`MAX_TASK_RISKS` task risks,
+and it reads a bounded page of candidates for each. Both bounds used to be
+silent, and the write caps were the worse of the two: a project or a task that
+was **still at risk** but fell beyond the cap simply was not in this pass's
+output, so the sweep read its absence as "the condition went away" and closed a
+live risk — recording the false reason "the condition behind it was not detected
+in this evaluation" on a condition NEXUS had merely declined to look at. Five of
+thirty blocked tasks disappeared on one pass and could not come back, because the
+sweep is terminal.
+
+So a cap now has two halves. What the cap drops is **deferred**, not resolved:
+those identities are carried to the sweep as ones to leave alone, and the count
+goes onto the run summary next to every other coverage note. And where the bound
+is on the *read* rather than the write — a candidate scan that did not reach the
+end of the set — the affected risk types are excluded from the sweep altogether,
+because "I did not look" and "it is gone" must never produce the same row.
+
+Both halves are the same rule: **a risk is closed only by a pass that was in a
+position to judge every candidate of its type.**
+
 Nothing is derived twice
 ------------------------
 Every figure the detectors consume is read from
@@ -171,6 +194,8 @@ __all__ = [
     "MAX_PROJECT_RISKS",
     "MAX_RECOMMENDATION_RISKS",
     "MAX_TASK_RISKS",
+    "PROJECT_TARGET_PAGE_SIZE",
+    "PROJECT_TARGET_SCAN_LIMIT",
     "RESCHEDULE_SCAN_LIMIT",
     "RESOLVE_SWEEP_LIMIT",
     "RiskDetectionService",
@@ -194,17 +219,20 @@ DEADLINE_SCAN_LIMIT = 200
 #: nearest twenty rows already describe.
 MAX_DEADLINE_TASKS = 25
 #: How many project risks one pass will write, keeping the highest scores. The
-#: remainder are still measured and dropped as zeros, so the cap costs no
-#: measurement.
+#: remainder are still measured, and they are **deferred**: their live risks are
+#: left alone by the resolution sweep and the count is reported, because a cap on
+#: what is written is not evidence that what was left out has gone away.
 MAX_PROJECT_RISKS = 25
 #: How many risks are handed to the recommendation generator. Recommendations
 #: hang off the risks that raised them, so the ones beyond this cap are the ones
 #: a user could not act on today anyway.
 MAX_RECOMMENDATION_RISKS = 25
-#: Upper bound on the blocked-task scan, and on the project target-date scan.
-#: Both are a floor rather than a total when the cap bites, and a floor
-#: understates a risk rather than inventing one — see
-#: :meth:`RiskDetectionService._blocked_tasks`.
+#: Upper bound on the blocked-task scan, and on the deadline scan below. Both are
+#: a floor rather than a total when the cap bites, and a floor understates a
+#: risk rather than inventing one — see
+#: :meth:`RiskDetectionService._blocked_tasks`. What it may no longer do is let
+#: the sweep close a task risk whose task was never in the page: a truncated
+#: candidate scan now marks ``RiskType.TASK`` unexamined for the pass.
 BLOCKED_SCAN_LIMIT = 500
 #: Upper bound on the reschedule read, ordered so the tasks with the most moves
 #: are the ones inside the cap. A floor again, and the same direction of error as
@@ -213,14 +241,24 @@ RESCHEDULE_SCAN_LIMIT = 500
 #: How many task risks one pass will write, keeping the highest scores, exactly
 #: as :data:`MAX_PROJECT_RISKS` caps the project detector. An account with more
 #: blocked tasks than that has one task to unblock at a time, and the ones
-#: beyond the cap stay in the account for the next pass rather than filling the
-#: list with work nobody is going to look at this morning.
+#: beyond the cap stay in the account — as **live risks the sweep will not
+#: close**, which is the whole difference between deferring a risk and resolving
+#: one.
 MAX_TASK_RISKS = 25
 #: Upper bound on the resolution sweep. A user returning after a long absence may
 #: have more stale risks than one transaction should close, and closing them in
 #: bounded batches means the history of each is written rather than the whole
 #: backlog being flipped in a single statement nobody can attribute to a run.
 RESOLVE_SWEEP_LIMIT = 200
+#: Page size for the project target-date read, and the ceiling on that read
+#: overall. Both are here because :class:`ProjectAnalyticsRead` is unbounded — it
+#: returns a row for every project the owner has — so a single page of target
+#: dates silently described only the first hundred projects and every project
+#: past the page lost its ``days_to_deadline``. A page whose consequence is not
+#: reported is a measurement gap wearing the shape of a measurement, so the
+#: ceiling is stated and the overflow goes onto the run summary.
+PROJECT_TARGET_PAGE_SIZE = 100
+PROJECT_TARGET_SCAN_LIMIT = 1000
 
 #: The statuses that make a task "open" for the purposes of deadline pressure. A
 #: cancelled task is not at risk of anything, and including it would raise a risk
@@ -402,7 +440,7 @@ class RiskDetectionService:
             previous_end=previous_end,
             horizon_end=horizon_end,
         )
-        findings, unassessable = await self._detect(context=context, today=today, now=now)
+        findings, deferred, unassessable = await self._detect(context=context, today=today, now=now)
         kept, unavailable, zeros = self._partition(findings)
 
         written: list[Risk] = []
@@ -413,7 +451,7 @@ class RiskDetectionService:
                 owner.id,
                 risk_type=finding.result.risk_type.value,
                 severity=_severity_value(finding),
-                score=int(finding.result.score or 0),
+                score=_scored_value(finding),
                 title=title,
                 description=description,
                 evidence=_evidence_payload(finding.result),
@@ -433,7 +471,15 @@ class RiskDetectionService:
             )
 
         resolved = await self._resolve_stale(
-            owner=owner, seen=[finding.identity for finding in kept], now=now
+            owner=owner,
+            seen=[finding.identity for finding in kept],
+            deferred=[
+                finding.identity
+                for finding in deferred
+                if finding.result.available and finding.result.score
+            ],
+            unexamined=context.unexamined,
+            now=now,
         )
         recommendations = await self._recommend(owner=owner, risks=written)
         duration_ms = int((perf_counter() - started) * 1000)
@@ -537,14 +583,14 @@ class RiskDetectionService:
         blocked_rows, blocked_unseen = await self._blocked_tasks(
             owner.id, wanted=bool(task_analytics.blocked_tasks)
         )
-        open_due, unestimated = await self._open_due_tasks(
+        open_due, unestimated, deadline_unseen = await self._open_due_tasks(
             owner.id, horizon_end, wanted=bool(task_analytics.open_tasks)
         )
-        targets = await self._project_targets(owner.id)
-        task_candidates = _merge_task_candidates(
-            blocked_rows,
-            await self._rescheduled_tasks(owner.id, wanted=bool(task_analytics.open_tasks)),
+        targets, targets_unseen = await self._project_targets(owner.id)
+        rescheduled, reschedule_truncated = await self._rescheduled_tasks(
+            owner.id, wanted=bool(task_analytics.open_tasks)
         )
+        task_candidates = _merge_task_candidates(blocked_rows, rescheduled)
 
         return _Context(
             owner_id=owner.id,
@@ -563,10 +609,18 @@ class RiskDetectionService:
             blocked_unseen=blocked_unseen,
             open_due=open_due,
             unestimated_open_due=unestimated,
+            deadline_unseen=deadline_unseen,
             project_targets=targets,
+            project_targets_unseen=targets_unseen,
             task_candidates=task_candidates,
+            reschedule_truncated=reschedule_truncated,
             session_rows=session_rows,
             availability=availability,
+            unexamined=_unexamined_types(
+                deadline_unseen=deadline_unseen,
+                targets_unseen=targets_unseen,
+                task_scan_truncated=bool(blocked_unseen) or reschedule_truncated,
+            ),
         )
 
     async def _now(self) -> datetime:
@@ -592,10 +646,14 @@ class RiskDetectionService:
         and the open-status filter has no equivalent parameter because the
         repository takes one status rather than a set of them.
 
-        The ordering is what makes :data:`DEADLINE_SCAN_LIMIT` safe. Truncating a
+        The ordering is what makes :data:`DEADLINE_SCAN_LIMIT` cheap: truncating a
         list sorted by due date drops the *latest* deadlines, which are the ones
         :func:`~app.services.risk.scoring.deadline_risk` would have graded lowest
-        anyway.
+        anyway. It does not make it safe. A dropped candidate is a task this pass
+        did not judge, so the third value says how many there were and
+        :data:`DEADLINE_SCAN_LIMIT` being reached marks ``RiskType.DEADLINE``
+        unexamined for the sweep — a deadline risk behind the page is left alone
+        rather than closed on the strength of a pass that never saw it.
 
         Tasks with no estimate are **excluded** and counted separately. With no
         estimate the remaining work is unknown rather than zero, and scoring one
@@ -609,11 +667,11 @@ class RiskDetectionService:
                 at all, in which case the query is skipped.
 
         Returns:
-            ``(tasks, skipped_unestimated)``.
+            ``(tasks, skipped_unestimated, candidates_outside_the_page)``.
         """
         if not wanted:
-            return [], 0
-        rows, _total = await self.tasks.list_for_user(
+            return [], 0, 0
+        rows, total = await self.tasks.list_for_user(
             owner_id,
             limit=DEADLINE_SCAN_LIMIT,
             offset=0,
@@ -630,7 +688,7 @@ class RiskDetectionService:
                 unestimated += 1
                 continue
             assessable.append(task)
-        return assessable, unestimated
+        return assessable, unestimated, max(0, total - len(rows))
 
     async def _blocked_tasks(self, owner_id: uuid.UUID, *, wanted: bool) -> tuple[list[Task], int]:
         """Every open task in the blocked status, and how many were not read.
@@ -643,7 +701,10 @@ class RiskDetectionService:
         and it is reported rather than hidden because a floor that a reader cannot
         see is just a wrong total. Understating the count is the safe direction:
         it lowers a project risk rather than raising one on nothing. The cap sits
-        far above any plausible blocked backlog for that to bite.
+        far above any plausible blocked backlog for that to bite — and when it
+        does bite, a non-zero value is also what tells the rest of the pass that
+        ``RiskType.TASK`` was not judged in full, so the blocked task risks behind
+        the page are not swept shut.
         """
         if not wanted:
             return [], 0
@@ -654,7 +715,7 @@ class RiskDetectionService:
 
     async def _rescheduled_tasks(
         self, owner_id: uuid.UUID, *, wanted: bool
-    ) -> list[tuple[Task, int]]:
+    ) -> tuple[list[tuple[Task, int]], bool]:
         """Open tasks with at least three recorded reschedules, most first.
 
         The one read this module assembles rather than delegates, and the reason
@@ -674,9 +735,17 @@ class RiskDetectionService:
         finished row. The ``HAVING`` does the same job for the threshold: a task
         with two moves never becomes a candidate, so nothing downstream has to
         decide whether it is interesting.
+
+        Returns:
+            ``(candidates, maybe_more)``. A full page is the only evidence this
+            read has that another candidate exists, so ``maybe_more`` is reported
+            as a flag rather than as a count: this query cannot count what it
+            chose not to fetch, and a fabricated zero there would be the same
+            "confident zero" failure the blocked scan's own count avoids by
+            reading the repository's total.
         """
         if not wanted:
-            return []
+            return [], False
         result = await self.metrics.session.execute(
             select(Task, func.count())
             .select_from(ActivityLog)
@@ -692,19 +761,51 @@ class RiskDetectionService:
             .order_by(func.count().desc(), Task.id.asc())
             .limit(RESCHEDULE_SCAN_LIMIT)
         )
-        return [(task, int(count)) for task, count in result.all()]
+        candidates = [(task, int(count)) for task, count in result.all()]
+        return candidates, len(candidates) >= RESCHEDULE_SCAN_LIMIT
 
-    async def _project_targets(self, owner_id: uuid.UUID) -> dict[uuid.UUID, date]:
-        """``project_id -> target_date`` for projects that declare one.
+    async def _project_targets(self, owner_id: uuid.UUID) -> tuple[dict[uuid.UUID, date], int]:
+        """The ``project_id -> target_date`` map, and how many projects it missed.
 
         Read from ``projects`` rather than derived: a target date is a column
         somebody typed, and :class:`ProjectAnalyticsRead` cannot carry one
         without Phase 6 publishing a field it deliberately does not.
+
+        **Paged to the end rather than to the first hundred rows.** The roll-up
+        this read is paired with is unbounded — it carries a row for every project
+        the owner has, including a project with no tasks — so a single page of
+        target dates silently described only the newest hundred projects and
+        every project past the page scored as though it had no target date at
+        all: ``days_to_deadline`` ``None``, the deadline sub-signal absent, and
+        up to 20 points of the score gone. The same project measured at 38 became
+        2 purely by being created early enough, which is a scoring result
+        determined by insertion order rather than by the project.
+
+        A short page ends the walk, so the ordinary case is still one round trip.
+        The scan limit is the same kind of ceiling as the candidate scans above
+        and its consequence is reported the same way, and — because a project
+        whose target date was never read measures a *lower* score — the limit also
+        marks ``RiskType.PROJECT`` unexamined, so a risk that is still true
+        because of its target date is not closed for want of the one column that
+        would have said so.
+
+        Returns:
+            ``(targets, projects_beyond_the_scan)``.
         """
-        rows, _total = await self.projects.list_for_user(
-            owner_id, limit=MAX_PROJECT_RISKS * 4, offset=0
-        )
-        return {row.id: row.target_date for row in rows if row.target_date is not None}
+        targets: dict[uuid.UUID, date] = {}
+        read = 0
+        total = 0
+        while read < PROJECT_TARGET_SCAN_LIMIT:
+            rows, total = await self.projects.list_for_user(
+                owner_id, limit=PROJECT_TARGET_PAGE_SIZE, offset=read
+            )
+            for row in rows:
+                if row.target_date is not None:
+                    targets[row.id] = row.target_date
+            read += len(rows)
+            if len(rows) < PROJECT_TARGET_PAGE_SIZE:
+                break
+        return targets, max(0, total - read)
 
     # -- Detection -----------------------------------------------------------
 
@@ -725,22 +826,32 @@ class RiskDetectionService:
             now: The anchor instant, for hours-to-deadline.
 
         Returns:
-            ``(findings, unassessable)`` where ``unassessable`` are inputs that
-            could not be assembled at all and so never reached a scoring
-            function. The partition into persisted and dropped happens in
-            :meth:`_partition`, so both rules live in one place.
+            ``(findings, deferred, unassessable)``. ``deferred`` are findings a
+            write cap kept out of this pass — measured, scoring above zero, and
+            **not** written, which is a different thing from not found.
+            ``unassessable`` are inputs that could not be assembled at all and so
+            never reached a scoring function. The partition into persisted and
+            dropped happens in :meth:`_partition`, so both rules live in one
+            place.
         """
         findings: list[_Finding] = []
-        findings.extend(self._detect_deadlines(context=context, now=now))
+        deferred: list[_Finding] = []
+        deadlines, held = self._detect_deadlines(context=context, now=now)
+        findings.extend(deadlines)
+        deferred.extend(held)
         findings.append(self._detect_workload(context))
         findings.append(await self._detect_estimation(context))
         findings.append(self._detect_consistency(context))
-        findings.extend(self._detect_projects(context=context, today=today))
+        projects, held = self._detect_projects(context=context, today=today)
+        findings.extend(projects)
+        deferred.extend(held)
         findings.append(self._detect_scheduling(context))
-        findings.extend(self._detect_tasks(context))
-        return findings, self._coverage_notes(context)
+        tasks, held = self._detect_tasks(context)
+        findings.extend(tasks)
+        deferred.extend(held)
+        return findings, deferred, self._coverage_notes(context, deferred)
 
-    def _coverage_notes(self, context: _Context) -> list[tuple[str, str]]:
+    def _coverage_notes(self, context: _Context, deferred: list[_Finding]) -> list[tuple[str, str]]:
         """What this pass could not look at, as ``(label, reason)`` pairs.
 
         A detector with no rows to read never reaches its scoring function —
@@ -748,6 +859,12 @@ class RiskDetectionService:
         deadline risks" can be distinguished from "no task carries both a due
         date and an estimate", which are very different sentences and both of
         which otherwise look like an empty Risk Center.
+
+        The capped detectors are named here too, for the same reason and more
+        sharply: a bound on what a pass writes is invisible in its output, and a
+        reader who cannot see it reads the rows that are missing as rows that do
+        not exist. Each sentence therefore says what was left out **and** that
+        the left-out risks were left open rather than closed.
         """
         notes: list[tuple[str, str]] = []
         if not context.open_due:
@@ -774,9 +891,52 @@ class RiskDetectionService:
                     "are not counted in any project's blocked total.",
                 )
             )
-        return notes
+        if context.deadline_unseen:
+            notes.append(
+                (
+                    "Deadline",
+                    f"{context.deadline_unseen} open task(s) due inside this window were beyond "
+                    f"the scan limit of {DEADLINE_SCAN_LIMIT} and were not assessed, so open "
+                    "deadline risks were left as they are.",
+                )
+            )
+        if context.blocked_unseen or context.reschedule_truncated:
+            reason = (
+                f"{context.blocked_unseen} blocked task(s) were beyond the scan limit"
+                if context.blocked_unseen
+                else f"the reschedule scan reached its limit of {RESCHEDULE_SCAN_LIMIT} candidates"
+            )
+            notes.append(
+                (
+                    "Task",
+                    f"Not assessed in full: {reason}, so open task risks were left as they are.",
+                )
+            )
+        if context.project_targets_unseen:
+            notes.append(
+                (
+                    "Project",
+                    f"{context.project_targets_unseen} project(s) were beyond the target-date scan "
+                    f"limit of {PROJECT_TARGET_SCAN_LIMIT} and are scored without their target "
+                    "date, so open project risks were left as they are.",
+                )
+            )
+        for finding in deferred:
+            if not finding.result.available or not finding.result.score:
+                continue
+            notes.append(
+                (
+                    _detector_label(finding.result.risk_type),
+                    f"{finding.result.score} more {finding.result.risk_type.value} risk(s) "
+                    "measured above zero were beyond the cap this pass writes, and their open "
+                    "risks were left as they are.",
+                )
+            )
+        return _dedupe(notes)
 
-    def _detect_deadlines(self, *, context: _Context, now: datetime) -> list[_Finding]:
+    def _detect_deadlines(
+        self, *, context: _Context, now: datetime
+    ) -> tuple[list[_Finding], list[_Finding]]:
         """One deadline risk per open, estimated task due inside the horizon.
 
         Per task rather than per account, because a deadline is a fact about a
@@ -788,6 +948,13 @@ class RiskDetectionService:
         by their due date, read from Phase 6 rather than recomputed, and ``None``
         — a neutral multiplier rather than a pessimistic guess — whenever Phase 6
         had nothing to decide.
+
+        Returns:
+            ``(written, deferred)``. The page is already ordered by due date, so
+            the nearest ``MAX_DEADLINE_TASKS`` deadlines are the ones kept, and
+            what is left is returned rather than discarded — a task past the cap
+            whose risk is still live must not be closed for the crime of not being
+            one of the twenty-five nearest.
         """
         booked = _booked_minutes_by_task(context.session_rows)
         # Divided by 100 here, and the reason is worth stating because getting it
@@ -803,7 +970,7 @@ class RiskDetectionService:
             context.deadlines.adherence_rate / 100.0 if context.deadlines.available else None
         )
         findings: list[_Finding] = []
-        for task in context.open_due[:MAX_DEADLINE_TASKS]:
+        for task in context.open_due:
             if task.due_date is None:  # pragma: no cover - filtered in _open_due_tasks
                 continue
             estimated = int(task.estimated_minutes or 0)
@@ -824,7 +991,7 @@ class RiskDetectionService:
                     task_id=task.id,
                 )
             )
-        return findings
+        return _split_by_cap(findings, MAX_DEADLINE_TASKS)
 
     def _detect_workload(self, context: _Context) -> _Finding:
         """Scheduled minutes against declared availability, over the window.
@@ -892,7 +1059,9 @@ class RiskDetectionService:
             entity_id=None,
         )
 
-    def _detect_projects(self, *, context: _Context, today: date) -> list[_Finding]:
+    def _detect_projects(
+        self, *, context: _Context, today: date
+    ) -> tuple[list[_Finding], list[_Finding]]:
         """One project risk per project, from the Phase 6 project roll-up.
 
         Overdue, remaining and velocity are read from
@@ -902,6 +1071,15 @@ class RiskDetectionService:
         the observed pace only: finishing the remaining work in the days to the
         target date is arithmetic on two figures that already exist, not a new
         measurement.
+
+        Returns:
+            ``(written, deferred)``. Highest score first, so the cap keeps the
+            projects a user would act on, and by id within a score so two passes
+            over the same data defer the same rows. What the cap leaves out is
+            **deferred, not resolved**: those projects are measured, they are
+            reported on the run summary, and their live risks are left alone by
+            the sweep — a project still carrying three overdue tasks is not at
+            risk of nothing merely because it was the twenty-sixth.
         """
         findings: list[_Finding] = []
         for project in context.projects:
@@ -925,11 +1103,10 @@ class RiskDetectionService:
                     project_id=project.project_id,
                 )
             )
-        # Highest first, so the cap keeps the projects a user would act on. The
-        # ones beyond it are still measured — they score zero and are dropped by
-        # the same rule as every other zero — so the cap costs no measurement.
-        findings.sort(key=lambda finding: finding.result.score or 0, reverse=True)
-        return findings[:MAX_PROJECT_RISKS]
+        # Highest first, so the cap keeps the projects a user would act on, and by
+        # id within a score so two passes over the same data defer the same rows.
+        findings.sort(key=lambda finding: (-(finding.result.score or 0), str(finding.entity_id)))
+        return _split_by_cap(findings, MAX_PROJECT_RISKS)
 
     def _detect_scheduling(self, context: _Context) -> _Finding:
         """Faults in the plan itself: overlap, out-of-hours, after-deadline, runs.
@@ -970,7 +1147,7 @@ class RiskDetectionService:
             entity_id=None,
         )
 
-    def _detect_tasks(self, context: _Context) -> list[_Finding]:
+    def _detect_tasks(self, context: _Context) -> tuple[list[_Finding], list[_Finding]]:
         """One task risk per task that is blocked, moved repeatedly, or both.
 
         The only detector scoped to a single row, and the reason it exists
@@ -984,6 +1161,14 @@ class RiskDetectionService:
         the candidates are exactly the tasks with a condition to report, and the
         accounts that have none say so through the coverage note rather than
         through a column of measured zeros.
+
+        Returns:
+            ``(written, deferred)``, and the deferral is the point of writing it
+            this way. Thirty blocked tasks in one account is an ordinary morning,
+            and truncating to twenty-five used to mean the other five were
+            reported as having gone away on every single pass — which is how five
+            of them could never come back, because a resolved risk is terminal
+            until the condition returns and the row is recreated from scratch.
         """
         findings: list[_Finding] = []
         for candidate in context.task_candidates:
@@ -1005,7 +1190,7 @@ class RiskDetectionService:
         # id within a score so two passes over the same data produce the same
         # twenty-five rows in the same order.
         findings.sort(key=lambda finding: (-(finding.result.score or 0), str(finding.entity_id)))
-        return findings[:MAX_TASK_RISKS]
+        return _split_by_cap(findings, MAX_TASK_RISKS)
 
     # -- Judging what to persist --------------------------------------------
 
@@ -1046,9 +1231,11 @@ class RiskDetectionService:
         *,
         owner: User,
         seen: list[tuple[str, str | None, uuid.UUID | None]],
+        deferred: list[tuple[str, str | None, uuid.UUID | None]],
+        unexamined: frozenset[RiskType],
         now: datetime,
     ) -> int:
-        """Close every live risk this pass did not re-detect.
+        """Close every live risk this pass did not re-detect **and could judge**.
 
         This is the step that makes a risk *mean* something. A risk the user
         neither dismissed nor acted on is still sitting in the Risk Center a
@@ -1057,10 +1244,25 @@ class RiskDetectionService:
         this sweep the table is append-only and the user's only way to clear it
         is by hand.
 
-        ``seen`` is the identity of every risk written this pass and **nothing
-        else** — a detector that measured zero is deliberately absent, because a
-        zero is the condition having gone away, which is exactly what should close
-        the old row.
+        ``seen`` is the identity of every risk written this pass, and a detector
+        that measured zero is deliberately absent from it, because a zero is the
+        condition having gone away, which is exactly what should close the old
+        row.
+
+        The two further arguments exist because absence of a finding is not
+        evidence unless the pass was in a position to produce one, and the
+        activity event this writes says "the condition behind it was not detected
+        in this evaluation" — a sentence that is only true when NEXUS looked.
+
+        * ``deferred`` are the identities a **write cap** kept out. The condition
+          was measured and scored above zero; there was simply no room in the
+          twenty-five rows this pass writes. Closing them would report a live
+          condition as a condition that ceased.
+        * ``unexamined`` are the risk types whose **candidate read** stopped at
+          its limit, so this pass cannot say anything at all about whether their
+          conditions are gone. Those risks are left open, which is the safe
+          direction: a risk that outlives its condition is one row the next
+          untruncated pass closes, and the run summary says why in the meantime.
 
         The risks' recommendations are expired in the same step, because a
         suggestion attached to a risk that no longer exists is moot, and "moot" is
@@ -1069,14 +1271,20 @@ class RiskDetectionService:
         Args:
             owner: The account being swept.
             seen: Identities written this pass.
+            deferred: Identities measured this pass but kept out by a write cap.
+            unexamined: Risk types this pass could not judge in full.
             now: The instant to stamp ``resolved_at`` with.
 
         Returns:
             How many live risks were closed.
         """
-        stale = await self.risks.list_stale_live_risks(
-            owner.id, seen=set(seen), limit=RESOLVE_SWEEP_LIMIT
-        )
+        stale = [
+            row
+            for row in await self.risks.list_stale_live_risks(
+                owner.id, seen=set(seen) | set(deferred), limit=RESOLVE_SWEEP_LIMIT
+            )
+            if row.risk_type not in unexamined
+        ]
         if not stale:
             return 0
         resolved_ids = [row.id for row in stale]
@@ -1219,12 +1427,62 @@ class _Context:
     blocked_unseen: int
     open_due: list[Task]
     unestimated_open_due: int
+    #: Open tasks due inside the horizon that sat beyond :data:`DEADLINE_SCAN_LIMIT`.
+    deadline_unseen: int
     project_targets: dict[uuid.UUID, date]
+    #: Projects beyond :data:`PROJECT_TARGET_SCAN_LIMIT`, whose target date this
+    #: pass therefore did not read.
+    project_targets_unseen: int
     #: Open tasks the task-level detector has something to say about: the union
     #: of the blocked scan and the reschedule scan.
     task_candidates: list[_TaskCandidate]
+    #: Whether the reschedule read filled its page, which is the only evidence it
+    #: has that a candidate it did not return exists.
+    reschedule_truncated: bool
     session_rows: list[tuple[Any, ...]]
     availability: list[tuple[int, time, time]]
+    #: Risk types this pass could not judge in full, and therefore must not close
+    #: a live risk of. Derived from the counts above rather than set at the call
+    #: sites, so "did we look at everything?" is one question with one answer.
+    unexamined: frozenset[RiskType]
+
+
+def _unexamined_types(
+    *, deadline_unseen: int, targets_unseen: int, task_scan_truncated: bool
+) -> frozenset[RiskType]:
+    """The risk types this pass was not in a position to judge.
+
+    The three candidate reads that can stop short of their set — the deadline
+    page, the blocked page, the reschedule page — plus the target-date read, whose
+    shortfall does not remove a project from the roll-up but grades it against a
+    deadline of ``None``. All four are reported on the run summary as well; this
+    set is the half that has to reach the *sweep*, because a risk this pass could
+    not judge must not be closed on the strength of a pass that never saw it.
+
+    Account-level types are absent by construction: each of those detectors reads
+    one aggregate for the whole window, so there is no per-row set to fall short
+    of.
+    """
+    unexamined: set[RiskType] = set()
+    if deadline_unseen:
+        unexamined.add(RiskType.DEADLINE)
+    if task_scan_truncated:
+        unexamined.add(RiskType.TASK)
+    if targets_unseen:
+        unexamined.add(RiskType.PROJECT)
+    return frozenset(unexamined)
+
+
+def _split_by_cap(findings: list[_Finding], cap: int) -> tuple[list[_Finding], list[_Finding]]:
+    """The first ``cap`` findings, and the ones the cap holds back.
+
+    Both halves are returned because both matter and they are opposites: the
+    first is what the pass writes, the second is what the pass must **not** treat
+    as absent. A caller that discarded the second would be saying "this
+    condition was not detected" about a condition it had just scored, which is
+    the one inference this module must never make.
+    """
+    return findings[:cap], findings[cap:]
 
 
 # ---------------------------------------------------------------------------
@@ -1517,6 +1775,31 @@ def _severity_value(finding: _Finding) -> str:
     """
     severity = finding.result.severity
     return severity.value if severity is not None else RiskSeverity.LOW.value
+
+
+def _scored_value(finding: _Finding) -> int:
+    """The integer stored on a finding about to be written.
+
+    Named rather than written as ``finding.result.score or 0`` because that
+    expression is precisely the coercion this module's rules forbid: it turns a
+    detector's ``None`` — "I could not judge this" — into a stored ``0``, which is
+    a measurement and reads as one. A detector that cannot judge must produce no
+    row at all, with its reason on the run summary; a detector that measured zero
+    must also produce no row, but it says so on the summary instead.
+
+    Only findings that :meth:`RiskDetectionService._partition` judged available
+    and non-zero reach this function, so ``None`` is unreachable rather than
+    merely unlikely. It is raised rather than defaulted because a defect that got
+    here would be writing a fabricated score into the training data, and a loud
+    failure at that point is cheaper than a quiet zero nobody can trace.
+    """
+    score = finding.result.score
+    if score is None:  # pragma: no cover - unreachable through _partition
+        raise ValueError(
+            "A risk cannot be stored from a detector that could not judge it; "
+            f"{finding.result.risk_type.value} returned no score."
+        )
+    return int(score)
 
 
 def _evidence_payload(result: RiskResult) -> list[dict[str, Any]]:

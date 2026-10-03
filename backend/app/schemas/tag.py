@@ -70,10 +70,15 @@ class TagCreate(BaseModel):
 class TagRead(BaseModel):
     """A tag as returned by the tag endpoints.
 
-    ``task_count`` and ``project_count`` default to zero so a tag read without
-    the association joins is still answerable — it just says "we did not look",
-    which the client cannot distinguish from "none". The list endpoints always
-    supply them.
+    ``task_count`` and ``project_count`` default to zero, which is the honest
+    value for a tag used on nothing and a **false** one for a tag that is used
+    on something nobody counted. The defaults survive only as the fallback for a
+    row read without the association joins; every endpoint here goes through
+    :class:`~app.services.tag_service.TagService`, which fills both — the
+    listing from one aggregate over the page, the single-tag fetch from the same
+    aggregate. It used to fill only the listing, so ``GET /tags/{id}`` reported
+    a tag applied to three tasks as unused while ``GET /tags`` reported the
+    three, and a client had no way to tell which screen was lying.
     """
 
     model_config = ConfigDict(from_attributes=True)

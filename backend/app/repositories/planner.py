@@ -29,6 +29,15 @@ caps it at 24 x 7 = 168 rows.
 ``actual_minutes_for_user`` are a single ``GROUP BY day`` each rather than a
 loop of per-day counts, so a month view is two round trips and its buckets
 cannot disagree with each other mid-write.
+
+**The collision check is one indexed read, not a scan.** ``overlapping_for_user``
+on each of the two tables answers "does this window touch something already
+reserved", which every session write has to ask before it persists. It is the
+same half-open predicate the listings use, so a session cannot overlap a
+neighbouring one by the boundary rule (``10:00`` end against ``10:00`` start is
+back-to-back, not a clash), and it is served by
+``ix_work_sessions_owner_scheduled_start`` because ``owner_id`` is in the
+predicate.
 """
 
 from __future__ import annotations
@@ -43,7 +52,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
-from app.models.planner import AvailabilityRule, CalendarEvent, WorkSession
+from app.models.planner import AvailabilityRule, CalendarEvent, WorkSession, WorkSessionStatus
 
 __all__ = [
     "AvailabilityRuleRepository",
@@ -290,6 +299,49 @@ class CalendarEventRepository:
         )
         return int(result.scalar_one())
 
+    async def overlapping_for_user(
+        self,
+        owner_id: uuid.UUID,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int = 1,
+    ) -> tuple[list[CalendarEvent], int]:
+        """Return the owner's events that overlap ``[start, end)``, earliest first.
+
+        The write-side collision check, and separate from
+        :meth:`list_for_user` because it answers a different question: not "show
+        me this window" but "does this window touch something". ``limit``
+        defaults to one because the caller only ever needs the *first* clash to
+        refuse a write and name it — asking for a thousand rows to report one
+        conflict is how a collision check becomes the slow part of a POST.
+
+        Ordering by ``starts_at`` (with the id tiebreak) is what makes
+        ``limit=1`` deterministic: two events overlapping the same write would
+        otherwise be reported in whichever order the plan chose, and the refusal
+        would name a different event on each attempt.
+
+        Returns:
+            The rows, and the number of rows the predicate matches — so a caller
+            can report "3 events are in the way" without reading them all.
+        """
+        filters = [CalendarEvent.owner_id == owner_id]
+        _overlapping(filters, start, end, CalendarEvent.starts_at, CalendarEvent.ends_at)
+        page = (
+            select(CalendarEvent)
+            .where(*filters)
+            .order_by(CalendarEvent.starts_at.asc(), CalendarEvent.id.asc())
+            .limit(limit)
+        )
+        result = await self.session.execute(page)
+        rows = list(result.scalars().all())
+        total = int(
+            await self.session.scalar(
+                select(func.count()).select_from(CalendarEvent).where(*filters)
+            )
+        )
+        return rows, total
+
     async def update_fields(self, event: CalendarEvent, **fields: object) -> CalendarEvent:
         """Apply a partial update and persist it.
 
@@ -410,6 +462,54 @@ class WorkSessionRepository:
         result = await self.session.execute(page)
         rows = list(result.scalars().all())
 
+        total = int(
+            await self.session.scalar(select(func.count()).select_from(WorkSession).where(*filters))
+        )
+        return rows, total
+
+    async def overlapping_for_user(
+        self,
+        owner_id: uuid.UUID,
+        *,
+        start: datetime,
+        end: datetime,
+        exclude_id: uuid.UUID | None = None,
+        limit: int = 1,
+    ) -> tuple[list[WorkSession], int]:
+        """Return the owner's sessions that overlap ``[start, end)``, earliest first.
+
+        The write-side collision check. Two things distinguish it from
+        :meth:`list_for_user`:
+
+        * **Cancelled sessions are excluded.** A cancelled block holds no time,
+          so refusing a write because of one would stop the user re-using a slot
+          they deliberately released.
+        * ``exclude_id`` is the session being moved. A PATCH that shifts a
+          session by one minute overlaps *itself* on every timestamp it is
+          compared against, and a check that cannot exclude the row under edit
+          would refuse every reschedule.
+
+        ``limit`` defaults to one for the same reason as the event equivalent:
+        the caller needs the first clash to refuse a write and name it.
+
+        Returns:
+            The rows, and the number of live rows the predicate matches.
+        """
+        filters = [
+            WorkSession.owner_id == owner_id,
+            WorkSession.status != WorkSessionStatus.CANCELLED.value,
+        ]
+        _overlapping(filters, start, end, WorkSession.scheduled_start, WorkSession.scheduled_end)
+        if exclude_id is not None:
+            filters.append(WorkSession.id != exclude_id)
+        page = (
+            select(WorkSession)
+            .where(*filters)
+            .order_by(WorkSession.scheduled_start.asc(), WorkSession.id.asc())
+            .limit(limit)
+        )
+        result = await self.session.execute(page)
+        rows = list(result.scalars().all())
         total = int(
             await self.session.scalar(select(func.count()).select_from(WorkSession).where(*filters))
         )
@@ -596,15 +696,58 @@ class AvailabilityRuleRepository:
         this one". Replacing makes the resource's identity the week, not the
         rule row.
 
+        The delete and the inserts share one SAVEPOINT
+        -----------------------------------------------
+        ``delete_for_user`` commits before this method used to insert, so a
+        payload rejected by the unique constraint or by a check constraint —
+        two rules sharing a Monday 09:00 start, a window that ends before it
+        starts — left the user's week deleted and answered 409 for a change that
+        never happened. The data was worse than the error: the client was told
+        "conflict" while its calendar quietly lost every window it had.
+
+        Atomicity is bought with an explicit savepoint rather than with a single
+        statement. One statement would need the DELETE's ``RETURNING`` rows
+        paired positionally with the submitted rules, and a data-modifying CTE
+        sees its own DELETE through the *pre-statement* snapshot, so the
+        insertion would have to be rebuilt out of the RETURNING set — the one
+        place where a reordering silently turns a user's 09:00 window into a
+        17:00 one. The savepoint keeps the submitted values paired with the
+        submitted rules and lets the whole pair fail together, which is the only
+        property the caller actually needs: either the week is exactly the week
+        that was sent, or it is exactly the week that was already there.
+
+        The commit stays *outside* the savepoint because the repository methods
+        here each commit individually and ``replace_for_user`` has always
+        committed — the savepoint release is what makes the statements durable
+        together, and a commit inside the block would end the savepoint's life
+        anyway. ``delete_for_user`` is untouched: the service calls it for a
+        delete-only request and its single-statement transaction is already
+        atomic on its own.
+
         Args:
             owner_id: The user whose pattern is being replaced.
             rules: The new rules, as objects or mappings carrying ``weekday``,
                 ``starts_at``, ``ends_at`` and an optional ``label``.
+
+        Returns:
+            The new rules, refreshed from the database so their ids and
+            timestamps are the stored ones rather than the ones the ORM was
+            holding when the savepoint opened.
+
+        Raises:
+            IntegrityError: A payload the table refuses — a duplicate
+                ``(weekday, starts_at)``, a weekday out of range, a window that
+                does not advance. Raised with the owner's previous rules
+                untouched, so the caller's existing calendar is still there.
         """
-        await self.delete_for_user(owner_id)
         rows = [AvailabilityRule(owner_id=owner_id, **_rule_fields(rule)) for rule in rules]
-        for row in rows:
-            self.session.add(row)
+        async with self.session.begin_nested():
+            await self.session.execute(
+                delete(AvailabilityRule).where(AvailabilityRule.owner_id == owner_id)
+            )
+            for row in rows:
+                self.session.add(row)
+            await self.session.flush()
         await self.session.commit()
         for row in rows:
             await self.session.refresh(row)
@@ -614,7 +757,10 @@ class AvailabilityRuleRepository:
         """Delete every rule belonging to this user.
 
         A set-based ``DELETE`` so a concurrent PUT is a no-op rather than a
-        failure. Called by the service, which commits its own transaction.
+        failure. Called by the service for a delete-only request, which commits
+        its own transaction; :meth:`replace_for_user` issues its own ``DELETE``
+        inside a savepoint rather than calling this, because a committed delete
+        is the one thing a failed replace cannot undo.
         """
         await self.session.execute(
             delete(AvailabilityRule).where(AvailabilityRule.owner_id == owner_id)

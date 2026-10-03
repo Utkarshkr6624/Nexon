@@ -58,8 +58,9 @@ Two things Phase 1-5 cannot record, said out loud
   No Phase 1-5 table marks anything as "learning", and ``KnowledgeService``
   records its events with no ``task_id`` and no ``project_id`` — so "tasks
   completed in projects the user was also writing about" is **not computable**.
-  :meth:`AnalyticsService.learning` says so in its ``basis`` string rather than
-  substituting a weaker correlation that would read as the same number.
+  :meth:`AnalyticsService.learning` reports the figure as ``null`` and says so in its
+  ``basis`` string, rather than substituting a weaker correlation that would read
+  as the same number.
 
 Feature extraction and why ``None`` is not optional
 --------------------------------------------------
@@ -99,6 +100,7 @@ from app.repositories.planner import (
 from app.repositories.project import ProjectRepository
 from app.repositories.task import TaskRepository
 from app.schemas.analytics import (
+    ANALYTICS_FEATURE_SCHEMA_VERSION,
     ComparisonPoint,
     ConsistencyRead,
     CsvExportManifestRead,
@@ -187,12 +189,23 @@ MAX_TIME_BUCKETS = 20
 #: How many rows the overdue drill-down carries. A drill-down, not an export.
 MAX_OVERDUE_ROWS = 20
 
+#: The most project rows a read will page through to turn project ids into
+#: project names. A bound rather than a single page: the previous read asked for
+#: 100 rows and no more, so an account with more than 100 projects had the rest
+#: labelled "Unassigned" — which is a claim about where the work was *recorded*,
+#: and every one of those projects is recorded against a real project row. The
+#: bound exists only to keep an unbounded owner from paging forever; past it the
+#: label degrades to the project's own id, which is ugly but not false.
+PROJECT_NAME_PAGE_SIZE = 100
+PROJECT_NAME_LOOKUP_CEILING = 1000
+
 _TASK_NOT_FOUND = "That task does not exist."
 _PROJECT_NOT_FOUND = "That project does not exist."
 
-#: ``TaskPriority`` as an ordinal. ``feature_snapshot`` is typed
-#: ``dict[str, float | int | None]``, so the grade must be a number, and this is
-#: the only mapping that does not invent an ordering the enum does not have.
+#: ``TaskPriority`` as an ordinal. The feature keys are numbers so a model can
+#: read them as one — ``schema_version`` is the single exception, and it is a
+#: contract string rather than a column — and this is the only mapping that does
+#: not invent an ordering the enum does not have.
 _PRIORITY_RANK = {
     TaskPriority.LOW: 1,
     TaskPriority.MEDIUM: 2,
@@ -760,8 +773,7 @@ class AnalyticsService:
                 by_task[task_id] = by_task.get(task_id, 0) + int(actual_minutes)
 
         total = sum(by_project.values())
-        project_rows, _total = await self.projects.list_for_user(owner.id, limit=100, offset=0)
-        names = {project.id: project.name for project in project_rows}
+        names = await self._project_names(owner.id)
         return TimeDistributionRead(
             total_minutes=total,
             available=bool(by_project),
@@ -775,7 +787,7 @@ class AnalyticsService:
             by_project=[
                 TimeBucketRead(
                     key=str(key) if key is not None else "unassigned",
-                    label=names.get(key, "Unassigned") if key is not None else "Unassigned",
+                    label=_project_label(key, names),
                     minutes=minutes,
                     share=rate(minutes, total),
                 )
@@ -816,7 +828,7 @@ class AnalyticsService:
         created = window["tasks_created"]
         completed = window["tasks_completed"]
         denominator = created or completed
-        top_overdue = await self._top_overdue(owner.id, today)
+        top_overdue, top_overdue_truncated = await self._top_overdue(owner.id, today)
         return TaskAnalyticsRead(
             total_tasks=int(status.get("total", 0)),
             completed_tasks=int(status.get("completed", 0)),
@@ -841,6 +853,7 @@ class AnalyticsService:
             else f"{NOT_ENOUGH_ACTIVITY}: no tasks exist for this account.",
             estimation=_estimation_read(estimation, start, end),
             top_overdue=top_overdue,
+            top_overdue_truncated=top_overdue_truncated,
             by_status=status,
             by_priority=priority,
             range=self._metric_range(start, end),
@@ -942,19 +955,20 @@ class AnalyticsService:
             # Phase 5 records knowledge events with no `task_id` and no
             # `project_id` — `KnowledgeService.record` passes only a title in the
             # metadata — so "tasks completed in projects the user was also writing
-            # about" is **not computable** from the rows that exist. The schema
-            # types this field as a plain int, so 0 is what is returned; the
-            # `basis` string below says in as many words that the figure is not
-            # measured. The honest fix is a nullable column, not a better query.
-            knowledge_linked_tasks=0,
+            # about" is **not computable** from the rows that exist. `None`, not
+            # `0`: a zero would say the correlation was measured and came back
+            # empty, and inside a training matrix that is a fabricated
+            # observation. The field is `int | None` and its description says so;
+            # the `basis` string below repeats it for the reader.
+            knowledge_linked_tasks=None,
             knowledge_interactions=interactions,
             notes_created=int(knowledge.get("notes_created", 0)),
             notes_updated=int(knowledge.get("notes_updated", 0)),
             basis=(
                 "calendar_events typed `study`, plus Phase 5 knowledge activity "
-                "events. `knowledge_linked_tasks` is 0 because it is NOT measurable: "
-                "Phase 5 writes its events with no task_id and no project_id, so no "
-                "query can join knowledge to a project."
+                "events. `knowledge_linked_tasks` is null because it is NOT "
+                "measurable: Phase 5 writes its events with no task_id and no "
+                "project_id, so no query can join knowledge to a project."
             ),
             definition=(
                 "NEXUS stores no learning flag on any table. These figures are the "
@@ -1313,7 +1327,7 @@ class AnalyticsService:
 
     async def feature_snapshot(
         self, *, owner: User, task_id: uuid.UUID
-    ) -> dict[str, float | int | None]:
+    ) -> dict[str, float | int | str | None]:
         """The ML feature vector for one task.
 
         **``None`` means "not observable"; it never means zero.** A zero here is a
@@ -1325,14 +1339,25 @@ class AnalyticsService:
         present and its value is ``None``, which an imputer can handle
         deliberately rather than by accident.
 
+        **Every row carries ``schema_version``**, the same
+        ``analytics_features.v1`` contract the Phase 8/9 vectors stamp themselves
+        with. Without it a training row cannot be attributed to the extraction
+        that produced it, so a column whose meaning changed between two runs is
+        indistinguishable from a feature that moved. It sits **beside**
+            ``features``, not inside it, because ``features`` is a feature matrix:
+            a positional row of numbers whose every column must be a feature. A
+            string in that mapping is not a feature, and a version key smuggled
+            into it becomes a column a model is then asked to fit.
+
         Args:
             owner: The caller. A task belonging to somebody else is *not found*,
                 so this cannot be used to probe which task ids exist.
             task_id: The task to describe.
 
         Returns:
-            A mapping with stable snake_case keys — the same keys, all present, on
-            every call whatever the data says.
+            A mapping carrying ``schema_version``, ``generated_at``, ``task_id``
+            and a ``features`` object whose keys are stable snake_case — the same
+            keys, all present, on every call whatever the data says.
 
         Raises:
             NotFoundError: If the task does not exist **or** is not the caller's.
@@ -1374,34 +1399,47 @@ class AnalyticsService:
             else (None, None, None)
         )
         return {
-            "priority": _priority_rank(task.priority),
-            "task_age_days": max(
-                0, (today - (created_at or task.created_at).astimezone(UTC).date()).days
-            ),
-            "estimated_minutes": task.estimated_minutes,
-            # `tasks.actual_minutes` is NOT NULL with a zero default, so it cannot
-            # distinguish "never tracked" from "tracked as zero" — the ambiguity
-            # app/models/task.py documents. With no session behind it, the honest
-            # answer is that the figure was never observed.
-            "actual_minutes": task.actual_minutes if session_count else None,
-            "deadline_distance_days": (due_date - today).days if due_date is not None else None,
-            "reschedule_count": reschedules,
-            "project_open_task_count": open_by_project.get(task.project_id, 0),
-            "historical_completion_rate": rate(completed, total_tasks),
-            "recent_work_minutes": session_minutes if session_count else None,
-            "work_session_count": session_count,
-            "time_of_day": first_work.astimezone(UTC).hour if first_work is not None else None,
-            "day_of_week": (due_date or task.created_at.date()).weekday(),
-            "project_velocity": velocity,
-            "overdue_count": (
-                max(0, (today - due_date).days)
-                if due_date is not None and due_date < today and task.completed_at is None
-                else 0
-            ),
-            # Reported alongside the other features rather than inside it: the
-            # project-level backlog pressure the task sits in, which a model needs
-            # and which the per-task figures alone do not carry.
-            "project_overdue_task_count": overdue_by_project.get(task.project_id, 0),
+            "schema_version": ANALYTICS_FEATURE_SCHEMA_VERSION,
+            "generated_at": today,
+            "task_id": str(task.id),
+            "features": {
+                "priority": _priority_rank(task.priority),
+                "task_age_days": max(
+                    0, (today - (created_at or task.created_at).astimezone(UTC).date()).days
+                ),
+                "estimated_minutes": task.estimated_minutes,
+                # `tasks.actual_minutes` is NOT NULL with a zero default, so it cannot
+                # distinguish "never tracked" from "tracked as zero" — the ambiguity
+                # app/models/task.py documents. With no session behind it, the honest
+                # answer is that the figure was never observed.
+                "actual_minutes": task.actual_minutes if session_count else None,
+                "deadline_distance_days": (due_date - today).days if due_date is not None else None,
+                "reschedule_count": reschedules,
+                "project_open_task_count": open_by_project.get(task.project_id, 0),
+                "historical_completion_rate": rate(completed, total_tasks),
+                "recent_work_minutes": session_minutes if session_count else None,
+                "work_session_count": session_count,
+                "time_of_day": first_work.astimezone(UTC).hour if first_work is not None else None,
+                # The weekday of the *deadline*, or `None` when there is no deadline. It was
+                # once `(due_date or task.created_at.date()).weekday()`, which reported
+                # the creation weekday under the name of a deadline weekday: beside
+                # `deadline_distance_days=None` in the same row, that claims a deadline
+                # the task does not have, and "no deadline pressure" is exactly the
+                # signal a fabricated weekday would destroy. The creation weekday is a
+                # real fact about a different thing; if it is wanted, it has to be
+                # asked for under its own name.
+                "day_of_week": due_date.weekday() if due_date is not None else None,
+                "project_velocity": velocity,
+                "overdue_count": (
+                    max(0, (today - due_date).days)
+                    if due_date is not None and due_date < today and task.completed_at is None
+                    else 0
+                ),
+                # Reported alongside the other features rather than inside it: the
+                # project-level backlog pressure the task sits in, which a model needs
+                # and which the per-task figures alone do not carry.
+                "project_overdue_task_count": overdue_by_project.get(task.project_id, 0),
+            },
         }
 
     # -- Internals -----------------------------------------------------------
@@ -1548,40 +1586,99 @@ class AnalyticsService:
             if estimated
         ]
 
-    async def _top_overdue(self, owner_id: uuid.UUID, today: date) -> list[OverdueTaskRead]:
-        """The most overdue open tasks, for the drill-down list.
+    async def _project_names(self, owner_id: uuid.UUID) -> dict[uuid.UUID, str]:
+        """Every project name the owner has, up to the documented ceiling.
+
+        Paged rather than asked for once. The single page of 100 this replaced
+        was not a bound, it was a guess with no failure mode: the projects past it
+        were simply absent from the map, and the caller could only label them by
+        whatever it substituted. Paging until the owner runs out means the bound
+        is the only thing that can truncate a name lookup, and it is a stated one.
+
+        Args:
+            owner_id: The account whose projects are named.
+
+        Returns:
+            The resolved ``{project_id: name}`` map. An id missing from it belongs
+            to a project this lookup did not reach, **not** to no project at all.
+        """
+        names: dict[uuid.UUID, str] = {}
+        offset = 0
+        while offset < PROJECT_NAME_LOOKUP_CEILING:
+            rows, _total = await self.projects.list_for_user(
+                owner_id, limit=PROJECT_NAME_PAGE_SIZE, offset=offset
+            )
+            if not rows:
+                break
+            names.update({project.id: project.name for project in rows})
+            offset += len(rows)
+            if len(rows) < PROJECT_NAME_PAGE_SIZE:
+                break
+        return names
+
+    async def _top_overdue(
+        self, owner_id: uuid.UUID, today: date
+    ) -> tuple[list[OverdueTaskRead], bool]:
+        """The most overdue open tasks, for the drill-down list, and whether it is short.
 
         Read through the task repository rather than the analytics one: it is an
         ordinary owner-scoped task listing, and asking the analytics repository to
         re-state a listing it does not own would be a second code path for the
-        same question. ``due_before`` is the half of the predicate the index can
-        serve; the status filter runs over the capped page rather than as a second
-        indexed round trip, which is why the page is fetched at the documented
-        maximum before being narrowed.
+        same question.
+
+        The open-status predicate is asked of the **query**, once per member of
+        :data:`_OPEN_STATUSES`, and the page is not narrowed afterwards. It used to
+        fetch the first 100 rows due before today in either status and drop the
+        closed ones in Python, so an account whose 100 earliest-due rows were all
+        finished answered ``overdue_tasks: 5`` beside an empty drill-down list, and
+        nothing in the response said the list had been cut. ``status`` is a single
+        value on the repository call rather than a set, which is why this is a
+        small loop instead of one statement; the cap is per status, and the union
+        of the per-status top-N by due date contains the overall top-N by due
+        date, so the merge below cannot drop a row that belonged in the result.
+
+        Args:
+            owner_id: The account whose tasks are listed.
+            today: The date "overdue" is measured against, from the database clock.
+
+        Returns:
+            At most :data:`MAX_OVERDUE_ROWS` reads, most overdue first, and a flag
+            saying whether more open overdue tasks existed than the list holds.
         """
-        rows, _total = await self.tasks.list_for_user(
-            owner_id,
-            limit=100,
-            offset=0,
-            due_before=today,
-            sort="due_date",
-            order="asc",
-        )
-        overdue = [
-            OverdueTaskRead(
-                task_id=task.id,
-                title=task.title,
-                due_date=task.due_date,
-                # None, not 0: a task with no due date is not "zero days late",
-                # the question does not apply to it.
-                days_overdue=None if task.due_date is None else (today - task.due_date).days,
-                priority=task.priority,
+        overdue: list[OverdueTaskRead] = []
+        matched = 0
+        for status in _OPEN_STATUSES:
+            rows, total = await self.tasks.list_for_user(
+                owner_id,
+                limit=MAX_OVERDUE_ROWS,
+                offset=0,
+                status=status,
+                due_before=today,
+                sort="due_date",
+                order="asc",
             )
-            for task in rows
-            if task.status in _OPEN_STATUSES and task.due_date is not None
-        ]
+            for task in rows:
+                # `due_before` already excludes a null due date in SQL; the guard
+                # states the invariant that `days_overdue` may not be 0 for one.
+                if task.due_date is None:
+                    continue
+                overdue.append(
+                    OverdueTaskRead(
+                        task_id=task.id,
+                        title=task.title,
+                        due_date=task.due_date,
+                        # None, not 0: a task with no due date is not "zero days
+                        # late", the question does not apply to it.
+                        days_overdue=(today - task.due_date).days,
+                        priority=task.priority,
+                    )
+                )
+            matched += total
         overdue.sort(key=lambda read: read.days_overdue or 0, reverse=True)
-        return overdue[:MAX_OVERDUE_ROWS]
+        # `matched` is the unpaginated count the repository counted in SQL, so the
+        # flag is true whenever an open overdue task exists that the list does not
+        # carry — including the case where a single status filled its own page.
+        return overdue[:MAX_OVERDUE_ROWS], matched > MAX_OVERDUE_ROWS
 
     async def _project_completions(
         self, owner_id: uuid.UUID, project_id: uuid.UUID, start: date, end: date
@@ -1615,6 +1712,21 @@ class AnalyticsService:
             # the database knows precisely.
             updated_at=row.updated_at,
         )
+
+
+def _project_label(project_id: uuid.UUID | None, names: dict[uuid.UUID, str]) -> str:
+    """The project's own name, or its id. Never "Unassigned" for a real project.
+
+    ``Unassigned`` is a claim about a **session**: this time was recorded against
+    no project, and it is counted in ``unassigned_minutes`` beside this list. A
+    project id that :meth:`AnalyticsService._project_names` did not resolve still
+    belongs to a project, so labelling it "Unassigned" asserts that the minutes
+    were unrecorded against any project while the same response counts them under
+    a project key. The id is ugly; it is not a lie.
+    """
+    if project_id is None:
+        return "Unassigned"
+    return names.get(project_id) or f"Project {str(project_id)[:8]}"
 
 
 def _by_day(rows: Sequence[tuple[date, int]]) -> dict[date, int]:

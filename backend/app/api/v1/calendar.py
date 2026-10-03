@@ -211,18 +211,28 @@ async def update_event(
     """Apply a partial update to an event the caller owns.
 
     **A field is written if the client named it** — clearing a location or a
-    description is ``"location": null``, not an absent key.
+    description is ``"location": null``, not an absent key. A window end is the
+    exception, because ``"starts_at": null`` clears nothing: the column is
+    ``NOT NULL``, and the request used to reach the service's window check as
+    ``None`` and leave as an unhandled **500**. It is a 422 naming the field.
 
     The window is re-checked against the **persisted** row, not only against the
     payload. A PATCH that moves only ``starts_at`` past a stored ``ends_at``
     carries nothing for the schema to compare against, and would otherwise
     persist an impossible schedule that no single request ever expressed.
 
+    **An event may still be moved over another event.** Deliberate, and a
+    different question from the one ``POST /work-sessions`` refuses: a meeting is
+    the user's own statement about their day, and real calendars hold concurrent
+    meetings, whereas a work session is a reservation other machinery places
+    into. Overlapping events are reported instead of prevented — as an
+    ``overlapping_events`` conflict from ``GET /planner/conflicts``.
+
     ``extra="forbid"`` means an unknown field is a 422 naming it, rather than a
     silent drop that reads as a successful write.
 
     Errors: 404 for an event that is not the caller's; 422 for a window that
-    ends before it starts.
+    ends before it starts, or a null window end.
     """
     event = await planner.get_event(event_id=event_id, owner=current_user)
     return await planner.update_event(event=event, data=payload, owner=current_user)

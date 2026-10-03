@@ -16,8 +16,17 @@ elapsed minutes have to come from the **database** clock, not from this process:
 a timer that read its own clock and computed the difference loses or invents
 time the moment the host and the server disagree, and two tabs starting the same
 session would each write their own answer. Routing them makes the service the
-only writer of ``actual_start``/``actual_end``/``actual_minutes``, so a PATCH can
-never forge a timing no clock produced.
+only writer of ``actual_start``/``actual_end``/``actual_minutes`` — and the PATCH
+schema no longer *accepts* those three fields, so the promise is kept at the
+edge with a 422 rather than relied on further down.
+
+Overlap
+-------
+**A work session may not be booked over another one or over a calendar event.**
+The rule lives in ``PlannerService._assert_window_free``, so the hand-created
+session and the suggestion the engine proposed are judged by the same read.
+Overlap is half-open — 10:00 against 10:00 is back-to-back — and a cancelled
+session holds no time, so releasing a slot frees it.
 
 Tenancy
 -------
@@ -150,8 +159,16 @@ async def create_session(
     before the row is written, so another account's id leaves no row behind at
     all and answers 404 rather than 403.
 
-    Errors: 404 for a task or project that is not the caller's; 422 for a window
-    that ends before it starts, a naive datetime, or a negative estimate.
+    **The window must be free.** A session overlapping another live session, or
+    a calendar event, is a **409** naming the row already in the way — checked in
+    the service, so the suggestion-accept path is covered by the same rule rather
+    than by a second implementation of it. Back-to-back is not overlap: a block
+    ending at 10:00 and one starting at 10:00 are both stored. A cancelled
+    session holds no time and never blocks a new one.
+
+    Errors: 404 for a task or project that is not the caller's; 409 for a window
+    that is already reserved; 422 for a window that ends before it starts, a
+    naive datetime, or a negative estimate.
     """
     return await planner.create_session(owner=current_user, data=payload)
 
@@ -192,19 +209,32 @@ async def update_session(
     """Apply a partial update to a session the caller owns.
 
     **A field is written if the client named it** — cancelling a block is
-    ``"status": "cancelled"``, not an absent key.
+    ``"status": "cancelled"``, not an absent key. The one exception is a window
+    end: ``"scheduled_start": null`` cannot clear a ``NOT NULL`` column, so it
+    is a **422 naming the field** rather than a 500 from the service trying to
+    compare ``None`` with a datetime.
 
     The window is re-checked against the **persisted** row: a PATCH that moves
     only ``scheduled_start`` past a stored ``scheduled_end`` carries nothing for
     the schema to compare against, and would otherwise persist an impossible
-    block no single request expressed.
+    block no single request expressed. A move is also re-checked for **overlap**
+    with the rest of the calendar — 409 naming the row in the way — excluding
+    this one, since a session overlaps itself on every instant of its own window.
+
+    **``actual_minutes``, ``actual_start`` and ``actual_end`` are not accepted.**
+    They used to be in the payload schema and dropped by the service, so
+    ``{"actual_minutes": 600}`` answered 200 and changed nothing. They are now a
+    **422 naming the field**: those three columns are measurements taken by
+    ``/start`` and ``/stop`` from the database clock, and a client-supplied
+    duration would put a number on the time-tracking page that no clock produced.
 
     Cancelling is an ordinary edit rather than a routed transition, because a
     session has no lifecycle rules a blanket write could bypass — starting and
     stopping are routed because the clock is involved, not the state machine.
 
-    Errors: 404 for a session that is not the caller's; 422 for an inverted
-    window.
+    Errors: 404 for a session that is not the caller's; 409 for a move onto time
+    that is already reserved; 422 for an inverted window, a null window end, or
+    one of the three measured fields.
     """
     session_row = await planner.get_session(session_id=session_id, owner=current_user)
     return await planner.update_session(session=session_row, data=payload, owner=current_user)

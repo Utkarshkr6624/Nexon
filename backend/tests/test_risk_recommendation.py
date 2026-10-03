@@ -55,6 +55,13 @@ this phase was being built rather than against the design:
   row-level sibling stored correctly. The metadata assertions here are therefore
   genuine database round trips through :func:`_stored`, not reads of the object
   the repository just handed back.
+* A deadline sentence's date was rebuilt rather than read. ``detected_at`` (the
+  instant the row was written) and ``deadline_in_hours`` (a gap measured at the
+  start of the pass) are two different clocks, and adding one to the other names
+  a day that is late whenever a pass begins before midnight and writes after it.
+  The date now comes from the task's own ``due_date`` column, and the guard below
+  moves ``detected_at`` a day forward so the disagreement is visible without
+  having to run the suite at 23:59.
 
 The fixtures build risks directly through
 :meth:`~app.repositories.risk.RiskRepository.upsert_risk` rather than by running
@@ -100,11 +107,11 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ConflictError, NotFoundError
@@ -366,12 +373,14 @@ async def _block_time_fixture(seed: AnalyticsSeed, risks: RiskRepository, owner:
 
 
 def _assert_block_time(rows: list[Recommendation], risk: Risk) -> _RuleFixture:
-    """The due date is derived from the pass's own instant, so it is recomputed here.
+    """This fixture's task carries no due date, so the sentence names none.
 
-    Only the date fragment is environment-dependent; everything else in the
-    expected sentence is fixed by the fixture's metadata and is asserted whole.
+    That is the honest branch and it is asserted whole: the rule reads the date
+    off the task rather than rebuilding one from ``deadline_in_hours`` and
+    ``detected_at``, so a task with no date recorded produces a pronoun and no
+    invented day. The dated path is covered separately, by the regression guards
+    below, which seed a real ``due_date``.
     """
-    due = f"{risk.detected_at + timedelta(hours=24):%d %b %Y}"
     row = _only(rows, RecommendationType.BLOCK_TIME)
     return _RuleFixture(
         key="block_time",
@@ -381,15 +390,15 @@ def _assert_block_time(rows: list[Recommendation], risk: Risk) -> _RuleFixture:
         primary=row,
         entity_type=ENTITY_TASK,
         entity_id=risk.entity_id,
-        title=f"Schedule another 3h for Atlas data migration before {due}",
+        title="Schedule another 3h for Atlas data migration before its due date",
         description=(
-            "Add 3h of unscheduled work to Atlas data migration on or before "
-            f"{due}, so the time exists before the date it is needed."
+            "Add 3h of unscheduled work to Atlas data migration on or before its due "
+            "date, so the time exists before the date it is needed."
         ),
         reason=(
             "5h of estimated work remains on Atlas data migration and 2h is booked "
-            f"before {due}, leaving 3h with no time scheduled. Recorded risk score 60 "
-            "of 100 (high severity, medium evidence strength)."
+            "before its due date, leaving 3h with no time scheduled. Recorded risk "
+            "score 60 of 100 (high severity, medium evidence strength)."
         ),
         figures=("5h", "2h", "3h", "60 of 100"),
     )
@@ -424,7 +433,14 @@ async def _review_deadline_fixture(seed: AnalyticsSeed, risks: RiskRepository, o
 
 
 def _assert_review_deadline(rows: list[Recommendation], risk: Risk) -> _RuleFixture:
-    due = f"{risk.detected_at + timedelta(hours=48):%d %b %Y}"
+    """No due date on the task, so no date is named; the distance still is.
+
+    "2 days" is quoted verbatim from the detector's own ``deadline_in_hours`` and
+    is a duration rather than a calendar day, so the two clocks cannot disagree
+    about it the way they could about a date. Asserting the sentence whole keeps
+    that split honest: the date comes from a column or not at all, while the
+    duration is the engine's own measurement and is repeated as given.
+    """
     row = _only(rows, RecommendationType.REVIEW_DEADLINE)
     return _RuleFixture(
         key="review_deadline",
@@ -436,13 +452,13 @@ def _assert_review_deadline(rows: list[Recommendation], risk: Risk) -> _RuleFixt
         entity_id=risk.entity_id,
         title="Check whether Ledger cutover is still achievable",
         description=(
-            "Review whether Ledger cutover is still achievable against "
-            f"{due}, and move the date or the scope if it is not."
+            "Review whether Ledger cutover is still achievable against its due date, "
+            "and move the date or the scope if it is not."
         ),
         reason=(
             "All 2h of the work remaining on Ledger cutover is already booked before "
-            f"{due}, which is 2 days away, so any slip has nowhere to go. Recorded "
-            "risk score 40 of 100 (medium severity, low evidence strength)."
+            "its due date, which is 2 days away, so any slip has nowhere to go. "
+            "Recorded risk score 40 of 100 (medium severity, low evidence strength)."
         ),
         figures=("2h", "2 days", "40 of 100"),
     )
@@ -2062,6 +2078,150 @@ async def test_every_suggestion_is_written_for_one_account_only(
     stored = await _stored(db_session, fixture.primary.id)
 
     assert stored.user_id == owner.id
+
+
+#: How far out the task's due date sits, in the three regression cases below.
+#: Today, tomorrow and three days out are the three a calendar word can get
+#: wrong, and they fail in the same direction: a day read late is still a
+#: perfectly well-formed date, so only the day's own number tells them apart.
+DUE_HORIZONS = (0, 1, 3)
+
+
+@pytest.mark.parametrize("days_out", DUE_HORIZONS)
+async def test_the_due_date_named_on_the_first_pass_is_the_tasks_own(
+    days_out: int,
+    seed: AnalyticsSeed,
+    risks: RiskRepository,
+    owner: User,
+    service: RecommendationService,
+    db_session: AsyncSession,
+) -> None:
+    """A deadline sentence names the task's own due date, on the very first pass.
+
+    **The defect this guards.** The due phrase used to be rebuilt as
+    ``detected_at + deadline_in_hours``: a gap the detector measures at the
+    *start* of its pass, added to the instant the row is *written*. Two clocks in
+    one sum, and the answer is ``due_date + (written_at - measured_at)``. On an
+    ordinary pass the two agree to the second and the copy is right; on a pass
+    that begins before midnight and writes its rows after it the sum lands a whole
+    day late. The next pass repairs the text, which is exactly why the defect
+    survives — the bad day is what the user is shown first, and a reason is
+    persisted, so it is stored too.
+
+    **The fixture.** ``deadline_in_hours`` is computed the way
+    :func:`~app.services.risk.detection._hours_until` computes it — to the end of
+    the due day, from the database clock — and ``detected_at`` is then moved one
+    day later, which is what a midnight-straddling pass produces and what turns a
+    latent disagreement into a visible one. The old sum reads *the day after the
+    due date* in all three cases, so this test fails on every parameter rather
+    than only when the suite happens to run at 23:59.
+
+    **The expected sentence**, written from the fixture's own numbers: 300
+    estimated minutes with 120 booked leaves a 180-minute gap, so the title says
+    "3h" and the reason says "5h of estimated work remains", "2h is booked" and
+    "3h with no time scheduled" beside the detector's own score of 60 of 100
+    (high severity, medium evidence strength). The date in all three fields is the
+    task's ``due_date`` rendered ``%d %b %Y``.
+    """
+    now = await _db_now(db_session)
+    due = now.date() + timedelta(days=days_out)
+    # The detector's own convention: ``tasks.due_date`` is a date, so it decides
+    # on the end of that day. Quoted rather than approximated so the fixture is a
+    # deadline risk the pass could really have written.
+    hours = (datetime.combine(due, time.max, tzinfo=UTC) - now).total_seconds() / 3600.0
+    project = await seed.project(name="Atlas data migration")
+    task = await seed.task(project_id=project.id, title="Atlas data migration", due_date=due)
+    risk = await _store(
+        risks,
+        owner,
+        risk_type=RiskType.DEADLINE,
+        severity=RiskSeverity.HIGH,
+        score=60,
+        evidence_strength=EvidenceStrength.MEDIUM,
+        entity_type=ENTITY_TASK,
+        entity_id=task.id,
+        metadata={
+            "title": "Atlas data migration",
+            "remaining_minutes": 300,
+            "available_minutes": 120,
+            "deadline_in_hours": hours,
+        },
+    )
+    await db_session.execute(
+        update(Risk)
+        .where(Risk.id == risk.id)
+        .values(detected_at=now + timedelta(days=1))
+        .execution_options(synchronize_session=False)
+    )
+    await db_session.commit()
+    stamped = (
+        await db_session.execute(
+            select(Risk).where(Risk.id == risk.id).execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+
+    rows = await service.generate(owner=owner, risks=[stamped])
+
+    row = _only(rows, RecommendationType.BLOCK_TIME)
+    assert row.title == f"Schedule another 3h for Atlas data migration before {due:%d %b %Y}"
+    assert row.description == (
+        "Add 3h of unscheduled work to Atlas data migration on or before "
+        f"{due:%d %b %Y}, so the time exists before the date it is needed."
+    )
+    assert row.reason == (
+        "5h of estimated work remains on Atlas data migration and 2h is booked "
+        f"before {due:%d %b %Y}, leaving 3h with no time scheduled. Recorded risk "
+        "score 60 of 100 (high severity, medium evidence strength)."
+    )
+    stored = await _stored(db_session, row.id)
+    assert stored.reason == row.reason, "a wrong day here would be persisted, not merely shown"
+
+
+@pytest.mark.parametrize("status", [RiskStatus.RESOLVED, RiskStatus.DISMISSED])
+async def test_closing_a_risk_expires_the_suggestions_attached_to_it(
+    status: RiskStatus,
+    seed: AnalyticsSeed,
+    risks: RiskRepository,
+    owner: User,
+    service: RecommendationService,
+    db_session: AsyncSession,
+) -> None:
+    """A risk the user closes takes its open suggestions with it, either way.
+
+    Both terminal statuses are covered because both are reachable from the Risk
+    Center — ``POST /{risk_id}/resolve`` and ``POST /{risk_id}/dismiss`` — and a
+    hook that worked for one and not the other would leave half the closable risks
+    holding suggestions for a condition its owner has already answered.
+
+    The expected figures are the two columns themselves: the closed risk's
+    suggestion goes to ``expired`` with ``expires_at`` stamped, the suggestion on
+    a risk that is still live stays ``new`` with ``expires_at`` null, and
+    ``responded_at`` stays null on both, because the user answered the *risk* and
+    never opened or declined the suggestion. That last one is the training label:
+    a suggestion that went moot is a different observation from one they refused.
+
+    This drives the two steps a close is made of — the repository transition, then
+    :meth:`RecommendationService.expire_for_resolved` — which is what
+    ``_transition`` in ``app/api/v1/risks.py`` has to do and, as of this writing,
+    does not: that helper calls ``RiskRepository.transition_risk`` and nothing
+    else, so a suggestion closed from the Risk Center stays ``new`` forever. The
+    seam is pinned here; the wiring is a defect reported against a file this
+    change does not own.
+    """
+    closed = await _build("block_time", seed, risks, owner, service)
+    still_live = await _build("reduce_workload", seed, risks, owner, service)
+
+    await risks.transition_risk(owner.id, closed.risks[0].id, status=status.value, responded=True)
+    expired = await service.expire_for_resolved(owner=owner, risk_ids=[closed.risks[0].id])
+
+    assert expired == 1
+    row = await _stored(db_session, closed.primary.id)
+    assert row.status == RecommendationStatus.EXPIRED.value
+    assert row.expires_at is not None
+    assert row.responded_at is None, "the user closed the risk, not the suggestion"
+    other = await _stored(db_session, still_live.primary.id)
+    assert other.status == RecommendationStatus.NEW.value
+    assert other.expires_at is None
 
 
 # ---------------------------------------------------------------------------

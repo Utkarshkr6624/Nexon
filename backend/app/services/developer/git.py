@@ -113,10 +113,18 @@ GIT_EXECUTABLE = "git"
 #: guarantee in this docstring.
 DEFAULT_GIT_TIMEOUT_SECONDS = 30
 
-#: The most commits one scan will return. A bound rather than a page size: the
-#: scan is idempotent and re-runnable, so a repository larger than this is
-#: scanned newest-first and picked up again on the next call rather than having
-#: one request try to read a decade of history.
+#: The most commits one scan will return, and git takes the *newest* N.
+#:
+#: **The truncation is permanent, and it is a ceiling on measurement rather than
+#: a page waiting to be picked up.** An incremental scan passes ``--since`` at
+#: the repository's stored high-water mark, which is its newest recorded commit,
+#: so the commits this leaves out are older than that mark and sit behind both
+#: filters at once: no later scan asks for them, and a full re-scan asks for the
+#: same newest N. A repository with more history than the ceiling records only
+#: these commits, for the life of the registration — which is why the ceiling is
+#: a setting (``developer_max_commits_per_scan``) rather than a constant a
+#: deployment cannot argue with, and why nothing downstream may describe a
+#: truncated repository's history as though it were the whole of it.
 MAX_COMMITS_PER_SCAN = 2000
 
 #: Hard ceiling on the bytes one invocation may return. The ``ls-files`` and
@@ -731,10 +739,21 @@ def validate_repository_path(
     a filesystem reader and does not reach into configuration itself. ``None``
     means "no allowlist configured", which is the default.
 
+    **An allowlist that resolves to nothing permits nothing.** A configured list
+    whose every entry was dropped by :func:`parse_path_allowlist` — an entry
+    carrying a NUL byte, a path the platform cannot resolve — has permitted *no*
+    directory, and skipping the check because the parse came back empty is the one
+    way this function could turn a locked-down deployment into an open one. So the
+    test is "did the caller configure a list", not "did it produce a usable
+    root": a configured list that produced none denies every path, with the same
+    sentence a path outside the roots gets.
+
     Args:
         path: A local path, absolute or relative, ``~``-prefixed or not.
         allowlist: Permitted roots, or ``None`` for no restriction. A path equal
-            to a root is permitted, as is any path underneath one.
+            to a root is permitted, as is any path underneath one. An empty
+            sequence is *not* "no restriction": it is a configured list that
+            permits nothing, and it is refused.
 
     Returns:
         The resolved absolute path to the repository root.
@@ -756,9 +775,12 @@ def validate_repository_path(
             f"No directory was found at {sanitize_git_message(str(expanded))}."
         ) from exc
 
-    if allowlist:
+    if allowlist is not None:
         roots = parse_path_allowlist(",".join(str(root) for root in allowlist))
-        if roots and not any(resolved == root or root in resolved.parents for root in roots):
+        # `not roots` rather than `if roots`: a configured allowlist whose every
+        # entry was dropped has permitted no directory, and letting it through
+        # would read the failure of a malformed setting as the absence of one.
+        if not roots or not any(resolved == root or root in resolved.parents for root in roots):
             raise GitRepositoryError(
                 f"{sanitize_git_message(str(resolved))} is outside the directories this "
                 "server is allowed to read repositories from."
@@ -1132,7 +1154,11 @@ async def _read_stat_records(
 
 
 async def _attribute_branches(
-    repo_path: Path, rows: Sequence[tuple[str, str, datetime, str | None, str | None, str]]
+    repo_path: Path,
+    rows: Sequence[tuple[str, str, datetime, str | None, str | None, str]],
+    *,
+    since: datetime | None,
+    limit: int,
 ) -> dict[str, str]:
     """Map each collected commit hash to the branch it belongs to.
 
@@ -1150,6 +1176,21 @@ async def _attribute_branches(
     itself names the ref that reached it. One traversal, whatever the repository
     size.
 
+    **The walk runs inside the same window as the other two passes.** ``--since``
+    and ``-n`` are the arguments :func:`_read_commit_rows` used, which is what
+    makes this the third pass over one window rather than a fourth pass over all
+    of history: an incremental re-scan that transferred two commits would
+    otherwise read every commit in the repository to attribute two of them, so
+    the scan would get slower as the repository grew — the opposite of what
+    ``--since`` is for, and enough to make a re-scan of a large repository cost
+    more than the first scan. Commits outside the window are of no use here
+    anyway, since the caller only ever asks about rows the window produced.
+
+    A commit in the window that the windowed walk still does not reach is left
+    unattributed, which the caller renders as ``None`` — the honest answer for a
+    branch-scoped walk, and the same answer this already gave for a commit no
+    branch reaches.
+
     Where several branches reach the same commit, git names one of them and this
     does not second-guess it: ``--source`` emits each commit once, attributed to
     whichever ref the traversal reached it from, and there is no ordering here
@@ -1161,6 +1202,8 @@ async def _attribute_branches(
     Args:
         repo_path: The repository to read.
         rows: The collected commit rows, newest first.
+        since: Same lower bound as the commit pass, or ``None`` for all history.
+        limit: Same cap as the commit pass.
 
     Returns:
         ``{commit hash: branch name}``. Commits git could not attribute are
@@ -1181,13 +1224,20 @@ async def _attribute_branches(
     if not branch_names:
         return {}
 
+    args = [
+        "log",
+        "--no-merges",
+        "-n",
+        str(max(1, limit)),
+        "--source",
+        "--pretty=format:%H%x09%S",
+    ]
+    if since is not None:
+        args.append(f"--since={_as_utc(since).isoformat()}")
     try:
         walked = await run_git(
             repo_path,
-            "log",
-            "--no-merges",
-            "--source",
-            "--pretty=format:%H%x09%S",
+            *args,
             *(f"refs/heads/{name}" for name in branch_names),
         )
     except GitCommandError:
@@ -1310,6 +1360,7 @@ async def read_repository(
     *,
     since: datetime | None = None,
     limit: int = MAX_COMMITS_PER_SCAN,
+    allowlist: Sequence[str | os.PathLike[str]] | None = None,
 ) -> RepositorySnapshot:
     """Read one repository off disk, or raise a sentence.
 
@@ -1333,13 +1384,29 @@ async def read_repository(
     no commits, no dates and a ``primary_language`` computed from the tracked
     files (of which an empty repository has none).
 
+    **The allowlist is re-checked here, not only at registration.** The path a
+    scan is given is a *stored* path read back days later, and the stored string
+    is not a promise about what the path resolves to today: a registered
+    directory deleted and replaced by a symlink resolves to wherever that
+    symlink points, with no ``.git`` entry of its own to contradict it.
+    Registration proved the path was permitted when it was written; only a check
+    on the path as it resolves *now* can prove it is still permitted. A caller
+    that has an allowlist must pass it here, and a scan refused by it raises the
+    same sentence a registration would — which the service turns into an error
+    scan run, never a traceback.
+
     Args:
         path: A local repository path. Validated first, so a caller may pass an
             unvalidated string and get the same guarantee.
         since: Only commits at or after this instant. The service passes the
             stored ``latest_commit_at``, which is what makes a re-scan transfer
             only what is new rather than the whole history again.
-        limit: Cap on commits returned, applied by git's own ``-n``.
+        limit: Cap on commits returned, applied by git's own ``-n``. The commits
+            left out are older than ``since``, so no later scan reaches them
+            either — see :data:`MAX_COMMITS_PER_SCAN`.
+        allowlist: Permitted roots, or ``None`` when none is configured. Passed
+            through to :func:`validate_repository_path`, which refuses a path
+            outside them and refuses an allowlist that resolves to nothing.
 
     Returns:
         The snapshot.
@@ -1351,7 +1418,7 @@ async def read_repository(
             working-tree state and the history span all answer "unknown" rather
             than failing a scan whose commits were read perfectly well.
     """
-    repo_path = validate_repository_path(path)
+    repo_path = validate_repository_path(path, allowlist=allowlist)
     bounded_limit = max(1, min(int(limit), MAX_COMMITS_PER_SCAN))
 
     has_commits = await _has_commits(repo_path)
@@ -1371,7 +1438,9 @@ async def read_repository(
         )
         stats = _merge_stats(_parse_numstat(numstat_payload), _parse_shortstat(shortstat_payload))
 
-    attribution = await _attribute_branches(repo_path, rows) if rows else {}
+    attribution = (
+        await _attribute_branches(repo_path, rows, since=since, limit=bounded_limit) if rows else {}
+    )
 
     commits = tuple(
         CommitInfo(

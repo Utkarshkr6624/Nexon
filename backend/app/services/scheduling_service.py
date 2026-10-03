@@ -50,6 +50,20 @@ engine reasons about the days the user is looking at. An unknown zone name is a
 422 — never a silent fall back to UTC, which would shift every boundary by the
 zone's offset and quietly answer a different question.
 
+Bounded answers
+---------------
+**Nothing here proposes or reports from a partial view of the calendar.** The
+busy list is read against its unpaginated total: a horizon that does not fit in
+one read makes :meth:`SchedulingService.suggest` return nothing and say why,
+rather than placing work into the slots the missing rows occupied. The conflict
+scan is capped at :data:`MAX_CONFLICTS` — it is pairwise, so its output is
+quadratic — and a scan that stopped at the cap says so, through
+:class:`ConflictScan`, all the way to the response body.
+
+**Each local day is judged against its own availability.** A session crossing
+midnight is measured against the rules for every day it touches; the rules of
+the day it started on are not evidence about the day it ran into.
+
 Repository contract relied on by this module is
 :class:`app.services.planner_service.PlannerService`'s, plus
 ``TaskRepository.list_for_user``.
@@ -58,7 +72,8 @@ Repository contract relied on by this module is
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -81,10 +96,10 @@ from app.schemas.planner import (
 from app.services.planner_service import (
     PlannerService,
     _aware,
+    _local_days_touched,
     _overlaps,
     availability_windows_for,
     day_bounds,
-    local_day,
     resolve_timezone,
 )
 
@@ -92,7 +107,13 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance
     from app.services.activity_service import ActivityService
     from app.services.audit_service import AuditService
 
-__all__ = ["MAX_SUGGESTIONS", "SchedulingService", "detect_conflicts"]
+__all__ = [
+    "MAX_CONFLICTS",
+    "MAX_SUGGESTIONS",
+    "ConflictScan",
+    "SchedulingService",
+    "detect_conflicts",
+]
 
 #: Ceiling on one response, across all tasks. ``planner_max_suggestions_per_task``
 #: bounds one task's appetite; this bounds the page. A user with a 400-task
@@ -100,6 +121,15 @@ __all__ = ["MAX_SUGGESTIONS", "SchedulingService", "detect_conflicts"]
 #: plan, it is a dump — and the truncated answer is still ordered by urgency, so
 #: the first rows are the ones that matter.
 MAX_SUGGESTIONS = 50
+
+#: Ceiling on one conflict response. Overlap detection is pairwise, so the number
+#: of conflicts a span can produce is quadratic: 500 mutually overlapping sessions
+#: are 500 x 499 / 2 = 124,750 conflicts, which serialised is roughly 63.5 MB and
+#: which is built in memory before any of it is sent. A conflict list is a list a
+#: person reads before fixing something; past this size they are not reading it,
+#: they are being sent a denial of service by their own calendar. Reaching the
+#: cap stops the scan and is reported as ``truncated`` — see :class:`ConflictScan`.
+MAX_CONFLICTS = 500
 
 #: Rows pulled per status when collecting candidates. The scheduler is bounded by
 #: ``planner_lookahead_days`` and by the deadline filter, and anything past this
@@ -223,6 +253,28 @@ def _collides(
     ]
 
 
+@dataclass(frozen=True)
+class ConflictScan:
+    """What a conflict scan found, and whether it saw everything.
+
+    ``truncated`` is the field the response exists for. An uncapped pairwise
+    overlap scan is quadratic in the rows it is handed: 500 mutually overlapping
+    sessions are 500 x 499 / 2 = 124,750 pairs, and each one is a JSON object
+    with two interval dictionaries in it — about 63.5 MB of response body, built
+    in memory before a byte was serialised. The cap keeps the answer a *list a
+    person reads*; ``truncated`` keeps the cap from being a lie, because a
+    response that stopped at the cap and said nothing is indistinguishable from
+    one that found exactly that many.
+
+    ``reasons`` says *why* it stopped, which is a different fact for each cause:
+    the conflict cap, a span too dense to read in full, or both.
+    """
+
+    conflicts: list[Conflict] = field(default_factory=list)
+    truncated: bool = False
+    reasons: tuple[str, ...] = ()
+
+
 def detect_conflicts(
     *,
     events: Sequence[Any],
@@ -230,25 +282,29 @@ def detect_conflicts(
     availability: Sequence[Any],
     tasks_by_id: Mapping[uuid.UUID, Task] | None,
     owner_tz: str = "UTC",
-) -> list[Conflict]:
+    max_conflicts: int = MAX_CONFLICTS,
+) -> ConflictScan:
     """Find everything wrong with a span of schedule.
 
     **Pure: no database, no clock, no settings.** Every input — including the
-    zone — is passed in, so this is unit-testable against hand-built rows and
-    cannot drift between two calls that describe the same schedule.
+    zone and the cap — is passed in, so this is unit-testable against hand-built
+    rows and cannot drift between two calls that describe the same schedule.
 
     Four kinds, matching the four ways a planner actually goes wrong:
 
     ``overlapping_events``
         Two calendar events occupying the same instant.
     ``overlapping_sessions``
-        Two work sessions reserved over each other.
+        Two work sessions reserved over each other. Since the write-side check
+        refuses to *store* one, this is a report on rows that predate it or that
+        were written outside the service, not a prediction.
     ``outside_availability``
-        A session booked where the user said they are not working. **Only
-        sessions.** A meeting outside the working pattern is how meetings happen;
-        work outside the pattern is how a plan gets broken. And a user with *no*
-        availability rules at all produces no conflict here — nothing declared is
-        unknown, not violated.
+        A session booked where the user said they are not working, judged **per
+        local day** — see :func:`_fully_covered`. **Only sessions.** A meeting
+        outside the working pattern is how meetings happen; work outside the
+        pattern is how a plan gets broken. And a user with *no* availability
+        rules at all produces no conflict here — nothing declared is unknown,
+        not violated.
     ``after_deadline``
         A session ending after its task's due date. A task whose id is not in
         ``tasks_by_id`` is skipped rather than guessed at: the deadline is a fact
@@ -260,15 +316,24 @@ def detect_conflicts(
         availability: The owner's weekly availability rules.
         tasks_by_id: The tasks the sessions point at, for the deadline check.
         owner_tz: IANA zone the days are cut on.
+        max_conflicts: Ceiling on the returned list. Reached, the scan stops and
+            the result is marked :attr:`ConflictScan.truncated`.
 
     Returns:
         The conflicts, in detection order: event overlaps, session overlaps,
-        out-of-availability sessions, then past-deadline sessions.
+        out-of-availability sessions, then past-deadline sessions — plus
+        whether the cap stopped the scan short of the span.
     """
     zone = _zone(owner_tz)
     conflicts: list[Conflict] = []
 
     for earlier, later, left, right in _pairwise_overlaps(events, "starts_at", "ends_at"):
+        if len(conflicts) >= max_conflicts:
+            return ConflictScan(
+                conflicts=conflicts,
+                truncated=True,
+                reasons=(_cap_reason(max_conflicts),),
+            )
         conflicts.append(
             Conflict(
                 kind="overlapping_events",
@@ -287,6 +352,12 @@ def detect_conflicts(
     for _earlier, later, left, right in _pairwise_overlaps(
         sessions, "scheduled_start", "scheduled_end", skip_cancelled=True
     ):
+        if len(conflicts) >= max_conflicts:
+            return ConflictScan(
+                conflicts=conflicts,
+                truncated=True,
+                reasons=(_cap_reason(max_conflicts),),
+            )
         conflicts.append(
             Conflict(
                 kind="overlapping_sessions",
@@ -301,34 +372,42 @@ def detect_conflicts(
     for row in sessions:
         if str(row.status) == WorkSessionStatus.CANCELLED.value:
             continue
-        window = availability_windows_for(
-            availability, local_day(_aware(row.scheduled_start), zone)
-        )
-        if not window:
-            # Nothing declared for this weekday: unknown, not violated.
+        if not availability:
+            # Nothing declared anywhere: unknown, not violated.
             continue
-        if not _fully_covered(_aware(row.scheduled_start), _aware(row.scheduled_end), window, zone):
-            conflicts.append(
-                Conflict(
-                    kind="outside_availability",
-                    severity="warning",
-                    message="A work session falls outside the declared availability.",
-                    entity_type="work_session",
-                    entity_id=row.id,
-                    evidence={
-                        "scheduled_start": _describe(row.scheduled_start),
-                        "scheduled_end": _describe(row.scheduled_end),
-                        "declared": [
-                            {
-                                "weekday": local_day(_aware(row.scheduled_start), zone).weekday(),
-                                "starts_at": _window_label(start, end),
-                            }
-                            for start, end in window
-                        ],
-                        "local_date": local_day(_aware(row.scheduled_start), zone).isoformat(),
-                    },
-                )
+        start, end = _aware(row.scheduled_start), _aware(row.scheduled_end)
+        if _fully_covered(start, end, availability, zone):
+            continue
+        if len(conflicts) >= max_conflicts:
+            return ConflictScan(
+                conflicts=conflicts,
+                truncated=True,
+                reasons=(_cap_reason(max_conflicts),),
             )
+        days = _local_days_touched(start, end, zone)
+        conflicts.append(
+            Conflict(
+                kind="outside_availability",
+                severity="warning",
+                message="A work session falls outside the declared availability.",
+                entity_type="work_session",
+                entity_id=row.id,
+                evidence={
+                    "scheduled_start": _describe(row.scheduled_start),
+                    "scheduled_end": _describe(row.scheduled_end),
+                    "declared": [
+                        {
+                            "date": day.isoformat(),
+                            "weekday": day.weekday(),
+                            "starts_at": _window_label(win_start, win_end),
+                        }
+                        for day in days
+                        for win_start, win_end in availability_windows_for(availability, day)
+                    ],
+                    "local_dates": [day.isoformat() for day in days],
+                },
+            )
+        )
 
     for row in sessions:
         if str(row.status) == WorkSessionStatus.CANCELLED.value:
@@ -337,26 +416,33 @@ def detect_conflicts(
         if task is None or task.due_date is None:
             continue
         end_local = _aware(row.scheduled_end).astimezone(zone).date()
-        if end_local > task.due_date:
-            conflicts.append(
-                Conflict(
-                    kind="after_deadline",
-                    severity="error",
-                    message=(
-                        f"A session for {task.title!r} ends on {end_local.isoformat()}, "
-                        f"after its due date {task.due_date.isoformat()}."
-                    ),
-                    entity_type="work_session",
-                    entity_id=row.id,
-                    evidence={
-                        "task_id": str(task.id),
-                        "task_title": task.title,
-                        "due_date": task.due_date.isoformat(),
-                        "scheduled_end": _describe(row.scheduled_end),
-                    },
-                )
+        if end_local <= task.due_date:
+            continue
+        if len(conflicts) >= max_conflicts:
+            return ConflictScan(
+                conflicts=conflicts,
+                truncated=True,
+                reasons=(_cap_reason(max_conflicts),),
             )
-    return conflicts
+        conflicts.append(
+            Conflict(
+                kind="after_deadline",
+                severity="error",
+                message=(
+                    f"A session for {task.title!r} ends on {end_local.isoformat()}, "
+                    f"after its due date {task.due_date.isoformat()}."
+                ),
+                entity_type="work_session",
+                entity_id=row.id,
+                evidence={
+                    "task_id": str(task.id),
+                    "task_title": task.title,
+                    "due_date": task.due_date.isoformat(),
+                    "scheduled_end": _describe(row.scheduled_end),
+                },
+            )
+        )
+    return ConflictScan(conflicts=conflicts)
 
 
 def _zone(owner_tz: str) -> ZoneInfo:
@@ -368,13 +454,20 @@ def _zone(owner_tz: str) -> ZoneInfo:
 
 def _pairwise_overlaps(
     rows: Sequence[Any], start_attr: str, end_attr: str, *, skip_cancelled: bool = False
-) -> list[tuple[Any, Any, dict[str, Any], dict[str, Any]]]:
+) -> Iterator[tuple[Any, Any, dict[str, Any], dict[str, Any]]]:
     """Yield ``(earlier, later, left_evidence, right_evidence)`` for every overlap.
 
-    O(n²) over an already-bounded span, and a sweep line would be premature: a
-    day view holds tens of rows, and the pairwise form reports *which two* rows
-    collided, which is what the message names. Sorting by start lets the inner
-    loop stop as soon as a row begins after the comparison window closes.
+    A **generator, not a list**, and that is the whole point: the caller has a
+    cap, and a function that materialises every pair before the caller can look
+    at any of them makes the cap useless — the quadratic cost has already been
+    paid in memory. Yielding lets the scan stop at :data:`MAX_CONFLICTS` having
+    built only that many.
+
+    O(n²) over an already-bounded span otherwise, and a sweep line would be
+    premature: a day view holds tens of rows, and the pairwise form reports
+    *which two* rows collided, which is what the message names. Sorting by start
+    lets the inner loop stop as soon as a row begins after the comparison window
+    closes.
     """
     ordered = sorted(
         (
@@ -384,7 +477,6 @@ def _pairwise_overlaps(
         ),
         key=lambda row: _aware(getattr(row, start_attr)),
     )
-    found: list[tuple[Any, Any, dict[str, Any], dict[str, Any]]] = []
     for index, earlier in enumerate(ordered):
         earlier_end = _aware(getattr(earlier, end_attr))
         for later in ordered[index + 1 :]:
@@ -398,48 +490,85 @@ def _pairwise_overlaps(
                 _aware(getattr(later, end_attr)),
             ):
                 continue
-            found.append(
-                (
-                    earlier,
-                    later,
-                    {
-                        "id": str(getattr(earlier, "id", "")),
-                        "title": getattr(earlier, "title", None) or "Work session",
-                        "starts_at": _describe(getattr(earlier, start_attr)),
-                        "ends_at": _describe(getattr(earlier, end_attr)),
-                    },
-                    {
-                        "id": str(getattr(later, "id", "")),
-                        "title": getattr(later, "title", None) or "Work session",
-                        "starts_at": _describe(getattr(later, start_attr)),
-                        "ends_at": _describe(getattr(later, end_attr)),
-                    },
-                )
+            yield (
+                earlier,
+                later,
+                {
+                    "id": str(getattr(earlier, "id", "")),
+                    "title": getattr(earlier, "title", None) or "Work session",
+                    "starts_at": _describe(getattr(earlier, start_attr)),
+                    "ends_at": _describe(getattr(earlier, end_attr)),
+                },
+                {
+                    "id": str(getattr(later, "id", "")),
+                    "title": getattr(later, "title", None) or "Work session",
+                    "starts_at": _describe(getattr(later, start_attr)),
+                    "ends_at": _describe(getattr(later, end_attr)),
+                },
             )
-    return found
+
+
+def _cap_reason(max_conflicts: int) -> str:
+    """The sentence a truncated conflict scan carries to the client.
+
+    Derived from the arithmetic rather than asserted: N mutually overlapping rows
+    produce N x (N - 1) / 2 pairs, so the cap is a decision about response size
+    and the user is told which one they are looking at.
+    """
+    return (
+        f"Stopped after {max_conflicts} conflicts. This scan is quadratic in the rows it "
+        "is given, so it reports the first ones in detection order rather than the "
+        "complete set. Narrow the span, or resolve the overlaps it named."
+    )
 
 
 def _fully_covered(
-    start: datetime, end: datetime, windows: list[tuple[time, time]], zone: ZoneInfo
+    start: datetime, end: datetime, availability: Sequence[Any], zone: ZoneInfo
 ) -> bool:
-    """Whether ``[start, end)`` lies entirely inside the declared windows.
+    """Whether ``[start, end)`` lies entirely inside the owner's declared hours.
 
-    The window is cut at local midnight and each day checked against its *own*
-    rules, so a session crossing midnight is measured against both days rather
-    than against whichever day's rules happen to be listed first. Within a day a
-    cursor walks the windows in order, so two abutting rules read as one
-    continuous stretch — which is what somebody who wrote "09:00-12:00" and
-    "12:00-15:00" meant.
+    **Each local day is measured against its own weekday's rules.** The previous
+    form resolved the windows once, from the session's *start* day, and then
+    tested every day of the session against them. A session from Friday 23:30 to
+    Saturday 01:00 was therefore judged against Friday's 09:00-17:00 — outside it
+    on the Saturday minutes, whatever the user had declared for Saturday. Every
+    session crossing local midnight was reported ``outside_availability``, which
+    is a false alarm on every one of them and is why the rule could not be acted
+    on.
+
+    A day with **no** declared rules contributes no verdict rather than a
+    failure. Nothing declared for that weekday is unknown, not violated — the
+    same rule this module has always applied to a weekday with no rules, applied
+    now per day rather than per session.
+
+    Within a day a cursor walks that day's (already merged) windows in order, so
+    two abutting rules read as one continuous stretch — which is what somebody
+    who wrote "09:00-12:00" and "12:00-15:00" meant.
+
+    **Local midnight is never evidence of a violation.** ``availability_rules``
+    forbids ``ends_at <= starts_at``, so a window cannot be written as "09:00 to
+    midnight" — the best a user can express is 09:00-23:59 — and a session that
+    runs to the day boundary is therefore always "outside availability" by at
+    least the last minute of the day. Judged literally, that re-flagged every
+    midnight-crossing session from a second direction and the defect above would
+    have survived its own fix.
+
+    So when a day's segment runs to the day boundary, an uncovered tail after the
+    last window is forgiven **if and only if the session began inside that day's
+    availability** (the cursor advanced past its own start). The boundary is a
+    calendar artefact the schema cannot express; a session that starts when the
+    user is not working is a different fact, and is still reported.
     """
     local_start = start.astimezone(zone)
     local_end = end.astimezone(zone)
-    first = local_day(start, zone)
-    last = local_day(end - timedelta(microseconds=1), zone)
-    for offset in range((last - first).days + 1):
-        day = first + timedelta(days=offset)
+    for day in _local_days_touched(start, end, zone):
+        windows = availability_windows_for(availability, day)
+        if not windows:
+            continue
         day_start = datetime.combine(day, time.min, tzinfo=zone)
+        day_end = day_start + timedelta(days=1)
         segment_start = max(local_start, day_start)
-        segment_end = min(local_end, day_start + timedelta(days=1))
+        segment_end = min(local_end, day_end)
         if segment_start >= segment_end:
             continue
         cursor = segment_start
@@ -452,8 +581,11 @@ def _fully_covered(
         ):
             if span_start <= cursor < span_end:
                 cursor = span_end
-        if cursor < segment_end:
-            return False
+        if cursor >= segment_end:
+            continue
+        if segment_end == day_end and cursor > segment_start:
+            continue
+        return False
     return True
 
 
@@ -512,7 +644,9 @@ class SchedulingService:
         Returns:
             The suggestions in the order they were placed, plus the span and zone
             they were computed for. ``reason_if_empty`` is set only when the list
-            is empty and says which of the preconditions was missing.
+            is empty and says which of the preconditions was missing — including
+            "the calendar in this span is too full to read completely", which is
+            the one case where the engine refuses rather than proposes.
         """
         zone = resolve_timezone(tz, self.settings)
         reference = _aware(now) if now is not None else await self._db_now()
@@ -523,10 +657,10 @@ class SchedulingService:
         window_end = max(window_end, day_bounds(last_day, zone)[1])
 
         rules = await self.planner.availability.list_for_user(owner.id)
-        events, _ = await self.planner.events.list_for_user(
+        events, event_total = await self.planner.events.list_for_user(
             owner.id, start=window_start, end=window_end, limit=MAX_CANDIDATES
         )
-        sessions, _ = await self.planner.sessions.list_for_user(
+        sessions, session_total = await self.planner.sessions.list_for_user(
             owner.id, start=window_start, end=window_end, limit=MAX_CANDIDATES
         )
         candidates = await self._candidates(
@@ -535,6 +669,24 @@ class SchedulingService:
 
         generated_for = PlannerWindow(start_date=today, end_date=last_day, timezone=str(zone))
 
+        if event_total > len(events) or session_total > len(sessions):
+            # The busy list is what the engine walks to find a free slot, and a
+            # truncated one is a list with holes in it: every hidden row is an
+            # occupied minute the engine would hand out. An audit measured
+            # exactly that — 1,100 events in the horizon, 1,000 read, the rest
+            # offered as free — so the engine returns nothing and says why
+            # rather than proposing into a calendar it cannot see.
+            return SuggestionResponse(
+                suggestions=[],
+                generated_for=generated_for,
+                reason_if_empty=(
+                    f"Your calendar holds {max(event_total, session_total)} rows in the next "
+                    f"{settings.planner_lookahead_days} days, more than the {MAX_CANDIDATES} this "
+                    "engine will read. It will not plan against a partial calendar, because "
+                    "every row it could not read is a slot it would offer as free. Narrow the "
+                    "horizon with PLANNER_LOOKAHEAD_DAYS, or clear some of the span."
+                ),
+            )
         if not rules:
             return SuggestionResponse(
                 suggestions=[],
@@ -611,6 +763,22 @@ class SchedulingService:
         Written through :meth:`PlannerService.create_session` so an accepted
         proposal passes exactly the validation a hand-created one does — an
         accepted suggestion is not a privileged path into the table.
+
+        **That is also where the staleness check lives, and it is the reason
+        this method has no validation of its own to forget.** A suggestion is a
+        proposal made against a snapshot: between ``POST /planner/suggestions``
+        and the accept click, a colleague booked the meeting, the user booked it
+        themselves on another tab, or the same tab was clicked twice. Accepting
+        a stale proposal used to write the row regardless, because the only thing
+        re-checked was that the task was the caller's. ``create_session`` now
+        refuses any window that overlaps a live session or a calendar event, so
+        the second accept of the same suggestion is a 409 naming the row that got
+        there first, and the user is offered the one block that is genuinely
+        free.
+
+        Raises:
+            ConflictError: If the proposed slot is no longer free. 409, naming
+                the conflicting row.
         """
         from app.schemas.planner import WorkSessionCreate  # local: avoids a cycle at import time
 
@@ -661,19 +829,27 @@ class SchedulingService:
         start: date,
         end: date,
         tz: str | None = None,
-    ) -> list[Conflict]:
+        max_conflicts: int = MAX_CONFLICTS,
+    ) -> ConflictScan:
         """Read a span and run :func:`detect_conflicts` over it.
 
         The read is here; the judgement is in the pure function, so the same
         rules can be exercised without a database.
+
+        **Two things can make the answer incomplete, and both are reported.**
+        The conflict list may have hit :data:`MAX_CONFLICTS`, and the span's rows
+        may have exceeded :data:`MAX_CANDIDATES` so the scan never saw them all.
+        A conflict report is only useful as a picture of the whole span, so a
+        partial one carries its reasons rather than looking like a clean bill of
+        health.
         """
         zone = resolve_timezone(tz, self.settings)
         window_start, window_end = day_bounds(start, zone)
         window_end = max(window_end, day_bounds(end, zone)[1])
-        events, _ = await self.planner.events.list_for_user(
+        events, event_total = await self.planner.events.list_for_user(
             owner.id, start=window_start, end=window_end, limit=MAX_CANDIDATES
         )
-        sessions, _ = await self.planner.sessions.list_for_user(
+        sessions, session_total = await self.planner.sessions.list_for_user(
             owner.id, start=window_start, end=window_end, limit=MAX_CANDIDATES
         )
         rules = await self.planner.availability.list_for_user(owner.id)
@@ -683,12 +859,26 @@ class SchedulingService:
             task = await self.tasks.get_by_id_for_user(task_id, owner.id)
             if task is not None:
                 tasks_by_id[task_id] = task
-        return detect_conflicts(
+        scan = detect_conflicts(
             events=events,
             sessions=sessions,
             availability=rules,
             tasks_by_id=tasks_by_id,
             owner_tz=str(zone),
+            max_conflicts=max_conflicts,
+        )
+        span_truncated = event_total > len(events) or session_total > len(sessions)
+        if not span_truncated:
+            return scan
+        reason = (
+            f"This span holds more than {MAX_CANDIDATES} rows of one kind, so it was not read "
+            "in full. The conflicts below are the ones in the rows that were read; narrow the "
+            "span to see the rest."
+        )
+        return ConflictScan(
+            conflicts=scan.conflicts,
+            truncated=True,
+            reasons=(*scan.reasons, reason),
         )
 
     # -- Internals -----------------------------------------------------------

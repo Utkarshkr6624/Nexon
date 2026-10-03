@@ -201,14 +201,39 @@ class TagService:
     # -- Reads ---------------------------------------------------------------
 
     async def get(self, *, tag_id: uuid.UUID, owner: User) -> Tag:
-        """Return one of the caller's tags.
+        """Return one of the caller's tags, carrying its two usage counts.
+
+        **The counts are filled in here, not left to the schema's defaults.**
+        ``TagRead.task_count`` and ``project_count`` are not properties of the
+        ``tags`` row — they are joins through ``task_tags`` and ``project_tags``
+        — and :meth:`list` has always filled them from
+        :meth:`~app.repositories.tag.TagRepository.count_usage_by_kind`. The
+        single-tag read did not, so ``GET /tags/{id}`` answered ``0``/``0`` for
+        a tag applied to one task and three projects while ``GET /tags``
+        answered ``1``/``3`` **for the same row in the same request**. A
+        confident zero is the worst of the two answers available here: the
+        client cannot tell it from "this tag is unused", so a palette entry
+        reads as dead and gets deleted.
+
+        The counts ride on the returned instance rather than being handed back
+        as a separate object because the router serves this method's return
+        value directly through ``response_model=TagRead`` and also passes it to
+        :meth:`rename` and :meth:`delete`, which want the ORM row. Setting
+        ``task_count``/``project_count`` on the instance satisfies the first and
+        is invisible to the second: they are not mapped columns, so nothing is
+        ever flushed back, and every later reader of the tag — service or
+        response model — sees the same numbers the listing reports.
+
+        The counts are the user's own and only the user's own, so a tag's reach
+        can never reveal that somebody else applied it.
 
         Args:
             tag_id: The tag to fetch.
             owner: The authenticated caller.
 
         Returns:
-            The tag.
+            The tag, with ``task_count`` and ``project_count`` set to the
+            caller's measured uses of it.
 
         Raises:
             NotFoundError: If the caller owns no tag with this id. Another
@@ -219,6 +244,10 @@ class TagService:
         tag = await self.repository.get_by_id_for_user(tag_id, owner.id)
         if tag is None:
             raise NotFoundError(_TAG_NOT_FOUND)
+        counts = await self.repository.count_usage_by_kind(owner.id)
+        task_count, project_count = counts.get(tag.id, (0, 0))
+        tag.task_count = task_count
+        tag.project_count = project_count
         return tag
 
     async def list(

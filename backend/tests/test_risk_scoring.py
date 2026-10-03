@@ -37,6 +37,7 @@ from app.services.risk.scoring import (
     DEFAULT_SEVERITY_THRESHOLDS,
     ESTIMATION_MIN_SAMPLES,
     NOT_ENOUGH_DATA,
+    PROJECT_REMAINING_FLOOR,
     PROJECT_SCHEDULING_WEIGHTS,
     PROJECT_WEIGHTS,
     TASK_RESCHEDULE_THRESHOLD,
@@ -1293,3 +1294,123 @@ def test_every_task_score_agrees_with_the_ladder_applied_to_it():
         assert sum(line.contribution for line in result.evidence) == pytest.approx(
             result.score, abs=0.5
         ), result.metadata
+
+
+# ---------------------------------------------------------------------------
+# The remaining-work floor
+# ---------------------------------------------------------------------------
+
+
+def test_unfinished_work_below_the_floor_is_not_a_pressure_signal_at_all():
+    """Two open tasks in a healthy project is a fact, not a risk.
+
+    The remaining-work sub-signal is the one input that is a *size* rather than a
+    fault, and a share measured from zero reads the normal state of an active
+    project as a fraction of one. At a weight of 0.10 each task was worth half a
+    point, so ``0.10 x 2/20 x 100 = 1`` — a whole integer, stored, ``low`` — and
+    *every* project holding two or more open tasks became a risk whose entire
+    description was "2 task(s) are unfinished".
+
+    :data:`PROJECT_REMAINING_FLOOR` is the statement that unfinished work is not
+    evidence of anything until there is enough of it to be a backlog, and the
+    assertion below is the accepting side of that boundary: at and below the floor
+    the sub-signal is **absent** from the breakdown, not present and small, which
+    is the difference between "there is no pressure here" and "there is a little
+    pressure here and it rounds to nothing".
+    """
+    empty = project_risk()
+    two = project_risk(remaining_tasks=2)
+    at_the_floor = project_risk(remaining_tasks=PROJECT_REMAINING_FLOOR)
+
+    for result in (two, at_the_floor):
+        assert result.available is True
+        assert result.score == 0
+        assert result.severity is RiskSeverity.LOW
+        assert result.metadata["signals"] == {}
+        assert _labels(result) == ["No project-level pressure detected"]
+
+    # The count is still reported in the metadata even when it moved nothing: the
+    # score is what the floor governs, not the record of what was read.
+    assert two.metadata["remaining_tasks"] == 2
+    assert empty.metadata["remaining_tasks"] == 0
+
+
+def test_the_remaining_work_signal_earns_its_row_one_task_at_a_time_above_the_floor():
+    """11 tasks is 1 point, 15 is 5, and 20 saturates at the full 10.
+
+    Derived from the documented formula ``remaining = (n - 10) / 10`` inside
+    ``0.10 x remaining x 100 = (n - 10)`` points: one point per task above the
+    floor, so the signal appears gradually instead of appearing out of nowhere,
+    and it holds at the saturation count rather than climbing past it.
+    """
+    just_above = project_risk(remaining_tasks=11)
+    half = project_risk(remaining_tasks=15)
+    saturated = project_risk(remaining_tasks=20)
+    beyond = project_risk(remaining_tasks=40)
+
+    assert just_above.score == 1
+    assert just_above.metadata["signals"] == {"remaining": 0.1}
+    assert half.score == 5
+    assert half.metadata["signals"] == {"remaining": 0.5}
+    assert saturated.score == 10
+    assert saturated.metadata["signals"] == {"remaining": 1.0}
+    assert beyond.score == 10
+    assert beyond.metadata["signals"] == {"remaining": 1.0}
+    # All four are `low`, so the floor decides whether a row exists at all while
+    # the ladder keeps deciding how urgent it reads once it does.
+    assert {result.severity for result in (just_above, half, saturated, beyond)} == {
+        RiskSeverity.LOW
+    }
+
+
+# ---------------------------------------------------------------------------
+# "I cannot judge this" is never a zero
+# ---------------------------------------------------------------------------
+
+
+def test_no_detector_that_declined_to_judge_reports_a_score_or_a_band():
+    """Every decline path, one grid, and not one of them answers 0.
+
+    The distinction the whole module is built on: a measured zero carries evidence
+    saying nothing is wrong, and an absence of measurement carries a *reason*
+    instead. Both of those halves are asserted here for all five declining
+    detectors, and the measured zero at the end is the contrast case — the same
+    ``0``, arrived at by the opposite route, which is what a detector that had
+    conflated the two would be unable to produce.
+
+    ``severity is None`` is asserted alongside ``score is None`` because the band
+    is derived from the score: a result that cannot judge must not acquire a
+    severity through the back door, and ``low`` in particular would be a stored
+    risk saying "there is nothing here" about an input that was never read.
+    """
+    declines = [
+        (
+            RiskType.DEADLINE,
+            deadline_risk(remaining_minutes=60, available_minutes=0, deadline_in_hours=None),
+        ),
+        (RiskType.WORKLOAD, workload_risk(scheduled_minutes=0, available_minutes=None)),
+        (RiskType.ESTIMATION, estimation_risk(pairs=[])),
+        (
+            RiskType.CONSISTENCY,
+            consistency_risk(
+                active_days=3, window_days=7, previous_active_days=None, previous_window_days=7
+            ),
+        ),
+        (RiskType.SCHEDULING, scheduling_risk(sessions_considered=0)),
+    ]
+
+    for expected_type, result in declines:
+        _assert_declined(result, expected_type)
+        assert result.score != 0, result.reason_if_unavailable
+
+    # The contrast: the same zero, measured. Nothing is outstanding on this task,
+    # which is a statement about a task that has a due date and an estimate.
+    measured_zero = deadline_risk(
+        remaining_minutes=0, available_minutes=0, deadline_in_hours=48, title="Done already"
+    )
+
+    assert measured_zero.available is True
+    assert measured_zero.score == 0
+    assert measured_zero.severity is RiskSeverity.LOW
+    assert measured_zero.reason_if_unavailable is None
+    assert _labels(measured_zero) == ["No work outstanding"]

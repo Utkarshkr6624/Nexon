@@ -30,6 +30,22 @@ the spec forbids.
 is a wall-clock statement that has no instant until it is combined with a date
 and a zone. The combination happens in :func:`availability_windows_for`.
 
+Reservations
+------------
+**A work session may not overlap another live work session or a calendar
+event**, and the check lives in the service — :meth:`PlannerService._assert_window_free`
+— so that the hand-created session and the accepted suggestion cannot disagree
+about what "reserved" means. Overlap is half-open: 10:00 against 10:00 is
+back-to-back, which is how a day is built out of blocks. Two *events* may still
+overlap each other; see :meth:`PlannerService.update_event` for why that is a
+deliberate difference and :func:`app.services.scheduling_service.detect_conflicts`
+for where it is reported instead.
+
+**A bounded read that does not fit is refused, never shortened.** Every range
+read compares its page against the unpaginated total and raises rather than
+returning a partial answer — a truncated busy list is a list with holes in it,
+and the scheduler places work into holes.
+
 Purity
 ------
 :meth:`PlannerService.overload_for_day` is delegated to the module-level
@@ -48,6 +64,8 @@ Repository contract relied on by this module::
                                           task_id=None, event_type=None, limit=100,
                                           offset=0, sort="starts_at",
                                           order="asc") -> tuple[list[CalendarEvent], int]
+    CalendarEventRepository.overlapping_for_user(owner_id, *, start, end,
+                                                 limit=1) -> tuple[list[CalendarEvent], int]
     CalendarEventRepository.update_fields(event, **fields) -> CalendarEvent
     CalendarEventRepository.delete(event) -> None
 
@@ -61,6 +79,9 @@ Repository contract relied on by this module::
                                         project_id=None, status=None, limit=100,
                                         offset=0, sort="scheduled_start",
                                         order="asc") -> tuple[list[WorkSession], int]
+    WorkSessionRepository.overlapping_for_user(owner_id, *, start, end,
+                                               exclude_id=None,
+                                               limit=1) -> tuple[list[WorkSession], int]
     WorkSessionRepository.update_fields(session, **fields) -> WorkSession
     WorkSessionRepository.delete(session) -> None
 
@@ -81,6 +102,7 @@ caller cannot file a calendar row against somebody else's work.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
@@ -151,6 +173,14 @@ MAX_PAGE_SIZE = 100
 #: pull. The repository's range predicate already bounds the statement; this
 #: bounds how much of the bounded set one view assembles, so a user with a
 #: pathological calendar gets a view rather than an unbounded materialisation.
+#:
+#: **A read that hits it is refused, never silently shortened.** Every caller
+#: compares the row count against the unpaginated total and refuses the request
+#: (a 422) when the window holds more than this. Truncating instead would make
+#: the scheduler place work into slots the truncated rows hid — an audit
+#: reproduced exactly that with 1,100 events in a month and 1,000 shown, and the
+#: remaining 100 were offered as free. A view that is short and says nothing is
+#: indistinguishable from a view that is complete.
 MAX_RANGE_ROWS = 1000
 
 #: Ceiling on the rules one ``PUT /availability`` may carry. The unique
@@ -277,13 +307,23 @@ def local_day(instant: datetime, tz: ZoneInfo) -> date:
 def availability_windows_for(
     rules: Sequence[AvailabilityRule], day: date
 ) -> list[tuple[time, time]]:
-    """The owner's availability windows on one calendar day.
+    """The owner's availability windows on one calendar day, **merged**.
 
     ``weekday`` is ISO: 0 is Monday through 6 for Sunday, which is
     :meth:`datetime.date.weekday` exactly. Sorted by start so a caller walking
-    the day does not have to re-sort, and merged where two rules abut so a
-    09:00-12:00 plus 12:00-15:00 rule reads as one window rather than as two
-    that a collision check would have to treat as continuous.
+    the day does not have to re-sort, and merged wherever two rules *overlap or
+    abut* so a 09:00-12:00 plus 12:00-15:00 rule reads as one window, and so
+    does a 09:00-17:00 plus 11:00-13:00 one.
+
+    Merging the overlapping case is not tidiness, it is correctness. Summing a
+    day's windows as they were written double-counts every shared minute: a day
+    declared as 09:00-17:00 (480 minutes) with a nested 11:00-13:00 rule (120)
+    reported **600** available minutes for an eight-hour day — the audit
+    measured 960 on its own eleven-hour fixture. Every downstream figure is a
+    ratio of scheduled time to available time, so an inflated denominator makes
+    an overloaded week look half empty. The unique constraint is
+    ``(owner_id, weekday, starts_at)``, which permits overlapping windows
+    freely: nothing but this function stops them being counted twice.
 
     Accepts any object carrying ``weekday``/``starts_at``/``ends_at`` - a
     persisted rule, a Pydantic payload, or a test double — because the same
@@ -294,8 +334,11 @@ def availability_windows_for(
     )
     merged: list[tuple[time, time]] = []
     for start, end in windows:
-        if merged and merged[-1][1] == start:
-            merged[-1] = (merged[-1][0], end)
+        if merged and start <= merged[-1][1]:
+            # `<=`, not `==`: abutting windows are continuous, and so are
+            # windows that share minutes. Taking the later end rather than the
+            # current one also covers a rule wholly nested inside another.
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
             merged.append((start, end))
     return merged
@@ -438,6 +481,49 @@ def _check_sort(sort: str, order: str, allowed: frozenset[str], subject: str) ->
         raise ValidationError(
             f"Cannot sort {subject} {order!r}.", details={"allowed": sorted(_SORT_ORDERS)}
         )
+
+
+def _reject_truncated_range(
+    *, rows: Sequence[Any], total: int, table: str, start: datetime, end: datetime
+) -> None:
+    """Refuse a bounded read that did not fit in :data:`MAX_RANGE_ROWS`.
+
+    The repository returns the unpaginated ``total`` alongside the page, so
+    "we read a thousand of eleven hundred" is a fact rather than a suspicion.
+
+    Refusing is the only honest option for a caller that is about to *decide*
+    something from the rows — the scheduler walks them to find free slots, and a
+    truncated busy list is a list with holes in it. The day, week and month views
+    refuse for the same reason: a month that silently showed 1,000 of 1,100
+    events looks complete, and every day after the cut looks free.
+    """
+    if total <= len(rows):
+        return
+    raise ValidationError(
+        f"That span holds more than {MAX_RANGE_ROWS} {table}, so it cannot be read "
+        "completely. Ask for a smaller range.",
+        details={
+            "table": table,
+            "rows_matched": total,
+            "rows_read": len(rows),
+            "max_range_rows": MAX_RANGE_ROWS,
+            "window_start": _aware(start).isoformat(),
+            "window_end": _aware(end).isoformat(),
+        },
+    )
+
+
+def _local_days_touched(start: datetime, end: datetime, zone: ZoneInfo) -> list[date]:
+    """The local calendar days a half-open ``[start, end)`` interval touches.
+
+    The half-microsecond on the end is what makes a block ending exactly at
+    local midnight belong to the day before it: the instant ``00:00:00`` is the
+    first moment of the *next* day, and a session that ran 23:00-00:00 has
+    touched one day, not two.
+    """
+    first = local_day(_aware(start), zone)
+    last = local_day(_aware(end - timedelta(microseconds=1)), zone)
+    return [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
 
 
 def _event_type_or_none(value: str | CalendarEventType | None) -> str | None:
@@ -625,15 +711,37 @@ class PlannerService:
         """Apply a partial update to an event the caller owns.
 
         **PATCH semantics: a field is written if the client named it**, so a
-        cleared location is ``"location": null`` rather than an absent key.
+        cleared location is ``"location": null`` rather than an absent key. That
+        rule has one exception, and it is checked here rather than trusted to the
+        schema: a ``null`` is a legitimate clear for a *nullable* column and is
+        not for a window end. ``PATCH {"starts_at": null}`` used to reach
+        ``_require_forward_window(None, ...)`` and raise ``AttributeError`` out
+        of ``_aware`` — an unhandled 500 on a request the schema had already
+        decided was well-formed. It is a 422 now, naming the field.
 
         The window is re-checked against the **persisted** row, not only against
         the payload: a PATCH that moves ``starts_at`` past a stored ``ends_at``
         carries nothing for the schema to compare against and would otherwise
         persist an impossible schedule no single request expressed.
+
+        Two events may still overlap each other. That is deliberate and is not
+        the same defect as two *sessions* overlapping: a meeting is a statement
+        the user makes about their own day, and real calendars hold concurrent
+        meetings, whereas a work session is a reservation other machinery places
+        into. :func:`app.services.scheduling_service.detect_conflicts` reports
+        ``overlapping_events`` as an error for exactly the users who want to be
+        told; here the diagnostic surface is the right place and a 409 would not
+        be.
+
+        Raises:
+            NotFoundError: If the event is not the caller's.
+            ValidationError: For a null window end, an inverted effective window,
+                an unknown event type, or a reference that is not the caller's
+                (the reference's own ``NotFoundError``).
         """
         self._owned_event(event, owner)
         sent = data.model_dump(exclude_unset=True)
+        _reject_null_window_fields(sent, ("starts_at", "ends_at"))
         fields = {key: value for key, value in sent.items() if key in _EVENT_UPDATABLE_FIELDS}
         if not fields:
             return event
@@ -686,10 +794,28 @@ class PlannerService:
         on the task: a session records what was *planned for this block*, which
         is not the same number as the task's whole estimate, and overwriting one
         with the other is how a 30-minute slice turns into a 4-hour booking.
+
+        **The window is checked against what is already reserved before the row
+        is written** — see :meth:`_assert_window_free`. This is the one place
+        that check belongs: every route that books a block reaches it (the
+        ``POST /work-sessions`` handler directly, and
+        :meth:`app.services.scheduling_service.SchedulingService.accept` through
+        this very method), so no caller can produce an overlap by going around
+        it.
+
+        Raises:
+            NotFoundError: If ``project_id`` or ``task_id`` is not the caller's.
+            ValidationError: If the window ends before it starts, or the status
+                is not one of the four.
+            ConflictError: If the window overlaps another live work session or a
+                calendar event. 409, naming the conflicting row.
         """
         project_id = await self._owned_project(data.project_id, owner)
         task_id = await self._owned_task(data.task_id, owner)
         _require_forward_window(data.scheduled_start, data.scheduled_end)
+        await self._assert_window_free(
+            owner=owner, start=data.scheduled_start, end=data.scheduled_end
+        )
         status = _session_status_or_raise(data.status).value
         row = await self.sessions.create(
             owner_id=owner.id,
@@ -756,13 +882,31 @@ class PlannerService:
     async def update_session(self, *, session: WorkSession, data: Any, owner: User) -> WorkSession:
         """Apply a partial update to a session the caller owns.
 
-        ``actual_start``/``actual_end``/``actual_minutes`` are **not** writable
-        here: they are the product of :meth:`start_session` and
-        :meth:`stop_session`, which are the only doors onto them, so a PATCH
-        cannot forge a timing that no clock ever produced.
+        **``actual_start``/``actual_end``/``actual_minutes`` are not in this
+        method's vocabulary at all** — not filtered out of a payload that
+        carried them, but refused by the schema before they arrive. They are the
+        product of :meth:`start_session` and :meth:`stop_session`, which are the
+        only doors onto them, and every surface that reports time to a user
+        reads those columns. A PATCH that could assert ``actual_minutes`` would
+        make the tracked total a function of what a client sent rather than of
+        what a clock measured; the audit's `PATCH {"actual_minutes": 600}`
+        returned 200 and changed nothing, which is worse than either
+        persisting the claim or rejecting it.
+
+        A move is re-checked for collisions exactly as a create is, excluding
+        the row being moved — a session overlaps itself on every instant of its
+        own window, so the exclusion is what makes "reschedule" possible at all.
+
+        Raises:
+            NotFoundError: If the session is not the caller's.
+            ValidationError: For a null window end, an inverted effective window,
+                or a status the model does not define.
+            ConflictError: If the new window overlaps another live session or a
+                calendar event.
         """
         self._owned_session(session, owner)
         sent = data.model_dump(exclude_unset=True)
+        _reject_null_window_fields(sent, ("scheduled_start", "scheduled_end"))
         fields = {key: value for key, value in sent.items() if key in _SESSION_UPDATABLE_FIELDS}
         if not fields:
             return session
@@ -772,10 +916,13 @@ class PlannerService:
             fields["task_id"] = await self._owned_task(fields["task_id"], owner)
         if "status" in fields:
             fields["status"] = _session_status_or_raise(fields["status"]).value
-        _require_forward_window(
-            fields.get("scheduled_start", session.scheduled_start),
-            fields.get("scheduled_end", session.scheduled_end),
-        )
+        start = fields.get("scheduled_start", session.scheduled_start)
+        end = fields.get("scheduled_end", session.scheduled_end)
+        _require_forward_window(start, end)
+        if _aware(start) != _aware(session.scheduled_start) or _aware(end) != _aware(
+            session.scheduled_end
+        ):
+            await self._assert_window_free(owner=owner, start=start, end=end, exclude_id=session.id)
         return await self.sessions.update_fields(session, **fields)
 
     async def delete_session(self, *, session: WorkSession, owner: User) -> None:
@@ -984,14 +1131,28 @@ class PlannerService:
     ) -> dict[date, tuple[list[CalendarEvent], list[WorkSession]]]:
         """Read every event and session touching a date span, bucketed by local day.
 
-        Rows are filed by their **local start day**, which is what the calendar
-        grid is. A block running across midnight therefore appears on the day it
-        began; the per-day overload still measures only the part that falls on
-        each day, so the two numbers cannot drift apart.
+        Rows are filed under **every local day they touch**, not only the one
+        they start on. That is the same rule ``/work-sessions`` and the
+        repository use — an interval is in a window when it *overlaps* it — and
+        the two surfaces used to disagree: a 90-minute session from 23:30 to
+        01:00 was filed under the first day alone, so ``/planner/day`` credited
+        30 minutes to it while ``/work-sessions`` listed it against both days
+        and :func:`compute_overload` (which measures the overlap with each day)
+        found 60 minutes of the same session with nowhere to go. Filing it twice
+        is not double-counting: each day's load clamps the interval to its own
+        bounds, so the shares are 30 and 60 and they sum to the session's 90.
+
+        A read that does not fit in :data:`MAX_RANGE_ROWS` is refused rather
+        than shortened — see :func:`_reject_truncated_range`.
+
+        Raises:
+            ValidationError: If either table holds more rows in the span than
+                :data:`MAX_RANGE_ROWS` allows, so the buckets could not be
+                complete.
         """
         window_start, window_end = day_bounds(first, zone)
         window_end = max(window_end, day_bounds(last, zone)[1])
-        events, _ = await self.events.list_for_user(
+        events, event_total = await self.events.list_for_user(
             owner.id,
             start=window_start,
             end=window_end,
@@ -999,7 +1160,14 @@ class PlannerService:
             sort="starts_at",
             order="asc",
         )
-        sessions, _ = await self.sessions.list_for_user(
+        _reject_truncated_range(
+            rows=events,
+            total=event_total,
+            table="calendar events",
+            start=window_start,
+            end=window_end,
+        )
+        sessions, session_total = await self.sessions.list_for_user(
             owner.id,
             start=window_start,
             end=window_end,
@@ -1007,18 +1175,25 @@ class PlannerService:
             sort="scheduled_start",
             order="asc",
         )
+        _reject_truncated_range(
+            rows=sessions,
+            total=session_total,
+            table="work sessions",
+            start=window_start,
+            end=window_end,
+        )
         span = (last - first).days
         buckets: dict[date, tuple[list[CalendarEvent], list[WorkSession]]] = {
             first + timedelta(days=offset): ([], []) for offset in range(span + 1)
         }
         for event in events:
-            key = local_day(_aware(event.starts_at), zone)
-            if key in buckets:
-                buckets[key][0].append(event)
+            for key in _local_days_touched(event.starts_at, event.ends_at, zone):
+                if key in buckets:
+                    buckets[key][0].append(event)
         for row in sessions:
-            key = local_day(_aware(row.scheduled_start), zone)
-            if key in buckets:
-                buckets[key][1].append(row)
+            for key in _local_days_touched(row.scheduled_start, row.scheduled_end, zone):
+                if key in buckets:
+                    buckets[key][1].append(row)
         return buckets
 
     def _build_day(
@@ -1057,6 +1232,86 @@ class PlannerService:
         """
         value = await self.sessions.session.scalar(select(func.now()))
         return _aware(value)
+
+    async def _assert_window_free(
+        self, *, owner: User, start: datetime, end: datetime, exclude_id: uuid.UUID | None = None
+    ) -> None:
+        """Refuse a work-session window that is already reserved.
+
+        Two questions, in the order that makes the message useful, both scoped
+        by ``owner_id`` in the query so one account's calendar can never decide
+        another's write:
+
+        1. Does it overlap another **live work session**? That is the
+           double-booking the audit demonstrated: two 201s for the same hour.
+        2. Does it overlap a **calendar event**? A session placed over a meeting
+           is a block of time the user has already promised to somebody else, and
+           every other surface in the system — the scheduler's busy list, the
+           conflict detector — treats that interval as spoken for. Refusing the
+           write is the only place the rule can be enforced; reporting it later
+           leaves the double-booking already stored.
+
+        **Half-open, like every other range here**: a session ending at 10:00
+        and one starting at 10:00 are back-to-back and both are allowed. A
+        calendar made of adjacent blocks is not a collision.
+
+        Cancelled sessions are ignored — a cancelled block holds no time — and
+        ``exclude_id`` is the row under edit, because a session overlaps itself
+        on every instant of its own window.
+
+        **The reads are serialised per owner** by a transaction-scoped advisory
+        lock taken *before* them (:func:`_lock_owner_calendar`). The check and
+        the insert that follows it are two statements, so two simultaneous POSTs
+        for the same slot could both read an empty calendar and both write —
+        which is the very defect this method exists to close, reached by a
+        different road. The lock is released when the repository's own commit
+        ends the transaction, so it covers the check and the write and nothing
+        else. This is the application-level substitute for the database-level
+        guard discussed in the report: a GiST exclusion constraint cannot be used
+        here, because ``owner_id WITH =`` needs ``btree_gist`` and this build has
+        no contrib extensions at all.
+
+        Raises:
+            ConflictError: 409, naming the conflicting row and the overlap. The
+                details carry the conflicting id so a client can offer to move
+                *that* block rather than to guess which one is in the way.
+        """
+        await _lock_owner_calendar(self.sessions.session, owner.id)
+        sessions, session_total = await self.sessions.overlapping_for_user(
+            owner.id, start=start, end=end, exclude_id=exclude_id, limit=1
+        )
+        if sessions:
+            clash = sessions[0]
+            raise ConflictError(
+                "That time overlaps another work session.",
+                details={
+                    "conflict": "work_session",
+                    "conflicting_id": str(clash.id),
+                    "conflicting_start": _aware(clash.scheduled_start).isoformat(),
+                    "conflicting_end": _aware(clash.scheduled_end).isoformat(),
+                    "conflicting_sessions": session_total,
+                    "requested_start": _aware(start).isoformat(),
+                    "requested_end": _aware(end).isoformat(),
+                },
+            )
+        events, event_total = await self.events.overlapping_for_user(
+            owner.id, start=start, end=end, limit=1
+        )
+        if events:
+            clash = events[0]
+            raise ConflictError(
+                "That time overlaps a calendar event.",
+                details={
+                    "conflict": "calendar_event",
+                    "conflicting_id": str(clash.id),
+                    "conflicting_title": clash.title,
+                    "conflicting_start": _aware(clash.starts_at).isoformat(),
+                    "conflicting_end": _aware(clash.ends_at).isoformat(),
+                    "conflicting_events": event_total,
+                    "requested_start": _aware(start).isoformat(),
+                    "requested_end": _aware(end).isoformat(),
+                },
+            )
 
     async def _owned_project(self, project_id: uuid.UUID | None, owner: User) -> uuid.UUID | None:
         if project_id is None:
@@ -1106,6 +1361,31 @@ class PlannerService:
         )
 
 
+def _lock_owner_calendar(session: Any, owner_id: uuid.UUID) -> Any:
+    """Serialise one owner's collision checks against their own writes.
+
+    ``pg_advisory_xact_lock`` on a key derived from ``owner_id``, so two
+    simultaneous writes for one account queue behind each other while two
+    accounts never wait for each other. **Transaction-scoped**, so the lock is
+    taken by the first statement of the transaction and released by whatever
+    commits it — here, the repository call that writes the row, which is exactly
+    the span the check has to cover.
+
+    The key is a BLAKE2b digest of the owner's uuid split into two ``int4``s, the
+    same construction ``tests/conftest.py`` uses for the suite's own database
+    lock, so there is one derivation of "an advisory key for this identifier"
+    in the repository rather than two that could disagree.
+
+    Returns:
+        The awaited result of the statement, so the caller can ``await`` it
+        without importing the driver.
+    """
+    digest = hashlib.blake2b(owner_id.bytes, digest_size=8).digest()
+    first = int.from_bytes(digest[:4], "big", signed=True)
+    second = int.from_bytes(digest[4:], "big", signed=True)
+    return session.execute(select(func.pg_advisory_xact_lock(first, second)))
+
+
 def _require_forward_window(start: datetime, end: datetime) -> None:
     """Reject an interval that ends before it starts.
 
@@ -1118,3 +1398,24 @@ def _require_forward_window(start: datetime, end: datetime) -> None:
             "The end of the window must be later than its start.",
             details={"starts_at": _aware(start).isoformat(), "ends_at": _aware(end).isoformat()},
         )
+
+
+def _reject_null_window_fields(sent: Mapping[str, Any], names: Sequence[str]) -> None:
+    """Reject a PATCH that names a window end with ``null``.
+
+    ``"location": null`` clears a nullable column and is the documented way to
+    clear it. ``"starts_at": null`` does not clear anything — the column is
+    ``NOT NULL`` — and before this check it reached ``_require_forward_window``,
+    where ``_aware(None)`` raised ``AttributeError`` and the request left as an
+    unhandled **500**. The schema had already decided the body was
+    well-formed, so the service is where the promise has to be kept.
+
+    Raises:
+        ValidationError: 422, naming the field and saying what it means.
+    """
+    for name in names:
+        if name in sent and sent[name] is None:
+            raise ValidationError(
+                f"{name} cannot be null; send the whole window instead of clearing one end of it.",
+                details={"field": name},
+            )

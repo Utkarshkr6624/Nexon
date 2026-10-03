@@ -59,7 +59,7 @@ from datetime import date, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.models.analytics import DailyMetric
 from app.models.enums import ActivityEvent, CalendarEventType, TaskStatus
@@ -1021,6 +1021,15 @@ async def test_a_feature_snapshot_describes_only_the_callers_own_task(client, db
     are the interesting ones for privacy: they are counts of *other* tasks, so a
     bug that dropped the owner predicate would return the first account's
     project backlog against the second account's task.
+
+    The response is a wrapper around that matrix — ``schema_version``,
+    ``generated_at``, ``task_id`` and ``features`` — and the wrapper is where
+    this file's own rule bites hardest. ``task_id`` echoes the id back, so a
+    route that resolved the task through an unscoped lookup and then echoed the
+    *requested* id would put the first account's id into the second account's
+    response. Every first-account task id is a marker, so the walk below already
+    catches that; it is spelled out here as well because a leak in a key added
+    yesterday is worth naming rather than leaving to the general sweep.
     """
     world = await _seed_world(client, db_session)
 
@@ -1030,8 +1039,17 @@ async def test_a_feature_snapshot_describes_only_the_callers_own_task(client, db
         headers=world.bravo_headers,
     )
     assert response.status_code == 200, response.text
-    vector = response.json()
+    body = response.json()
+    vector = body["features"]
 
+    assert set(body) == {"schema_version", "generated_at", "task_id", "features"}
+    assert body["schema_version"] == "analytics_features.v1"
+    # The id in the body is the caller's own, never one of the first account's.
+    assert body["task_id"] == str(world.bravo_task_ids[0])
+    # The stamp is the **database** clock, the same one every feature in the row
+    # was derived from; a wrapper dated from a host-local ``date.today()`` would
+    # be a day ahead of them for five and a half hours a day.
+    assert body["generated_at"] == (await db_session.scalar(select(func.now()))).date().isoformat()
     assert set(vector) == {
         "priority",
         "task_age_days",
@@ -1059,7 +1077,7 @@ async def test_a_feature_snapshot_describes_only_the_callers_own_task(client, db
     assert vector["project_open_task_count"] == 1
     assert vector["project_overdue_task_count"] == 0
     assert vector["overdue_count"] == 0
-    world.assert_no_alpha_data(vector, where="/feature-snapshot")
+    world.assert_no_alpha_data(body, where="/feature-snapshot")
 
 
 # -- The empty shape ----------------------------------------------------------

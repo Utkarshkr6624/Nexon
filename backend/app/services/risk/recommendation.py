@@ -141,7 +141,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
 from sqlalchemy import func, select
@@ -791,6 +791,50 @@ class RecommendationService:
 
     # -- Rule 1: deadline gap ------------------------------------------------
 
+    async def _task_due_date(self, *, owner: User, risk: Risk) -> date | None:
+        """The due date of the task a risk is about, read from the task's own row.
+
+        **A date is a measurement; a distance is not a date.** The deadline rules
+        used to rebuild one by adding ``deadline_in_hours`` — a gap the detector
+        measured at the *start* of its pass — to ``detected_at``, the instant the
+        row was *written*. Those are two different clocks, and adding a length
+        measured from one to a timestamp taken from the other yields
+        ``due_date + (written_at - measured_at)``: right to the second on an
+        ordinary pass, and a day out on a pass that began before midnight and
+        wrote its rows after it — which is a suggestion whose reason is persisted,
+        so the wrong day is stored rather than merely shown.
+
+        The arithmetic cannot be repaired, only removed. No anchor makes it right,
+        because the instant the hours were measured from is recorded nowhere on the
+        row: ``detected_at`` is the wrong one, and a second clock read inside this
+        service is a third. A date guessed from an unrecorded instant is a figure
+        the engine did not measure, which is the one thing this whole layer is
+        built not to say.
+
+        The task's ``due_date`` is the figure that *was* measured — it is the
+        column the detector computed ``deadline_in_hours`` against, it is the
+        user's own input rather than this engine's arithmetic, and reading it costs
+        one primary-key lookup by a primary key. It is therefore correct on the
+        first pass, on the hundredth, and after the user has moved the date; the
+        rebuilt one was correct only while the two clocks happened to agree, which
+        is a condition no caller can rely on.
+
+        Args:
+            owner: The caller. The read is owner-scoped inside the repository, so
+                a risk pointing at another account's task reads as *no task* rather
+                than as a row the caller may not see — the same 404-not-403 answer
+                the endpoints give, arrived at without an endpoint.
+            risk: The risk whose entity is the task in question.
+
+        Returns:
+            The task's due date, or ``None`` when the risk is not about a task, or
+            the task is gone, or it has no date recorded.
+        """
+        if risk.entity_type != ENTITY_TASK or risk.entity_id is None:
+            return None
+        task = await self.tasks.get_by_id_for_user(risk.entity_id, owner.id)
+        return task.due_date if task is not None else None
+
     async def _rule_block_time(self, *, owner: User, risk: Risk) -> RecommendationDraft | None:
         """Deadline risk with unbooked work left: schedule the remainder.
 
@@ -812,7 +856,7 @@ class RecommendationService:
             return None
 
         name = _clip(str(meta.get("title") or "this task"), 120)
-        due = _due_phrase(hours, risk.detected_at)
+        due = _due_phrase(await self._task_due_date(owner=owner, risk=risk))
         return self._draft(
             risk=risk,
             recommendation_type=RecommendationType.BLOCK_TIME,
@@ -869,7 +913,7 @@ class RecommendationService:
                 f"or record the work as done."
             )
         else:
-            due = _due_phrase(hours, risk.detected_at)
+            due = _due_phrase(await self._task_due_date(owner=owner, risk=risk))
             reason = (
                 f"All {_duration(remaining)} of the work remaining on {name} is already "
                 f"booked before {due}, which is {_hours_phrase(hours)} away, so any slip "
@@ -1965,25 +2009,19 @@ def _percent(fraction: float) -> str:
     return f"{round(fraction * 100)}%"
 
 
-def _due_phrase(hours: float | None, detected_at: datetime | None) -> str:
-    """Name the due date, derived from the hours the detector recorded.
+def _due_phrase(due: date | None) -> str:
+    """Name the due date the task carries, or a pronoun when it carries none.
 
-    The detector measures ``deadline_in_hours`` from the instant of the pass to
-    the end of the due day, and ``detected_at`` is that instant, so adding one
-    back lands on the date itself. The alternative — storing the due date in the
-    risk's metadata — would mean changing the frozen scoring module and the
-    migration for one word in a sentence, which is not a trade worth making.
+    The one place a deadline sentence is allowed to learn a date, and it only
+    ever learns it from a column: :meth:`RecommendationService._task_due_date`
+    argues at length why the date is read rather than rebuilt from the hours the
+    detector recorded against a different clock.
 
-    Falls back to a pronoun rather than a date whenever either input is missing:
-    "before its due date" is true in every case, where a date computed from an
-    absent number would not be.
+    ``None`` becomes a pronoun rather than a date computed from an absent number,
+    on the same principle the layer runs on — "before its due date" is true in
+    every case, where a date nobody measured is not.
     """
-    if hours is None or detected_at is None:
-        return "its due date"
-    moment = (detected_at if detected_at.tzinfo else detected_at.replace(tzinfo=UTC)) + timedelta(
-        hours=hours
-    )
-    return f"{moment:%d %b %Y}"
+    return _day_phrase(due) if due is not None else "its due date"
 
 
 def _day_phrase(value: datetime | date) -> str:
